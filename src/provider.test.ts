@@ -10,6 +10,7 @@ import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
+  decideCodexOversizedAction,
   isCodexPayload,
   minimumOutputTokensForPayload,
   modelSupportsLongCacheRetention,
@@ -122,6 +123,22 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "prefix input must stay identical",
   );
   assert(CODEX_WARM_OUTPUT_ABORT_TOKENS >= 128, "abort threshold should sit above normal OK-suffix outs");
+  assert(CODEX_WARM_OUTPUT_ABORT_TOKENS === 256, "current shipped threshold is 256");
+}
+
+// 2c) Codex oversized policy: ok -> soft-skip -> sticky-block
+{
+  const under = decideCodexOversizedAction(32, 0);
+  assert(under.decision === "ok" && under.consecutiveAfter === 0, "normal out resets streak");
+
+  const first = decideCodexOversizedAction(300, 0);
+  assert(first.decision === "soft-skip" && first.consecutiveAfter === 1, "first spike soft-skips");
+
+  const second = decideCodexOversizedAction(300, 1);
+  assert(second.decision === "sticky-block" && second.consecutiveAfter === 2, "second spike blocks");
+
+  const recover = decideCodexOversizedAction(20, 1);
+  assert(recover.decision === "ok" && recover.consecutiveAfter === 0, "small out clears streak");
 }
 
 // 3) Strategy intervals stay inside TTL.

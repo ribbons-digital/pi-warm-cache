@@ -215,6 +215,29 @@ export const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
  */
 export const CODEX_WARM_OUTPUT_ABORT_TOKENS = 256;
 
+export type CodexOversizedDecision = "ok" | "soft-skip" | "sticky-block";
+
+/**
+ * Pure policy for Codex oversized warm ticks.
+ * - under threshold: reset streak, continue normally
+ * - first oversized: soft-skip (reschedule, no sticky block)
+ * - second consecutive oversized: sticky-block until /warm resume
+ */
+export function decideCodexOversizedAction(
+  outputTokens: number,
+  consecutiveOversizedBefore: number,
+  threshold: number = CODEX_WARM_OUTPUT_ABORT_TOKENS,
+): { decision: CodexOversizedDecision; consecutiveAfter: number } {
+  if (outputTokens < threshold) {
+    return { decision: "ok", consecutiveAfter: 0 };
+  }
+  const consecutiveAfter = consecutiveOversizedBefore + 1;
+  if (consecutiveAfter < 2) {
+    return { decision: "soft-skip", consecutiveAfter };
+  }
+  return { decision: "sticky-block", consecutiveAfter };
+}
+
 /** Detect ChatGPT Codex request bodies (no max_output_tokens support). */
 export function isCodexPayload(payload: Record<string, unknown>): boolean {
   // Codex bodies use instructions + input + store:false and never ship max_output_tokens.

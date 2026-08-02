@@ -4,6 +4,7 @@ import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
+  decideCodexOversizedAction,
   DEFER_BACKOFF_MS,
   resolveStrategy,
   stableFingerprint,
@@ -706,40 +707,41 @@ export class SessionWarmer {
       // Codex has no API output cap. OK-suffix ticks are usually small (out≈5-32).
       // First oversized tick: soft-skip and reschedule. Second consecutive: sticky block.
       const codexApi = model.api === "openai-codex-responses";
-      if (codexApi && result.output >= CODEX_WARM_OUTPUT_ABORT_TOKENS) {
-        this.consecutiveCodexOversized += 1;
-        if (result.cacheHit) {
-          anchor.warmHitCount += 1;
-          anchor.cachedTokens = result.cacheRead;
-          anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
-          anchor.lastWarmAt = Date.now();
-          anchor.lastActivityAt = Date.now();
-        } else {
-          anchor.warmMissCount += 1;
-        }
-        const usageBit =
-          `out=${result.output} read=${result.cacheRead} write=${result.cacheWrite} in=${result.input}`;
-        if (this.consecutiveCodexOversized < 2) {
+      if (codexApi) {
+        const policy = decideCodexOversizedAction(result.output, this.consecutiveCodexOversized);
+        this.consecutiveCodexOversized = policy.consecutiveAfter;
+        if (policy.decision !== "ok") {
+          if (result.cacheHit) {
+            anchor.warmHitCount += 1;
+            anchor.cachedTokens = result.cacheRead;
+            anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
+            anchor.lastWarmAt = Date.now();
+            anchor.lastActivityAt = Date.now();
+          } else {
+            anchor.warmMissCount += 1;
+          }
+          const usageBit =
+            `out=${result.output} read=${result.cacheRead} write=${result.cacheWrite} in=${result.input}`;
+          if (policy.decision === "soft-skip") {
+            const detail =
+              `Codex warm oversized (${usageBit}). Soft-skip #${policy.consecutiveAfter}; ` +
+              `sticky-block on a second consecutive spike (threshold=${CODEX_WARM_OUTPUT_ABORT_TOKENS}).`;
+            this.recordAttempt(reason, false, detail, usageSnap);
+            if (ctx.hasUI) ctx.ui.notify(`pi-warm-cache: ${detail}`, "warning");
+            this.showFailure(ctx, "codex out high · retry", detail);
+            return result;
+          }
+          shouldRescheduleAfter = false;
           const detail =
-            `Codex warm oversized (${usageBit}). Soft-skip #1; will sticky-block on a second consecutive spike.`;
+            `Codex warm oversized twice (${usageBit}). ` +
+            `Auto-warm blocked for this session until /warm resume.`;
+          this.blockAutoWarm(detail);
           this.recordAttempt(reason, false, detail, usageSnap);
           if (ctx.hasUI) ctx.ui.notify(`pi-warm-cache: ${detail}`, "warning");
-          this.showFailure(ctx, "codex out high · retry", detail);
-          // Keep shouldRescheduleAfter true so the timer continues.
+          this.showFailure(ctx, "codex auto-warm blocked", detail);
           return result;
         }
-        shouldRescheduleAfter = false;
-        const detail =
-          `Codex warm oversized twice (${usageBit}). ` +
-          `Auto-warm blocked for this session until /warm resume.`;
-        this.blockAutoWarm(detail);
-        this.recordAttempt(reason, false, detail, usageSnap);
-        if (ctx.hasUI) ctx.ui.notify(`pi-warm-cache: ${detail}`, "warning");
-        this.showFailure(ctx, "codex auto-warm blocked", detail);
-        return result;
       }
-
-      if (codexApi) this.consecutiveCodexOversized = 0;
 
       if (result.cacheHit) {
         anchor.warmHitCount += 1;
