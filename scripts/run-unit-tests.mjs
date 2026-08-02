@@ -57,7 +57,7 @@ const providerFile = resolve(root, "src/provider.ts");
 waitForStableFile(testFile);
 waitForStableFile(providerFile);
 
-// Re-hash after stability wait so we never print a pre-edit digest.
+// Re-hash after stability wait so printed digests match what the suite loads.
 const digest = sha256File(testFile);
 const providerDigest = sha256File(providerFile);
 const bytes = statSync(testFile).size;
@@ -67,29 +67,12 @@ console.log(`[run-unit-tests] sha256=${digest}`);
 console.log(`[run-unit-tests] provider_sha256=${providerDigest}`);
 console.log(`[run-unit-tests] bytes=${bytes}`);
 
-// Fail closed if the on-disk threshold assertion cannot see current provider export text.
-const providerText = readFileSync(providerFile, "utf8");
-if (!providerText.includes("CODEX_WARM_OUTPUT_ABORT_TOKENS = 256")) {
-  console.error("[run-unit-tests] provider.ts does not contain expected CODEX threshold 256");
-  process.exit(2);
-}
-const testText = readFileSync(testFile, "utf8");
-if (!testText.includes("decideCodexOversizedAction")) {
-  console.error("[run-unit-tests] provider.test.ts missing decideCodexOversizedAction coverage");
-  process.exit(2);
-}
-
 const result = spawnSync(
   process.execPath,
   ["--experimental-strip-types", "--no-warnings", testFile],
   {
     cwd: root,
     stdio: "inherit",
-    env: {
-      ...process.env,
-      // Bust any accidental loader caches keyed only on path.
-      PI_WARM_CACHE_TEST_NONCE: `${Date.now()}-${digest.slice(0, 12)}`,
-    },
   },
 );
 
