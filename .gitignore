@@ -1,0 +1,6 @@
+.memory-lane/
+.pi/
+node_modules/
+dist/
+*.log
+.DS_Store

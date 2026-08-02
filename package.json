@@ -1,0 +1,31 @@
+{
+  "name": "pi-warm-cache",
+  "version": "0.1.0",
+  "description": "Pi extension that keeps Anthropic and OpenAI prompt caches warm during long idle gaps",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "prompt-cache",
+    "anthropic",
+    "openai"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node scripts/run-unit-tests.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  },
+  "packageManager": "pnpm@10.0.0+sha512.b8fef5494bd3fe4cbd4edabd0745df2ee5be3e4b0b8b08fa643aa3e4c6702ccc0f00d68fa8a8c9858a735a0032485a44990ed2810526c875e416f001b17df12b"
+}
