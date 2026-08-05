@@ -5,7 +5,9 @@ import type {
   AnthropicTtlMode,
   CacheFamily,
   ProviderCapability,
+  ProbeOutcome,
   ProviderCapabilityState,
+  RealTurnObservation,
   StrategyPlan,
   WarmCacheConfig,
 } from "./types.ts";
@@ -272,6 +274,28 @@ export function resolveStrategy(
 }
 
 /**
+ * Classify a no-read warm-probe response before retry state is incremented.
+ * The first no-read/no-write response on an implicit route is transient.
+ */
+export function classifyProbeOutcome(args: {
+  cacheFamily: CacheFamily;
+  cacheRead: number;
+  cacheWrite: number;
+  consecutiveFailuresBefore: number;
+}): ProbeOutcome {
+  if (args.cacheWrite > 0 && args.cacheRead === 0) return "payload-drift";
+  if (
+    args.cacheFamily === "openai-implicit" &&
+    args.cacheRead === 0 &&
+    args.cacheWrite === 0 &&
+    args.consecutiveFailuresBefore === 0
+  ) {
+    return "transient-miss";
+  }
+  return "miss";
+}
+
+/**
  * OpenAI Responses rejects max_output_tokens below 16.
  * Source in pi-ai: dist/api/openai-responses.js
  *   "OpenAI Responses rejects max_output_tokens below 16"
@@ -465,6 +489,145 @@ export const WARM_MUTABLE_PAYLOAD_KEYS = new Set([
   "max_output_tokens",
   "max_completion_tokens",
 ]);
+
+/**
+ * Return true when the new real-turn payload keeps the old provider payload as
+ * an exact prefix and only appends conversation items.
+ * Anthropic cache markers are ignored because Pi moves the marker to the new
+ * last cacheable block on each turn.
+ *
+ * A payload fingerprint changes on every normal turn, so fingerprint equality
+ * alone cannot identify continuity.  This check deliberately stays strict:
+ * if any non-conversation field changes, the next real-turn classification is
+ * unknown instead of claiming a miss caused by the provider.
+ */
+export function isPayloadContinuation(
+  previous: unknown,
+  current: unknown,
+  api: string | undefined,
+): boolean {
+  if (!previous || typeof previous !== "object" || !current || typeof current !== "object") {
+    return false;
+  }
+
+  const previousBody = previous as Record<string, unknown>;
+  const currentBody = current as Record<string, unknown>;
+  const conversationKey =
+    api === "anthropic-messages" || api === "openai-completions" ? "messages" : "input";
+  const previousItems = previousBody[conversationKey];
+  const currentItems = currentBody[conversationKey];
+
+  if (!Array.isArray(previousItems) || !Array.isArray(currentItems)) return false;
+  if (currentItems.length < previousItems.length) return false;
+  if (cacheControlSignature(previous) !== cacheControlSignature(current)) return false;
+
+  const keys = new Set([...Object.keys(previousBody), ...Object.keys(currentBody)]);
+  keys.delete(conversationKey);
+  for (const key of keys) {
+    if (!deepPayloadEqual(previousBody[key], currentBody[key], true)) return false;
+  }
+
+  for (let i = 0; i < previousItems.length; i++) {
+    if (!deepPayloadEqual(previousItems[i], currentItems[i], true)) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Classify cache usage from a real assistant turn.
+ *
+ * A no-read response is only called a miss when the payload is comparable to
+ * the previous turn and the prompt is large enough for the configured cache
+ * threshold.  All other cases remain unknown while preserving raw usage.
+ */
+export function classifyRealTurnObservation(args: {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  minCachedTokens: number;
+  continuity: boolean;
+  continuityReason: string;
+  provider?: string;
+  modelId?: string;
+  api?: string;
+  payloadFingerprint?: string;
+  observedAt?: number;
+}): RealTurnObservation {
+  const input = args.input ?? 0;
+  const cacheRead = args.cacheRead ?? 0;
+  const cacheWrite = args.cacheWrite ?? 0;
+  const promptTokens = input + cacheRead + cacheWrite;
+  let state: RealTurnObservation["state"] = "unknown";
+  let reason = args.continuityReason;
+
+  if (!args.continuity) {
+    state = "unknown";
+  } else if (promptTokens <= 0 || promptTokens < args.minCachedTokens) {
+    state = "unknown";
+    reason = `prompt below minimum (${promptTokens} < ${args.minCachedTokens})`;
+  } else if (cacheRead > 0) {
+    state = "hit";
+    reason = "comparable continuation with cache read";
+  } else {
+    state = "miss";
+    reason = "comparable continuation with no cache read";
+  }
+
+  return {
+    state,
+    cacheRead,
+    cacheWrite,
+    input,
+    promptTokens,
+    provider: args.provider ?? "",
+    modelId: args.modelId ?? "",
+    api: args.api ?? "",
+    payloadFingerprint: args.payloadFingerprint ?? "",
+    observedAt: args.observedAt ?? Date.now(),
+    reason,
+  };
+}
+
+function cacheControlSignature(payload: unknown): string {
+  const controls: string[] = [];
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    if (record.cache_control && typeof record.cache_control === "object") {
+      controls.push(JSON.stringify(record.cache_control));
+    }
+    for (const value of Object.values(record)) visit(value);
+  };
+  visit(payload);
+  return controls.sort().join("|");
+}
+
+function deepPayloadEqual(a: unknown, b: unknown, ignoreCacheControl = false): boolean {
+  if (Object.is(a, b)) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepPayloadEqual(a[i], b[i], ignoreCacheControl)) return false;
+    }
+    return true;
+  }
+
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const keys = new Set([...Object.keys(aRecord), ...Object.keys(bRecord)]);
+  for (const key of keys) {
+    if (ignoreCacheControl && key === "cache_control") continue;
+    if (!deepPayloadEqual(aRecord[key], bRecord[key], ignoreCacheControl)) return false;
+  }
+  return true;
+}
 
 /** Fast stable-ish fingerprint for payload identity / logging. */
 export function stableFingerprint(payload: unknown): string {

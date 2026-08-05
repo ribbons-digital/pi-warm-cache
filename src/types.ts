@@ -13,6 +13,48 @@ export interface ProviderCapability {
   manualProbe: boolean;
 }
 
+export type RealTurnCacheState = "hit" | "miss" | "unknown";
+
+/** Cache usage observed on a real assistant turn, never from a warm probe. */
+export interface RealTurnObservation {
+  state: RealTurnCacheState;
+  cacheRead: number;
+  cacheWrite: number;
+  input: number;
+  promptTokens: number;
+  provider: string;
+  modelId: string;
+  api: string;
+  payloadFingerprint: string;
+  observedAt: number | null;
+  /** Explains an unknown state or the continuity evidence used. */
+  reason: string;
+}
+
+export type ProbeOutcome =
+  | "hit"
+  | "transient-miss"
+  | "miss"
+  | "payload-drift"
+  | "error"
+  | "unavailable";
+
+/** One provider response from the extension's warm probe path. */
+export interface ProbeObservation {
+  outcome: ProbeOutcome;
+  cacheRead: number;
+  cacheWrite: number;
+  input: number;
+  output: number;
+  costUsd: number;
+  provider: string;
+  modelId: string;
+  api: string;
+  payloadFingerprint: string;
+  observedAt: number;
+  error?: string;
+}
+
 /** Detected cache family for interval + payload strategy. */
 export type CacheFamily =
   | "anthropic-short"
@@ -40,9 +82,9 @@ export interface WarmCacheConfig {
   maxConcurrentWarmSessions: number;
   /** Minimum cached prefix tokens before warming is useful. */
   minCachedTokens: number;
-  /** Stop after this many consecutive warm failures. */
+  /** Stop after this many consecutive probe failures. */
   maxConsecutiveFailures: number;
-  /** Show the editor widget while waiting / after a warm hit. */
+  /** Show the editor widget while waiting / after a probe hit. */
   showWidget: boolean;
   /** Append a tiny warm user turn instead of replaying the exact last prefix only. */
   warmSuffix: string;
@@ -92,9 +134,9 @@ export interface CacheAnchor {
   cacheRetention: CacheRetention;
   /** Hash of the captured provider payload (identity / logging). */
   payloadFingerprint: string;
-  /** Last observed cache-read tokens from a real or warm response. */
+  /** Compatibility prompt-size hint; authoritative values live in observations. */
   cachedTokens: number;
-  /** Last known input+cache tokens that form the billable prompt. */
+  /** Compatibility prompt-size hint; authoritative values live in observations. */
   promptTokens: number;
   /** Model cache-read price $/MTok when known. */
   cacheReadPricePerMTok: number;
@@ -106,24 +148,30 @@ export interface CacheAnchor {
   pricingSource: "model" | "unknown";
   /** Wall clock of last real agent activity that refreshed the cache. */
   lastActivityAt: number;
-  /** Wall clock of last successful warm hit. */
-  lastWarmAt: number | null;
-  /** Estimated USD saved by warm hits this session (vs cold input re-read). */
+  /** Wall clock of the last successful warm-probe hit. */
+  lastProbeAt: number | null;
+  /** Estimated USD saved by warm-probe hits this session (vs cold input re-read). */
   estimatedSavingsUsd: number;
-  warmHitCount: number;
-  warmMissCount: number;
-  /** One-shot observations on an unverified route are kept separate. */
+  /** Number of provider responses returned by the warm-probe path. */
   probeCount: number;
   probeHitCount: number;
   probeMissCount: number;
+  /** Consecutive probe failures. Real turns reset this retry state. */
   consecutiveFailures: number;
+  /** Latest real-turn usage and classification. Never updated by a probe. */
+  latestRealTurn: RealTurnObservation;
+  /** Latest warm-probe response. Never updated by a real turn. */
+  latestProbe: ProbeObservation | null;
 }
 
 export interface WarmResult {
   ok: boolean;
   cacheHit: boolean;
+  probeOutcome?: ProbeOutcome;
   capabilityState?: ProviderCapabilityState;
   capabilityReason?: string;
+  /** Consecutive probe retry state at the time of this result. */
+  retryState?: string;
   /** True when a probe was rejected before any provider request. */
   unavailable?: boolean;
   provider?: string;

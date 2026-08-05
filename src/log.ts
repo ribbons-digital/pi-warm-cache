@@ -1,10 +1,13 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import type { ProbeOutcome } from "./types.ts";
 
 export type WarmLogEvent = {
   ts: string;
   sessionId?: string;
   event: string;
+  source?: "real_turn" | "warm_probe" | "system";
+  probeOutcome?: ProbeOutcome;
   detail?: string;
   ok?: boolean;
   reason?: string;
