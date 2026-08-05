@@ -627,6 +627,23 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(warmer.getStatusText().includes("probeMisses=1"), "status should expose probe misses");
   assert(warmer.getStatusText().includes("probeFailStreak=0/3"), "successful probe should reset retry state");
 
+  // A continuing real turn gets a fresh observation, but the preceding probe
+  // remains visible so users can compare the two cache signals.
+  const continuedPayload = {
+    model: model.id,
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "hello" }] },
+      { role: "assistant", content: [{ type: "output_text", text: "answer" }] },
+    ],
+    prompt_cache_key: "warmer-test",
+  };
+  warmer.capturePayload(continuedPayload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 0, cacheWrite: 100, output: 2 });
+  assert(warmer.getLatestRealTurnObservation()?.state === "miss", "real turn should classify independently");
+  assert(warmer.getLatestProbeObservation()?.outcome === "hit", "real turn should retain the preceding probe");
+  assert(warmer.getStatusText().includes("realTurn=miss"), "status should expose the real-turn miss");
+  assert(warmer.getStatusText().includes("probe=hit"), "status should retain the probe outcome");
+
   const providerError = await warmer.warmNow(ctx);
   assert(!providerError.ok && providerError.probeOutcome === "error", "provider error should be an error outcome");
   assert(warmer.getLatestProbeObservation()?.outcome === "error", "provider error should remain a probe error");

@@ -272,11 +272,16 @@ export class SessionWarmer {
         prev.capability.state === this.capability.state &&
         prev.capability.reason === this.capability.reason,
     );
-    const samePayload = Boolean(prev && prev.payloadFingerprint === payloadFingerprint);
+    // A payload-drift probe deliberately clears lastPayload. Do not treat a
+    // later fingerprint match as continuity unless the old payload is still
+    // available for comparison.
+    const samePayload = Boolean(
+      prev && previousPayload && prev.payloadFingerprint === payloadFingerprint,
+    );
     const payloadContinuation = Boolean(
       sameRoute &&
-        (samePayload ||
-          (previousPayload && isPayloadContinuation(previousPayload, payload, model.api))),
+        previousPayload &&
+        (samePayload || isPayloadContinuation(previousPayload, payload, model.api)),
     );
     const previousTurnObserved = Boolean(prev && prev.latestRealTurn.observedAt !== null);
     const comparableContinuation = payloadContinuation && previousTurnObserved;
@@ -335,7 +340,10 @@ export class SessionWarmer {
       savingsKnown,
       pricingSource: pricing.source,
       lastActivityAt: Date.now(),
-      lastProbeAt: null,
+      // Keep the latest probe alongside a continuing real-turn observation so
+      // /warm can show whether that probe preceded the next real turn. A
+      // changed prefix starts a new anchor and must not inherit old evidence.
+      lastProbeAt: preserveSessionStats ? (prev?.lastProbeAt ?? null) : null,
       estimatedSavingsUsd:
         savingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
       probeCount: preserveSessionStats ? (prev?.probeCount ?? 0) : 0,
@@ -343,7 +351,7 @@ export class SessionWarmer {
       probeMissCount: preserveSessionStats ? (prev?.probeMissCount ?? 0) : 0,
       consecutiveFailures: 0,
       latestRealTurn: realTurn,
-      latestProbe: null,
+      latestProbe: preserveSessionStats ? (prev?.latestProbe ?? null) : null,
     };
     this.realTurnBoundaryReason = "awaiting real-turn usage";
     this.realTurnContinuity = comparableContinuation;
