@@ -38,7 +38,7 @@ File logging is optional. All evidence comes from:
    Expect:
 
    ```
-   enabled family=anthropic-short capability=verified capabilityReason=first-party Anthropic Messages route with cache markers provider=anthropic/claude-fable-5 api=anthropic-messages realRead=<big> realWrite=0 probeRead=none prompt≈<big> probeHits=0 probeMisses=0 realTurn=hit (...) probe=none probeFailStreak=0/3 savings=est. $0.0000 saved pricing=model nextDue=<ISO timestamp> pfp=<8-char hash> autoWarm=on last=none
+   enabled family=anthropic-short capability=verified capabilityReason=first-party Anthropic Messages route with cache markers provider=anthropic/claude-fable-5 api=anthropic-messages strategy=anthropic-short cadence=5m prompt-cache TTL intervalMs=240000 cacheKey=none realRead=<big> realWrite=0 probeRead=none prompt≈<big> probeHits=0 probeMisses=0 realTurn=hit (...) probe=none probeFailStreak=0/3 savings=est. $0.0000 saved pricing=model nextDue=<ISO timestamp> pfp=<8-char hash> autoWarm=on last=none
    ```
 
    - `inactive capability=unsupported` -> this route is unsupported and the provider will not be called, abort.
@@ -50,7 +50,11 @@ File logging is optional. All evidence comes from:
 
    Do not start a timer test for `capability=unverified` or `capability=unsupported`.
 
-   Direct xAI is currently unverified and supports only a clearly labelled manual probe when its captured payload is safe.
+   Direct xAI Grok 4.5 on `https://api.x.ai/v1` with `openai-responses` is verified as a best-effort route.
+
+   Its captured payload must include a stable `prompt_cache_key` before the automatic cadence can start.
+
+   Do not treat the 4m cadence as a provider TTL guarantee.
 
 ## Step 1: smoke test (before any waiting)
 
@@ -152,6 +156,15 @@ whether the 4m cadence actually beats the TTL.
 | `anthropic-long` | ~48m | requires Pi cache retention set to long |
 | `openai-explicit` | ~24m | needs `supportsExplicitPromptCacheMode` |
 | `openai-implicit` | ~6.4m | ~20m (3 ticks) |
+| `xai-best-effort` | 4m heuristic | at least 12m, record observed hit rate |
 
 `anthropic-short` is the recommended default for validation. The others follow
 the same procedure with longer waits.
+
+For `xai-best-effort`, record the route, payload fingerprint, cache-key identity,
+read, write, output, cost, and retry values for every probe.
+
+xAI may report cached reads without a separate cache-write token count through Pi.
+
+Repeated no-read/no-write probes must stop and request a new real-turn anchor when
+the configured failure budget is reached.

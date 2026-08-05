@@ -3,13 +3,16 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
+  applyXaiWarmOutputLimit,
   classifyProbeOutcome,
   classifyRealTurnObservation,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
   decideCodexOversizedAction,
   DEFER_BACKOFF_MS,
+  getPromptCacheKey,
   isPayloadContinuation,
   isSafeReplayPayload,
+  isSafeXaiReplayPayload,
   resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
@@ -298,6 +301,10 @@ export class SessionWarmer {
 
     this.lastPayload = structuredClone(payload);
     this.plan = resolveStrategy(model, this.config, this.lastPayload);
+    const cacheKey = getPromptCacheKey(this.lastPayload, model.api);
+    const cacheKeyFingerprint = cacheKey
+      ? stableFingerprint(cacheKey).split(":")[0]!.slice(0, 8)
+      : "none";
     const manualProbeAvailable =
       this.capability.manualProbe && isSafeReplayPayload(this.lastPayload, model.api);
 
@@ -331,6 +338,7 @@ export class SessionWarmer {
       cacheFamily: this.plan.family,
       cacheRetention: this.plan.cacheRetention,
       payloadFingerprint,
+      cacheKeyFingerprint,
       // These fields remain as compatibility aliases for the scheduler and
       // older integrations. The authoritative observations are below.
       cachedTokens: 0,
@@ -370,6 +378,7 @@ export class SessionWarmer {
       manualProbe: this.capability.manualProbe,
       manualProbeAvailable,
       payloadFingerprint,
+      cacheKeyFingerprint,
       prefixChanged,
       realTurnContinuity: comparableContinuation ? "comparable" : "unknown",
       realTurnContinuityReason: continuityReason,
@@ -459,6 +468,7 @@ export class SessionWarmer {
       promptTokens,
       realTurnState: observation.state,
       realTurnReason: observation.reason,
+      cacheKeyFingerprint: this.anchor.cacheKeyFingerprint,
       payloadFingerprint: observation.payloadFingerprint,
       retryState: "probe failure streak reset by real turn",
     });
@@ -505,6 +515,7 @@ export class SessionWarmer {
       capabilityReason: this.anchor?.capability.reason ?? this.capability?.reason,
       hasPayload: Boolean(this.lastPayload),
       cachedTokens: this.anchor?.cachedTokens ?? 0,
+      cacheKeyFingerprint: this.anchor?.cacheKeyFingerprint,
       realTurnState: this.anchor?.latestRealTurn.state,
       realTurnReason: this.anchor?.latestRealTurn.reason,
       probeOutcome: this.anchor?.latestProbe?.outcome,
@@ -541,6 +552,7 @@ export class SessionWarmer {
         ? `${model.provider}/${model.id}`
         : "none";
     const api = this.anchor?.modelApi ?? model?.api ?? "none";
+    const cacheKey = this.anchor?.cacheKeyFingerprint ?? "none";
     const realTurn = this.anchor ? formatRealTurnStatus(this.anchor.latestRealTurn) : "none";
     const probe = this.anchor ? formatProbeStatus(this.anchor.latestProbe) : "none";
     const retry = this.anchor
@@ -575,6 +587,7 @@ export class SessionWarmer {
         `realTurn=${realTurn}`,
         `probe=${probe}`,
         retry,
+        `cacheKey=${cacheKey}`,
         this.anchor ? `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}` : "pfp=none",
         last,
         log.trim(),
@@ -589,9 +602,11 @@ export class SessionWarmer {
         "capability=verified",
         `provider=${route}`,
         `api=${api}`,
+        "strategy=none",
         "realTurn=none",
         "probe=none",
         retry,
+        "cacheKey=none",
         blocked,
         last,
         log.trim(),
@@ -612,6 +627,8 @@ export class SessionWarmer {
         `realTurn=${realTurn}`,
         `probe=${probe}`,
         retry,
+        `strategy=${this.anchor.cacheFamily}`,
+        `cacheKey=${cacheKey}`,
         `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
         last,
         log.trim(),
@@ -620,15 +637,18 @@ export class SessionWarmer {
         .join(" ");
     }
     if (!this.plan || !this.plan.automaticWarm || this.plan.intervalMs === null) {
+      const strategyReason = this.plan?.ttlLabel ?? "no automatic strategy";
       return [
         "inactive capability=verified",
         `provider=${route}`,
         `api=${api}`,
         `capabilityReason=${this.anchor.capability.reason}`,
-        "reason=no automatic strategy",
+        `reason=${strategyReason}`,
+        `strategy=${this.anchor.cacheFamily}`,
         `realTurn=${realTurn}`,
         `probe=${probe}`,
         retry,
+        `cacheKey=${cacheKey}`,
         `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
         last,
         log.trim(),
@@ -651,6 +671,10 @@ export class SessionWarmer {
       `capabilityReason=${this.anchor.capability.reason}`,
       `provider=${route}`,
       `api=${api}`,
+      `strategy=${this.anchor.cacheFamily}`,
+      `cadence=${this.plan.ttlLabel}`,
+      `intervalMs=${this.plan.intervalMs}`,
+      `cacheKey=${cacheKey}`,
       `realRead=${this.anchor.latestRealTurn.cacheRead}`,
       `realWrite=${this.anchor.latestRealTurn.cacheWrite}`,
       `probeRead=${this.anchor.latestProbe?.cacheRead ?? "none"}`,
@@ -775,6 +799,7 @@ export class SessionWarmer {
       capabilityReason: anchor.capability.reason,
       automaticWarm: anchor.capability.automaticWarm,
       family: anchor.cacheFamily,
+      cacheKeyFingerprint: anchor.cacheKeyFingerprint,
       delayMs: delay,
       nextDueAt: new Date(this.nextDueAt).toISOString(),
       reason: options.reason ?? "ttl",
@@ -930,6 +955,8 @@ export class SessionWarmer {
       ok,
       detail,
       probeOutcome,
+      family: this.anchor?.cacheFamily,
+      cacheKeyFingerprint: this.anchor?.cacheKeyFingerprint,
       payloadFingerprint: this.anchor?.payloadFingerprint,
       retryState: this.anchor
         ? `${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
@@ -972,6 +999,11 @@ export class SessionWarmer {
       provider: result.provider ?? anchor?.provider ?? model?.provider,
       modelId: result.modelId ?? anchor?.modelId ?? model?.id,
       api: result.api ?? anchor?.modelApi ?? model?.api,
+      family: result.family ?? anchor?.cacheFamily ?? this.plan?.family,
+      strategyLabel: result.strategyLabel ?? this.plan?.ttlLabel,
+      intervalMs:
+        result.intervalMs !== undefined ? result.intervalMs : (this.plan?.intervalMs ?? null),
+      cacheKeyFingerprint: result.cacheKeyFingerprint ?? anchor?.cacheKeyFingerprint,
       retryState:
         result.retryState ??
         (anchor ? `${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}` : "none"),
@@ -1067,6 +1099,20 @@ export class SessionWarmer {
       };
     }
 
+    if (anchor.cacheFamily === "xai-best-effort" && !isSafeXaiReplayPayload(payload)) {
+      const detail =
+        "xAI best-effort probe requires an exact Responses payload with a stable prompt_cache_key";
+      this.clearTimers();
+      this.recordAttempt(reason, false, detail);
+      this.showIdle(ctx, "xAI probe unavailable", detail);
+      return buildWarmResult({
+        fingerprint: anchor.payloadFingerprint,
+        error: detail,
+        unavailable: true,
+        anchor,
+      });
+    }
+
     if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
       const detail = "captured payload shape is not safe for an unverified manual probe";
       this.recordAttempt(reason, false, detail);
@@ -1157,6 +1203,8 @@ export class SessionWarmer {
       capabilityReason: anchor.capability.reason,
       automaticWarm: anchor.capability.automaticWarm,
       manualProbe: anchor.capability.manualProbe,
+      family: anchor.cacheFamily,
+      cacheKeyFingerprint: anchor.cacheKeyFingerprint,
       payloadFingerprint: fingerprint,
     });
 
@@ -1197,10 +1245,13 @@ export class SessionWarmer {
             // body that wins is this onPayload result (by design).
             const cloned = structuredClone(payload);
             const codex = model.api === "openai-codex-responses";
+            const xaiBestEffort = anchor.cacheFamily === "xai-best-effort";
             const shaped = codex
               ? appendWarmUserTurn(cloned, this.config.warmSuffix, model.api)
               : cloned;
-            return applyWarmOutputLimit(shaped, this.config.maxOutputTokens, model.api);
+            return xaiBestEffort
+              ? applyXaiWarmOutputLimit(shaped, this.config.maxOutputTokens)
+              : applyWarmOutputLimit(shaped, this.config.maxOutputTokens, model.api);
           },
         },
       );
@@ -1238,6 +1289,7 @@ export class SessionWarmer {
             cacheRead: result.cacheRead,
             cacheWrite: result.cacheWrite,
             consecutiveFailuresBefore: anchor.consecutiveFailures,
+            maxConsecutiveFailures: this.config.maxConsecutiveFailures,
           });
       this.observeProbeResult(anchor, result, model, outcome, fingerprint);
 
@@ -1308,6 +1360,12 @@ export class SessionWarmer {
         renderWarmHitUi(ctx, this.config, anchor, plan, result.cacheRead);
       } else {
         const payloadDrift = outcome === "payload-drift";
+        // classifyProbeOutcome upgrades the final budgeted xAI no-read result
+        // to payload-drift because this route may not report cache writes.
+        const xaiNoWriteReanchor =
+          anchor.cacheFamily === "xai-best-effort" &&
+          result.cacheRead === 0 &&
+          result.cacheWrite === 0;
         const transientImplicitMiss = outcome === "transient-miss";
         anchor.consecutiveFailures += 1;
         const detail =
@@ -1316,19 +1374,18 @@ export class SessionWarmer {
         this.recordAttempt(reason, false, detail, usageSnap, outcome);
 
         if (payloadDrift) {
+          const reanchorDetail = xaiNoWriteReanchor
+            ? "Repeated xAI no-read/no-write probes; xAI does not expose cache-write usage, so re-anchor is required."
+            : `write=${result.cacheWrite} read=0. Payload likely diverged from provider cache.`;
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `pi-warm-cache: probe miss with cache write (read=${result.cacheRead} write=${result.cacheWrite}); re-anchor required.`,
+              `pi-warm-cache: probe miss; re-anchor required (${reanchorDetail})`,
               "warning",
             );
           }
           this.lastPayload = null;
           shouldRescheduleAfter = false;
-          this.showFailure(
-            ctx,
-            "probe miss · re-anchor needed",
-            `write=${result.cacheWrite} read=0. Payload likely diverged from provider cache.`,
-          );
+          this.showFailure(ctx, "probe miss · re-anchor needed", reanchorDetail);
           return result;
         }
 
