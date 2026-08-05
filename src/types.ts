@@ -61,6 +61,7 @@ export type CacheFamily =
   | "anthropic-long"
   | "openai-explicit"
   | "openai-implicit"
+  | "xai-best-effort"
   | "unverified"
   | "unsupported";
 
@@ -134,6 +135,8 @@ export interface CacheAnchor {
   cacheRetention: CacheRetention;
   /** Hash of the captured provider payload (identity / logging). */
   payloadFingerprint: string;
+  /** Redacted identity of the provider cache-routing key, when present. */
+  cacheKeyFingerprint: string;
   /** Compatibility prompt-size hint; authoritative values live in observations. */
   cachedTokens: number;
   /** Compatibility prompt-size hint; authoritative values live in observations. */
@@ -172,6 +175,14 @@ export interface WarmResult {
   capabilityReason?: string;
   /** Consecutive probe retry state at the time of this result. */
   retryState?: string;
+  /** Named cache strategy used by this route. */
+  family?: CacheFamily;
+  /** Human-readable strategy or cadence label. */
+  strategyLabel?: string;
+  /** Configured delay before the next automatic probe. */
+  intervalMs?: number | null;
+  /** Redacted identity of the provider cache-routing key, when present. */
+  cacheKeyFingerprint?: string;
   /** True when a probe was rejected before any provider request. */
   unavailable?: boolean;
   provider?: string;

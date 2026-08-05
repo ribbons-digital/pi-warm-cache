@@ -9,6 +9,7 @@
 import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
+  applyXaiWarmOutputLimit,
   canManualProbe,
   classifyProbeOutcome,
   classifyRealTurnObservation,
@@ -19,8 +20,10 @@ import {
   minimumOutputTokensForPayload,
   modelSupportsLongCacheRetention,
   isSafeReplayPayload,
+  isSafeXaiReplayPayload,
   OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
   payloadHasAnthropicLongTtl,
+  XAI_BEST_EFFORT_INTERVAL_MS,
   resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
@@ -94,6 +97,27 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     `openai-responses floor ${OPENAI_RESPONSES_MIN_OUTPUT_TOKENS}, got ${out.max_output_tokens}`,
   );
   deepEqualExcept(original, out, WARM_MUTABLE_PAYLOAD_KEYS);
+}
+
+// 2a) xAI Responses: cap only the legal output field and preserve cache identity.
+{
+  const original = {
+    model: "grok-4.5",
+    max_output_tokens: 4096,
+    prompt_cache_key: "xai-session-1",
+    input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+    instructions: "Keep this exact.",
+    reasoning: { effort: "high", summary: "auto" },
+    tools: [{ type: "function", name: "bash" }],
+  };
+  const out = applyXaiWarmOutputLimit(structuredClone(original), 1) as typeof original;
+  assert(out.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS, "xAI output cap should use the legal floor");
+  assert(out.prompt_cache_key === original.prompt_cache_key, "xAI cache key must stay unchanged");
+  assert(out.instructions === original.instructions, "xAI instructions must stay unchanged");
+  assert(JSON.stringify(out.reasoning) === JSON.stringify(original.reasoning), "xAI reasoning must stay unchanged");
+  assert(JSON.stringify(out.tools) === JSON.stringify(original.tools), "xAI tools must stay unchanged");
+  assert(!("max_tokens" in out), "xAI must not receive max_tokens");
+  assert(!("max_completion_tokens" in out), "xAI must not receive max_completion_tokens");
 }
 
 // 2b) Codex: strip illegal caps; keep effort/tool_choice; suffix append is separate.
@@ -217,27 +241,65 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     provider: "xai",
     api: "openai-responses",
     baseUrl: "https://api.x.ai/v1",
+    compat: { sessionAffinityFormat: "openai", supportsLongCacheRetention: false },
   } as any;
   const xaiCapability = resolveProviderCapability(directXai);
-  assert(xaiCapability.state === "unverified", "direct xAI must be unverified");
-  assert(!xaiCapability.automaticWarm, "unverified xAI must not auto-warm");
-  assert(xaiCapability.manualProbe, "direct xAI may expose a manual probe");
+  assert(xaiCapability.state === "verified", "direct xAI Grok 4.5 should be verified");
+  assert(xaiCapability.automaticWarm, "verified xAI should allow automatic warming");
+  assert(!xaiCapability.manualProbe, "verified xAI does not need an unverified probe escape hatch");
   const insecureXai = { ...directXai, baseUrl: "http://api.x.ai/v1" } as any;
   assert(
     resolveProviderCapability(insecureXai).state === "unsupported",
     "HTTP xAI routes must not receive first-party capability",
   );
+  const missingBaseUrl = { ...directXai, baseUrl: undefined } as any;
+  assert(
+    resolveProviderCapability(missingBaseUrl).state === "unsupported",
+    "xAI routes without endpoint metadata must fail closed",
+  );
+  const wrongRouting = {
+    ...directXai,
+    compat: { sessionAffinityFormat: "openrouter" },
+  } as any;
+  assert(
+    resolveProviderCapability(wrongRouting).state === "unsupported",
+    "proxy cache-routing metadata must fail closed for direct xAI",
+  );
   const xai = resolveStrategy(directXai, DEFAULT_CONFIG);
-  assert(xai.family === "unverified", "xAI must not inherit OpenAI family wording");
-  assert(xai.intervalMs === null, "unverified xAI must not receive a timer interval");
-  assert(xai.ttlLabel.includes("unverified"), "xAI must not receive a fixed TTL label");
+  assert(xai.family === "xai-best-effort", "xAI should use its named best-effort family");
+  assert(xai.intervalMs === XAI_BEST_EFFORT_INTERVAL_MS, "xAI should use its provider cadence by default");
+  assert(xai.ttlLabel.includes("best-effort"), "xAI should not expose a fixed TTL label");
+  assert(xai.automaticWarm, "xAI strategy should allow automatic warming after payload validation");
 
   const xaiPayload = {
     model: "grok-4.5",
     input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+    prompt_cache_key: "xai-session-1",
   };
   assert(isSafeReplayPayload(xaiPayload, directXai.api), "Responses payload should be probe-safe");
-  assert(canManualProbe(directXai, xaiPayload), "safe xAI payload should allow a manual probe");
+  assert(isSafeXaiReplayPayload(xaiPayload), "xAI payload should include a stable prompt-cache key");
+  assert(!canManualProbe(directXai, xaiPayload), "verified xAI should not use the unverified probe path");
+  const xaiWithoutKey = { ...xaiPayload, prompt_cache_key: undefined };
+  const xaiWithoutKeyStrategy = resolveStrategy(directXai, DEFAULT_CONFIG, xaiWithoutKey);
+  assert(!xaiWithoutKeyStrategy.automaticWarm, "xAI must fail closed without a cache key");
+  assert(
+    xaiWithoutKeyStrategy.ttlLabel.includes("stable prompt-cache key"),
+    "missing xAI cache key should explain why warming is inactive",
+  );
+  const xaiOverride = resolveStrategy(
+    directXai,
+    { ...DEFAULT_CONFIG, intervalMs: 75_000 },
+    xaiPayload,
+  );
+  assert(xaiOverride.intervalMs === 75_000, "xAI should honor the existing interval override");
+  const otherXai = { ...directXai, id: "grok-4.3" } as any;
+  const otherXaiCapability = resolveProviderCapability(otherXai);
+  assert(otherXaiCapability.state === "unverified", "other xAI models remain unverified");
+  assert(otherXaiCapability.manualProbe, "other xAI models retain manual probe access");
+  assert(
+    canManualProbe(otherXai, xaiPayload),
+    "safe payload should allow a manual probe for an unverified xAI model",
+  );
   assert(
     !canManualProbe(directXai, { model: "grok-4.5", messages: [] }),
     "unsafe xAI payload should not allow a manual probe",
@@ -280,7 +342,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   );
   assert(!canManualProbe(unknownResponses, xaiPayload), "unknown routes must reject manual probes");
 
-  const unverifiedProbe = buildWarmResult({
+  const xaiProbe = buildWarmResult({
     fingerprint: "xai-payload",
     usage: {
       input: 4,
@@ -296,9 +358,9 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       capability: xaiCapability,
     },
   });
-  assert(unverifiedProbe.cacheHit, "unverified probe should retain observed cache-read result");
-  assert(unverifiedProbe.probeOutcome === "hit", "probe result should identify a probe hit");
-  assert(unverifiedProbe.estimatedSavedUsd === 0, "unverified probe must not claim savings");
+  assert(xaiProbe.cacheHit, "xAI probe should retain observed cache-read result");
+  assert(xaiProbe.probeOutcome === "hit", "xAI probe result should identify a hit");
+  assert(xaiProbe.estimatedSavedUsd > 0, "verified xAI savings should use observed cache reads");
   const rejectedProbe = buildWarmResult({
     fingerprint: "unsafe-xai-payload",
     error: "captured payload shape is not safe",
@@ -307,7 +369,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       inputPricePerMTok: 2,
       cacheReadPricePerMTok: 0.3,
       savingsKnown: false,
-      capability: xaiCapability,
+      capability: otherXaiCapability,
     },
   });
   assert(rejectedProbe.unavailable === true, "policy rejection must be marked unavailable");
@@ -317,7 +379,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       estimatedSavingsUsd: 0,
       savingsKnown: false,
       pricingSource: "model",
-      capability: xaiCapability,
+      capability: otherXaiCapability,
     }) === "n/a (unverified route)",
     "unverified route must not use the no-pricing message for savings",
   );
@@ -360,6 +422,45 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       consecutiveFailuresBefore: 0,
     }) === "payload-drift",
     "write without read should be a payload-drift candidate",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "xai-best-effort",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 0,
+      maxConsecutiveFailures: 3,
+    }) === "transient-miss",
+    "first xAI no-read/no-write response should retry quietly",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "xai-best-effort",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 1,
+      maxConsecutiveFailures: 3,
+    }) === "miss",
+    "second xAI no-read/no-write response should remain retryable",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "xai-best-effort",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 2,
+      maxConsecutiveFailures: 3,
+    }) === "payload-drift",
+    "repeated xAI misses should request a re-anchor when cache writes are unavailable",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "xai-best-effort",
+      cacheRead: 0,
+      cacheWrite: 100,
+      consecutiveFailuresBefore: 0,
+    }) === "payload-drift",
+    "reported xAI cache writes should request an immediate re-anchor",
   );
 }
 
@@ -627,6 +728,23 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(warmer.getStatusText().includes("probeMisses=1"), "status should expose probe misses");
   assert(warmer.getStatusText().includes("probeFailStreak=0/3"), "successful probe should reset retry state");
 
+  // A continuing real turn gets a fresh observation, but the preceding probe
+  // remains visible so users can compare the two cache signals.
+  const continuedPayload = {
+    model: model.id,
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "hello" }] },
+      { role: "assistant", content: [{ type: "output_text", text: "answer" }] },
+    ],
+    prompt_cache_key: "warmer-test",
+  };
+  warmer.capturePayload(continuedPayload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 0, cacheWrite: 100, output: 2 });
+  assert(warmer.getLatestRealTurnObservation()?.state === "miss", "real turn should classify independently");
+  assert(warmer.getLatestProbeObservation()?.outcome === "hit", "real turn should retain the preceding probe");
+  assert(warmer.getStatusText().includes("realTurn=miss"), "status should expose the real-turn miss");
+  assert(warmer.getStatusText().includes("probe=hit"), "status should retain the probe outcome");
+
   const providerError = await warmer.warmNow(ctx);
   assert(!providerError.ok && providerError.probeOutcome === "error", "provider error should be an error outcome");
   assert(warmer.getLatestProbeObservation()?.outcome === "error", "provider error should remain a probe error");
@@ -637,6 +755,122 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(warmer.getLatestProbeObservation()?.outcome === "payload-drift", "status should retain payload drift");
   assert(warmer.getStatusText().includes("payload=none"), "payload drift should clear the replay payload");
   assert(notifications.some((entry) => entry.level === "warning"), "payload drift should warn immediately");
+
+  // Recapturing the same payload after drift must create a fresh anchor. The
+  // old fingerprint alone is not enough to prove continuity because the old
+  // replay payload was deliberately discarded.
+  warmer.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "warmer-test",
+    },
+    ctx,
+  );
+  const reanchoredStatus = warmer.getStatusText();
+  assert(warmer.getLatestProbeObservation() === null, "re-anchor should clear the prior probe observation");
+  assert(
+    warmer.getLatestRealTurnObservation()?.reason === "prefix changed",
+    "re-anchor should mark the continuity boundary",
+  );
+  assert(reanchoredStatus.includes("probeHits=0"), "re-anchor should reset probe hits");
+  assert(reanchoredStatus.includes("probeMisses=0"), "re-anchor should reset probe misses");
+  assert(
+    reanchoredStatus.includes("savings=est. $0.0000 saved"),
+    "re-anchor should reset probe savings",
+  );
+  warmer.dispose();
+}
+
+// 10) Direct xAI uses the exact anchor, stable cache routing, legal output
+// shaping, quiet first miss, and a bounded re-anchor after repeated misses.
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  const responses = [
+    { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
+    { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
+    { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
+  ];
+  const xaiModel = {
+    id: "grok-4.5",
+    provider: "xai",
+    api: "openai-responses",
+    baseUrl: "https://api.x.ai/v1",
+    compat: { sessionAffinityFormat: "openai", supportsLongCacheRetention: false },
+    cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
+  } as any;
+  const capturedPayload = {
+    model: "grok-4.5",
+    input: [{ role: "user", content: [{ type: "input_text", text: "keep this exact" }] }],
+    prompt_cache_key: "xai-session",
+    max_output_tokens: 4096,
+    instructions: "Do not change this.",
+    reasoning: { effort: "high", summary: "auto" },
+    tools: [{ type: "function", name: "bash" }],
+  };
+  const calls: Array<{ options: any; payload: any }> = [];
+  const completeStub = async (_model: any, _context: any, options: any): Promise<any> => {
+    const payload = options.onPayload?.(structuredClone({
+      model: "grok-4.5",
+      input: [],
+      prompt_cache_key: "generated-by-adapter",
+    }), xaiModel);
+    calls.push({ options, payload });
+    return responses.shift();
+  };
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model: xaiModel,
+    hasUI: true,
+    ui,
+    thinkingLevel: "high",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "xai-session" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "xai-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "high" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+  });
+  warmer.capturePayload(capturedPayload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+
+  const first = await warmer.warmNow(ctx);
+  assert(first.family === "xai-best-effort", "xAI result should identify its strategy");
+  assert(first.probeOutcome === "transient-miss", "first xAI miss should retry quietly");
+  assert(first.cacheKeyFingerprint !== "none", "xAI result should expose cache-key identity");
+  assert(warmer.getStatusText().includes("strategy=xai-best-effort"), "status should expose the xAI strategy");
+  assert(warmer.getStatusText().includes("cadence=xAI best-effort probe cadence"), "status should expose the xAI cadence");
+  assert(warmer.getStatusText().includes("cacheKey="), "status should expose cache-key identity");
+  assert(calls[0]?.options.sessionId === "xai-session", "xAI probe should reuse the stable session identity");
+  assert(calls[0]?.options.cacheRetention === "short", "xAI probe should use short cache retention");
+  const shaped = calls[0]?.payload as Record<string, unknown>;
+  assert(shaped.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS, "xAI probe should cap output legally");
+  assert(shaped.prompt_cache_key === capturedPayload.prompt_cache_key, "xAI probe should preserve the cache key");
+  assert(shaped.instructions === capturedPayload.instructions, "xAI probe should preserve instructions");
+  assert(JSON.stringify(shaped.reasoning) === JSON.stringify(capturedPayload.reasoning), "xAI probe should preserve reasoning");
+  assert(JSON.stringify(shaped.tools) === JSON.stringify(capturedPayload.tools), "xAI probe should preserve tools");
+  assert(JSON.stringify(shaped.input) === JSON.stringify(capturedPayload.input), "xAI probe should preserve the exact prefix");
+  assert(notifications.every((entry) => entry.level !== "warning"), "first xAI miss should not warn immediately");
+
+  const second = await warmer.warmNow(ctx);
+  assert(second.probeOutcome === "miss", "second xAI miss should remain retryable");
+  const third = await warmer.warmNow(ctx);
+  assert(third.probeOutcome === "payload-drift", "repeated xAI misses should request re-anchor");
+  assert(warmer.getStatusText().includes("payload=none"), "xAI repeated misses should clear the replay payload");
+  assert(notifications.some((entry) => entry.level === "warning"), "xAI re-anchor should be visible");
   warmer.dispose();
 }
 

@@ -26,14 +26,21 @@ export function renderWaitingUi(
   const tokens = formatTokens(anchor.cachedTokens || anchor.promptTokens);
   const saved = formatSavingsLabel(anchor);
 
-  const title = `Cache-warm wait · 1 monitor on duty`;
-  const line1 = `Continuation deferred ${waitLabel} - the timed wake stays inside the ${plan.ttlLabel}.`;
+  const bestEffort = plan.family === "xai-best-effort";
+  const title = bestEffort
+    ? `Cache-warm wait · xAI best-effort monitor`
+    : `Cache-warm wait · 1 monitor on duty`;
+  const line1 = bestEffort
+    ? `Best-effort probe scheduled in ${waitLabel}. xAI cache retention is not guaranteed.`
+    : `Continuation deferred ${waitLabel} - the timed wake stays inside the ${plan.ttlLabel}.`;
   const line2 =
     anchor.probeHitCount > 0
       ? anchor.savingsKnown
         ? `~${tokens} tokens kept warm · ${saved} vs cold re-reads`
         : `~${tokens} tokens kept warm · savings ${saved}`
-      : `~${tokens} tokens kept warm · waiting for first verified probe hit`;
+      : bestEffort
+        ? `~${tokens} tokens kept warm · waiting for first observed xAI probe hit`
+        : `~${tokens} tokens kept warm · waiting for first verified probe hit`;
 
   ctx.ui.setWidget(WIDGET_ID, [
     ctx.ui.theme.fg("accent", `⚡ ${title}`),
@@ -57,10 +64,16 @@ export function renderWarmHitUi(
   if (!ctx.hasUI || !config.showWidget) return;
   const tokens = formatTokens(cacheRead || anchor.cachedTokens);
   const saved = formatSavingsLabel(anchor);
+  const bestEffort = plan.family === "xai-best-effort";
+  const hitLabel = bestEffort ? "xAI best-effort probe hit" : "probe hit";
+  const nextLabel = bestEffort
+    ? `Next best-effort probe in ${plan.waitLabel ?? "n/a"}. ` +
+      "No fixed xAI cache lifetime is promised."
+    : `Next probe in ${plan.waitLabel ?? "n/a"} (${plan.ttlLabel}).`;
 
   ctx.ui.setWidget(WIDGET_ID, [
-    ctx.ui.theme.fg("success", `⚡ Cache warm · probe hit ~${tokens} tokens`),
-    ctx.ui.theme.fg("dim", `Next probe in ${plan.waitLabel ?? "n/a"} (${plan.ttlLabel}).`),
+    ctx.ui.theme.fg("success", `⚡ Cache warm · ${hitLabel} ~${tokens} tokens`),
+    ctx.ui.theme.fg("dim", nextLabel),
     ctx.ui.theme.fg(
       "warning",
       anchor.savingsKnown
@@ -71,7 +84,7 @@ export function renderWarmHitUi(
 
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("success", `probe hit · ~${tokens}`),
+    ctx.ui.theme.fg("success", `${hitLabel} · ~${tokens}`),
   );
 }
 

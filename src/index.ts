@@ -148,8 +148,12 @@ export default function piWarmCache(pi: ExtensionAPI) {
           `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
           `out=${result.output} cost=$${result.costUsd.toFixed(4)}`;
         const fingerprint = `pfp=${result.fingerprint ? result.fingerprint.slice(0, 8) : "none"}`;
+        const strategy =
+          `strategy=${result.family ?? "unknown"} cadence=${result.strategyLabel ?? "unknown"} ` +
+          `intervalMs=${result.intervalMs ?? "none"}`;
+        const cacheKey = `cacheKey=${result.cacheKeyFingerprint ?? "none"}`;
         const retry = `retry=${result.retryState ?? "none"}`;
-        const diagnostics = `${route}; ${capability}; ${usage}; ${fingerprint}; ${retry}`;
+        const diagnostics = `${route}; ${capability}; ${strategy}; ${cacheKey}; ${usage}; ${fingerprint}; ${retry}`;
         if (!result.ok) {
           const failureLabel =
             result.unavailable || result.capabilityState === "unsupported"
@@ -165,21 +169,23 @@ export default function piWarmCache(pi: ExtensionAPI) {
           );
           return;
         }
+        const probeLabel =
+          result.family === "xai-best-effort" ? "Best-effort probe" : "Probe";
         if (result.probeOutcome === "transient-miss") {
           ctx.ui.notify(
-            `Probe miss (transient; retry scheduled) (${diagnostics})`,
+            `${probeLabel} miss (transient; retry scheduled) (${diagnostics})`,
             "info",
           );
           return;
         }
         if (result.probeOutcome === "payload-drift") {
-          ctx.ui.notify(`Probe miss (payload drift; re-anchor required) (${diagnostics})`, "warning");
+          ctx.ui.notify(`${probeLabel} miss (payload drift; re-anchor required) (${diagnostics})`, "warning");
           return;
         }
         ctx.ui.notify(
           result.cacheHit
-            ? `Probe hit (${diagnostics})`
-            : `Probe miss (${diagnostics})`,
+            ? `${probeLabel} hit (${diagnostics})`
+            : `${probeLabel} miss (${diagnostics})`,
           result.cacheHit ? "info" : "warning",
         );
         return;

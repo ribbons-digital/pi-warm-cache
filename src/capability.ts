@@ -3,10 +3,12 @@ import type { ProviderCapability, ProviderCapabilityState } from "./types.ts";
 
 type RouteCompat = {
   cacheControlFormat?: string;
+  sessionAffinityFormat?: "openai" | "openai-nosession" | "openrouter";
 };
 
 const OPENAI_COMPAT_APIS = new Set(["openai-responses", "openai-completions"]);
 const XAI_PROBE_APIS = new Set(["openai-responses", "openai-completions"]);
+const XAI_BEST_EFFORT_MODEL_IDS = new Set(["grok-4.5"]);
 const ANTHROPIC_FIRST_PARTY_HOSTS = new Set(["api.anthropic.com"]);
 const OPENAI_FIRST_PARTY_HOSTS = new Set(["api.openai.com"]);
 const XAI_FIRST_PARTY_HOSTS = new Set(["api.x.ai"]);
@@ -27,8 +29,65 @@ function hasFirstPartyBaseUrl(model: Model<any>, hosts: Set<string>): boolean {
   }
 }
 
+function hasExplicitFirstPartyBaseUrl(model: Model<any>, hosts: Set<string>): boolean {
+  if (!model.baseUrl) return false;
+  return hasFirstPartyBaseUrl(model, hosts);
+}
+
+function hasXaiCacheRoutingMetadata(model: Model<any>): boolean {
+  const sessionAffinityFormat = getCompat(model)?.sessionAffinityFormat;
+  // The xAI provider uses the OpenAI Responses adapter. An omitted format is
+  // safe because that adapter defaults direct first-party routes to "openai".
+  return (
+    sessionAffinityFormat === undefined ||
+    sessionAffinityFormat === "openai" ||
+    sessionAffinityFormat === "openai-nosession"
+  );
+}
+
 function routeLabel(model: Model<any>): string {
   return `${model.provider || "unknown"}/${model.api || "unknown"}`;
+}
+
+/**
+ * Identify the first explicitly supported direct xAI route.
+ * Provider identity, API transport, model id, endpoint, and routing metadata
+ * must all agree. Display names and proxy base URLs do not qualify.
+ */
+export function isDirectXaiGrokRoute(model: Model<any> | undefined): boolean {
+  if (!model || model.provider !== "xai" || model.api !== "openai-responses") return false;
+  if (!XAI_BEST_EFFORT_MODEL_IDS.has(model.id)) return false;
+  if (!hasExplicitFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)) return false;
+  return hasXaiCacheRoutingMetadata(model);
+}
+
+/** Return the provider cache-routing key from an OpenAI Responses payload. */
+export function getPromptCacheKey(payload: unknown, api: string | undefined): string | null {
+  if (
+    api !== "openai-responses" &&
+    api !== "openai-codex-responses"
+  ) {
+    return null;
+  }
+  if (!payload || typeof payload !== "object") return null;
+  const key = (payload as Record<string, unknown>).prompt_cache_key;
+  return typeof key === "string" && key.trim().length > 0 ? key : null;
+}
+
+/**
+ * xAI Responses needs a provider cache key in the captured body before a
+ * best-effort probe can be armed. This is the route's stable cache identity.
+ */
+export function hasXaiPromptCacheKey(payload: unknown): boolean {
+  return (
+    isSafeReplayPayload(payload, "openai-responses") &&
+    Boolean(getPromptCacheKey(payload, "openai-responses"))
+  );
+}
+
+/** True when a captured direct xAI payload is safe for automatic replay. */
+export function isSafeXaiReplayPayload(payload: unknown): boolean {
+  return hasXaiPromptCacheKey(payload);
 }
 
 function capability(
@@ -90,12 +149,38 @@ export function resolveProviderCapability(
     return capability("verified", "registered OpenAI Codex Responses route");
   }
 
-  // Direct xAI is intentionally observable but not automatically warmed until
-  // the provider-specific strategy is validated. Do not use model names here.
+  // Direct xAI Grok 4.5 Responses is a named best-effort strategy. The model
+  // id is an exact route identity, not a display-name match. A missing or
+  // proxy endpoint fails closed before any automatic probe can be scheduled.
+  if (
+    model.provider === "xai" &&
+    model.api === "openai-responses" &&
+    model.id === "grok-4.5"
+  ) {
+    if (!hasExplicitFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)) {
+      return capability(
+        "unsupported",
+        "direct xAI Grok 4.5 requires an explicit https://api.x.ai first-party endpoint",
+      );
+    }
+    if (!hasXaiCacheRoutingMetadata(model)) {
+      return capability(
+        "unsupported",
+        "direct xAI Grok 4.5 route has unsupported cache-routing metadata",
+      );
+    }
+    return capability(
+      "verified",
+      "direct xAI Grok 4.5 Responses route with best-effort prompt-cache routing",
+    );
+  }
+
+  // Other direct xAI routes remain observable through a clearly labelled
+  // manual probe until each route receives its own validated strategy.
   if (
     model.provider === "xai" &&
     XAI_PROBE_APIS.has(model.api) &&
-    hasFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)
+    hasExplicitFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)
   ) {
     return capability(
       "unverified",

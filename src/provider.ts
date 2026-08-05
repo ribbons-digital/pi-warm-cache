@@ -1,6 +1,11 @@
 import type { CacheRetention, Model } from "@earendil-works/pi-ai";
 import { formatDurationShort } from "./config.ts";
-import { isSafeReplayPayload, resolveProviderCapability } from "./capability.ts";
+import {
+  isDirectXaiGrokRoute,
+  isSafeReplayPayload,
+  isSafeXaiReplayPayload,
+  resolveProviderCapability,
+} from "./capability.ts";
 import type {
   AnthropicTtlMode,
   CacheFamily,
@@ -14,7 +19,11 @@ import type {
 
 export {
   canManualProbe,
+  getPromptCacheKey,
+  hasXaiPromptCacheKey,
+  isDirectXaiGrokRoute,
   isSafeReplayPayload,
+  isSafeXaiReplayPayload,
   resolveProviderCapability,
 } from "./capability.ts";
 export type { ProviderCapability, ProviderCapabilityState } from "./types.ts";
@@ -27,6 +36,8 @@ export const ANTHROPIC_LONG_TTL_MS = 60 * 60_000;
 export const OPENAI_EXPLICIT_TTL_MS = 30 * 60_000;
 /** Older OpenAI in-memory idle window. Conservative. */
 export const OPENAI_IMPLICIT_TTL_MS = 8 * 60_000;
+/** xAI Grok best-effort cadence. This is an operational heuristic, not a TTL. */
+export const XAI_BEST_EFFORT_INTERVAL_MS = 4 * 60_000;
 
 /** Default ping delay as a fraction of TTL (stay safely inside). */
 const DEFAULT_TTL_FRACTION = 0.8;
@@ -50,6 +61,10 @@ export function isOpenAIModel(model: Model<any> | undefined): boolean {
     (model.provider === "openai-codex" && model.api === "openai-codex-responses") ||
     (model.provider === "azure-openai-responses" && model.api === "azure-openai-responses")
   );
+}
+
+export function isXaiBestEffortModel(model: Model<any> | undefined): boolean {
+  return isDirectXaiGrokRoute(model);
 }
 
 export function supportsPromptCache(model: Model<any> | undefined): boolean {
@@ -149,6 +164,7 @@ function resolveVerifiedCacheFamily(
     }
     return "anthropic-short";
   }
+  if (isXaiBestEffortModel(model)) return "xai-best-effort";
   if (isOpenAIModel(model)) {
     return modelSupportsExplicitPromptCacheMode(model) ? "openai-explicit" : "openai-implicit";
   }
@@ -173,6 +189,7 @@ export function resolveCacheRetention(family: CacheFamily): CacheRetention {
     case "anthropic-short":
     case "openai-explicit":
     case "openai-implicit":
+    case "xai-best-effort":
       return "short";
     case "unverified":
     case "unsupported":
@@ -207,6 +224,20 @@ export function resolveStrategy(
     };
   }
 
+  if (family === "xai-best-effort" && payload !== undefined && !isSafeXaiReplayPayload(payload)) {
+    return {
+      capability,
+      family,
+      cacheRetention,
+      intervalMs: null,
+      ttlLabel: "xAI best-effort probe waiting for a stable prompt-cache key",
+      waitLabel: null,
+      automaticWarm: false,
+      manualProbe: false,
+      longTtlDegradedReason: null,
+    };
+  }
+
   let longTtlDegradedReason: string | null = null;
   if (isAnthropicModel(model) && config.anthropicTtl === "1h" && family !== "anthropic-long") {
     if (!modelSupportsLongCacheRetention(model)) {
@@ -237,6 +268,10 @@ export function resolveStrategy(
       ttlMs = OPENAI_IMPLICIT_TTL_MS;
       ttlLabel = "~8m idle cache window";
       break;
+    case "xai-best-effort":
+      ttlMs = XAI_BEST_EFFORT_INTERVAL_MS;
+      ttlLabel = "xAI best-effort probe cadence";
+      break;
     default:
       return {
         capability: {
@@ -258,7 +293,10 @@ export function resolveStrategy(
   }
 
   const intervalMs =
-    config.intervalMs ?? Math.max(30_000, Math.floor(ttlMs * DEFAULT_TTL_FRACTION));
+    config.intervalMs ??
+    (family === "xai-best-effort"
+      ? XAI_BEST_EFFORT_INTERVAL_MS
+      : Math.max(30_000, Math.floor(ttlMs * DEFAULT_TTL_FRACTION)));
 
   return {
     capability,
@@ -282,16 +320,29 @@ export function classifyProbeOutcome(args: {
   cacheRead: number;
   cacheWrite: number;
   consecutiveFailuresBefore: number;
+  maxConsecutiveFailures?: number;
 }): ProbeOutcome {
   if (args.cacheWrite > 0 && args.cacheRead === 0) return "payload-drift";
+
+  const noReadNoWrite = args.cacheRead === 0 && args.cacheWrite === 0;
+  // xAI Responses currently reports cached reads but not a separate cache-write
+  // token count. After the configured retry budget, repeated no-read results
+  // become a re-anchor candidate instead of an endless replay loop.
+  const maxFailures = Math.max(1, args.maxConsecutiveFailures ?? 3);
   if (
-    args.cacheFamily === "openai-implicit" &&
-    args.cacheRead === 0 &&
-    args.cacheWrite === 0 &&
-    args.consecutiveFailuresBefore === 0
+    args.cacheFamily === "xai-best-effort" &&
+    noReadNoWrite &&
+    args.consecutiveFailuresBefore + 1 >= maxFailures
   ) {
+    return "payload-drift";
+  }
+
+  const transientFamily =
+    args.cacheFamily === "openai-implicit" || args.cacheFamily === "xai-best-effort";
+  if (noReadNoWrite && transientFamily && args.consecutiveFailuresBefore === 0) {
     return "transient-miss";
   }
+
   return "miss";
 }
 
@@ -458,6 +509,21 @@ export function applyWarmOutputLimit(
     // Unknown API shapes: leave unchanged rather than guess a rejected field.
   }
 
+  return p;
+}
+
+/**
+ * Apply the only output mutation used by the direct xAI Responses strategy.
+ * xAI accepts max_output_tokens; do not add or rewrite max_tokens or Codex
+ * fields, and leave reasoning/tool/cache-routing fields untouched.
+ */
+export function applyXaiWarmOutputLimit(payload: unknown, preferred: number): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const p = payload as Record<string, unknown>;
+  p.max_output_tokens = Math.max(
+    OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
+    Math.max(1, preferred),
+  );
   return p;
 }
 

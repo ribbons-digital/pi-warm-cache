@@ -1,7 +1,7 @@
 {
   "name": "pi-warm-cache",
   "version": "0.1.0",
-  "description": "Pi extension that keeps Anthropic and OpenAI prompt caches warm during long idle gaps",
+  "description": "Pi extension that keeps Anthropic, OpenAI, and direct xAI Grok prompt caches warm during long idle gaps",
   "type": "module",
   "keywords": [
     "pi-package",

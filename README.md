@@ -1,6 +1,6 @@
 # pi-warm-cache
 
-Pi extension that keeps Anthropic and OpenAI prompt caches warm during long idle gaps in agent sessions.
+Pi extension that keeps Anthropic, OpenAI, and direct xAI Grok prompt caches warm during long idle gaps in agent sessions.
 
 ## Why
 
@@ -9,6 +9,7 @@ Provider prompt caches expire after a short idle TTL.
 
 - Anthropic default: 5 minutes (sliding). Optional 1h TTL at higher write cost.
 - OpenAI GPT-5.6+: explicit `prompt_cache_options.ttl = "30m"` (minimum lifetime).
+- Direct xAI Grok 4.5: best-effort probe cadence with no fixed cache-lifetime promise.
 - Older OpenAI routes: shorter in-memory idle windows.
 
 When the cache expires, the next turn pays a cold re-read (or a costly rewrite).
@@ -66,6 +67,7 @@ Instead:
    Prefer `max_tokens = 1`.
    If Anthropic thinking is enabled, set `max_tokens = thinking.budget_tokens + 1`.
    Never mutate `thinking`, `reasoning.effort`, tools, messages, system blocks, or `cache_control`.
+   Direct xAI Responses probes use only the legal `max_output_tokens` field and preserve `prompt_cache_key`.
 4. Keep the same `sessionId` and `cacheRetention`.
 5. Never copy the summarize/handoff pattern of `cacheRetention: "none"` + fresh `uuidv7()` session ids.
 
@@ -125,6 +127,8 @@ Failures keep the widget visible with a reason. They do not silently clear to a 
 
 `/warm` reports `realTurn=...` and `probe=...` as separate observations.
 
+Diagnostics also include the named strategy, cadence, payload fingerprint, and redacted cache-key identity.
+
 `realTurn=unknown` is used for the first turn, invalidation boundaries, changed prefixes, and prompts below the configured minimum.
 
 `probeHits` and `probeMisses` count only extension warm probes.
@@ -154,14 +158,25 @@ Do not guess from model id strings.
 | `anthropic-long` | 1h | ~48m | `long` |
 | `openai-explicit` | 30m min | ~24m | `short` (+ keep key) |
 | `openai-implicit` | ~8m idle | ~6.4m | `short` |
+| `xai-best-effort` | no fixed TTL claim | 4m heuristic | `short` (+ captured key) |
 
 Automatic warming uses only a verified provider-route capability.
 
 A verified route has an explicit provider, API transport, and compatibility registration for the strategy shown above.
 
-Direct xAI routes are currently unverified.
+Direct xAI Grok 4.5 on the first-party OpenAI Responses route is a verified best-effort strategy.
 
-They have no automatic timer or fixed TTL claim, but `/warm now` may run one clearly labelled probe when the captured payload shape is safe to replay.
+It uses the exact captured payload, requires the captured `prompt_cache_key`, and uses a configurable 4m probe cadence by default.
+
+The cadence is an operational heuristic, not a provider TTL guarantee.
+
+xAI Responses exposes cached reads but may not expose cache-write tokens through Pi.
+
+The first no-read/no-write probe retries quietly.
+
+Repeated no-read/no-write probes stop warming and request a new real-turn anchor when the configured failure budget is reached.
+
+A write-without-read response, if reported by the route, stops warming immediately as a payload-drift candidate.
 
 OpenRouter, OpenCode Go, and other API-compatible routes do not inherit a first-party strategy.
 
@@ -195,6 +210,10 @@ Continuation deferred 4m - the timed wake stays inside the 5m prompt-cache TTL.
 /warm log|nolog    # JSONL diagnostics on/off (.pi/warm-cache.jsonl)
 /warm interval=3.5m max=2
 ```
+
+The existing `interval` override also controls the direct xAI best-effort cadence.
+
+Use `/warm now` to inspect observed xAI read, write, input, output, cost, strategy, cache-key identity, and retry values.
 
 Codex (`openai-codex-responses`) has no API output-token cap, so bare payload replay
 can continue the agent trajectory and bill large `out` (measured `out=1127` on a hit).
@@ -279,10 +298,11 @@ interface WarmCacheConfig {
 9. **Session resume** - do not restore old payloads. Wait for the first real turn.
 10. **Print/RPC modes** - still warm if enabled, but skip TUI widgets when `!ctx.hasUI`.
 11. **1h Anthropic mode** - follow on-wire Pi long TTL only. This extension does not rewrite real turns.
-12. **Codex / openai-codex-responses** - never send `max_output_tokens` (API rejects it).
-13. **OpenAI Responses** - `max_output_tokens` floor is 16, not 1.
-14. **Do not use `sendUserMessage`** - it pollutes history and can trigger tool loops.
-15. **Abort on shutdown / disable** - clear `setTimeout` / `setInterval` and abort in-flight `complete()`.
+12. **Direct xAI Grok 4.5** - require the first-party Responses route and a captured `prompt_cache_key`; best-effort probes do not promise cache retention.
+13. **Codex / openai-codex-responses** - never send `max_output_tokens` (API rejects it).
+14. **OpenAI and xAI Responses** - `max_output_tokens` floor is 16, not 1.
+15. **Do not use `sendUserMessage`** - it pollutes history and can trigger tool loops.
+16. **Abort on shutdown / disable** - clear `setTimeout` / `setInterval` and abort in-flight `complete()`.
 
 ## Package layout
 
