@@ -142,31 +142,44 @@ export default function piWarmCache(pi: ExtensionAPI) {
         // Manual ping is allowed even when auto-warm is sticky-blocked.
         const result = await warmer.warmNow(ctx);
         const route = `${result.provider ?? "unknown"}/${result.modelId ?? "unknown"} api=${result.api ?? "unknown"}`;
+        const capability =
+          `capability=${result.capabilityState ?? "unknown"} reason=${result.capabilityReason ?? "unknown"}`;
         const usage =
           `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
           `out=${result.output} cost=$${result.costUsd.toFixed(4)}`;
+        const fingerprint = `pfp=${result.fingerprint ? result.fingerprint.slice(0, 8) : "none"}`;
+        const retry = `retry=${result.retryState ?? "none"}`;
+        const diagnostics = `${route}; ${capability}; ${usage}; ${fingerprint}; ${retry}`;
         if (!result.ok) {
           const failureLabel =
             result.unavailable || result.capabilityState === "unsupported"
-              ? "Warm unavailable"
-              : "Warm failed";
-          ctx.ui.notify(
-            `${failureLabel}: ${result.error} (${route})`,
-            "error",
-          );
+              ? "Probe unavailable"
+              : "Probe failed";
+          ctx.ui.notify(`${failureLabel}: ${result.error} (${diagnostics})`, "error");
           return;
         }
         if (result.capabilityState === "unverified") {
           ctx.ui.notify(
-            `Unverified probe ${result.cacheHit ? "observed a cache read" : "completed without a cache read"} (${route}; ${usage}). No active keepalive or verified savings claim.`,
+            `Unverified probe ${result.cacheHit ? "hit" : "miss"} (${diagnostics}). No active keepalive or verified savings claim.`,
             result.cacheHit ? "info" : "warning",
           );
           return;
         }
+        if (result.probeOutcome === "transient-miss") {
+          ctx.ui.notify(
+            `Probe miss (transient; retry scheduled) (${diagnostics})`,
+            "info",
+          );
+          return;
+        }
+        if (result.probeOutcome === "payload-drift") {
+          ctx.ui.notify(`Probe miss (payload drift; re-anchor required) (${diagnostics})`, "warning");
+          return;
+        }
         ctx.ui.notify(
           result.cacheHit
-            ? `Warm hit (${route}; ${usage})`
-            : `Warm done but no cache hit (${route}; ${usage})`,
+            ? `Probe hit (${diagnostics})`
+            : `Probe miss (${diagnostics})`,
           result.cacheHit ? "info" : "warning",
         );
         return;

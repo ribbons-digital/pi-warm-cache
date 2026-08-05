@@ -10,9 +10,12 @@ import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
   canManualProbe,
+  classifyProbeOutcome,
+  classifyRealTurnObservation,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
   decideCodexOversizedAction,
   isCodexPayload,
+  isPayloadContinuation,
   minimumOutputTokensForPayload,
   modelSupportsLongCacheRetention,
   isSafeReplayPayload,
@@ -29,6 +32,7 @@ import {
   formatSavingsLabel,
   resolveModelPricing,
 } from "./savings.ts";
+import { SessionWarmer } from "./warmer.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -293,6 +297,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     },
   });
   assert(unverifiedProbe.cacheHit, "unverified probe should retain observed cache-read result");
+  assert(unverifiedProbe.probeOutcome === "hit", "probe result should identify a probe hit");
   assert(unverifiedProbe.estimatedSavedUsd === 0, "unverified probe must not claim savings");
   const rejectedProbe = buildWarmResult({
     fingerprint: "unsafe-xai-payload",
@@ -306,6 +311,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     },
   });
   assert(rejectedProbe.unavailable === true, "policy rejection must be marked unavailable");
+  assert(rejectedProbe.probeOutcome === "unavailable", "rejected probe should be unavailable, not a miss");
   assert(
     formatSavingsLabel({
       estimatedSavingsUsd: 0,
@@ -317,13 +323,53 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   );
 }
 
-// 4) minimumOutputTokensForPayload helper
+// 4) Implicit probe misses retry quietly before becoming persistent misses.
+{
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "openai-implicit",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 0,
+    }) === "transient-miss",
+    "first implicit no-read/no-write response should be transient",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "openai-implicit",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 1,
+    }) === "miss",
+    "repeated implicit no-read/no-write response should be persistent miss",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "anthropic-short",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 0,
+    }) === "miss",
+    "non-implicit no-read/no-write response should remain a miss",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "anthropic-short",
+      cacheRead: 0,
+      cacheWrite: 300,
+      consecutiveFailuresBefore: 0,
+    }) === "payload-drift",
+    "write without read should be a payload-drift candidate",
+  );
+}
+
+// 5) minimumOutputTokensForPayload helper
 {
   const n = minimumOutputTokensForPayload({ thinking: { type: "enabled", budget_tokens: 100 } }, 1);
   assert(n === 101, `expected 101, got ${n}`);
 }
 
-// 5) Payload fingerprint changes when payload changes
+// 6) Payload fingerprint changes when payload changes
 {
   const a = stableFingerprint({ messages: [{ role: "user", content: "a" }] });
   const b = stableFingerprint({ messages: [{ role: "user", content: "b" }] });
@@ -331,7 +377,111 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(a === stableFingerprint({ messages: [{ role: "user", content: "a" }] }), "stable");
 }
 
-// 6) Savings pricing: zero-cost proxy => n/a (do not invent catalog rates)
+// 7) Real-turn continuity and classification stay separate from probe results.
+{
+  const firstPayload = {
+    model: "gpt-5.6",
+    input: [{ role: "user", content: [{ type: "input_text", text: "first" }] }],
+    prompt_cache_key: "session-1",
+  };
+  const continuedPayload = {
+    ...firstPayload,
+    input: [
+      ...firstPayload.input,
+      { role: "assistant", content: [{ type: "output_text", text: "answer" }] },
+      { role: "user", content: [{ type: "input_text", text: "second" }] },
+    ],
+  };
+  const changedPrefix = {
+    ...continuedPayload,
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "rewritten" }] },
+      ...continuedPayload.input.slice(1),
+    ],
+  };
+  assert(
+    isPayloadContinuation(firstPayload, continuedPayload, "openai-responses"),
+    "appended conversation items should preserve continuity",
+  );
+  assert(
+    !isPayloadContinuation(firstPayload, changedPrefix, "openai-responses"),
+    "rewritten prefix must not be treated as continuity",
+  );
+  const markerPrevious = {
+    model: "claude-fable-5",
+    messages: [
+      {
+        role: "user",
+        content: [{ type: "text", text: "first", cache_control: { type: "ephemeral" } }],
+      },
+    ],
+    system: [],
+  };
+  const markerCurrent = {
+    ...markerPrevious,
+    messages: [
+      {
+        role: "user",
+        content: [{ type: "text", text: "first" }],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "second", cache_control: { type: "ephemeral" } }],
+      },
+    ],
+  };
+  assert(
+    isPayloadContinuation(markerPrevious, markerCurrent, "anthropic-messages"),
+    "moving Anthropic cache markers must not break normal-turn continuity",
+  );
+
+  const first = classifyRealTurnObservation({
+    input: 10,
+    cacheRead: 1000,
+    cacheWrite: 0,
+    minCachedTokens: 512,
+    continuity: false,
+    continuityReason: "first real turn",
+    provider: "openai",
+    modelId: "gpt-5.6",
+    api: "openai-responses",
+  });
+  assert(first.state === "unknown", "first real turn must remain unknown");
+  assert(first.cacheRead === 1000, "unknown state must retain raw cache-read usage");
+
+  const hit = classifyRealTurnObservation({
+    input: 10,
+    cacheRead: 1000,
+    cacheWrite: 0,
+    minCachedTokens: 512,
+    continuity: true,
+    continuityReason: "comparable continuation",
+  });
+  assert(hit.state === "hit", "comparable real turn with a read is a hit");
+
+  const miss = classifyRealTurnObservation({
+    input: 10,
+    cacheRead: 0,
+    cacheWrite: 1000,
+    minCachedTokens: 512,
+    continuity: true,
+    continuityReason: "comparable continuation",
+  });
+  assert(miss.state === "miss", "comparable real turn with no read is a miss");
+
+  const small = classifyRealTurnObservation({
+    input: 10,
+    cacheRead: 0,
+    cacheWrite: 20,
+    minCachedTokens: 512,
+    continuity: true,
+    continuityReason: "comparable continuation",
+  });
+  assert(small.state === "unknown", "small prompts must not claim a real-turn miss");
+  assert(small.reason.includes("below minimum"), "small prompt should explain unknown state");
+}
+
+// 8) Savings pricing: zero-cost proxy => n/a (do not invent catalog rates)
 {
   const vibe = {
     id: "claude-opus-5",
@@ -373,6 +523,121 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     }).includes("net cost"),
     "negative net must not look like savings",
   );
+}
+
+// 9) Session warmer keeps real-turn observations, probe outcomes, and retries separate.
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  const responses: Array<unknown> = [
+    {
+      stopReason: "stop",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: { total: 0.01 },
+      },
+    },
+    {
+      stopReason: "stop",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 100,
+        cacheWrite: 0,
+        cost: { total: 0.01 },
+      },
+    },
+    new Error("provider down"),
+    {
+      stopReason: "stop",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 100,
+        cost: { total: 0.2 },
+      },
+    },
+  ];
+  const completeStub = async (): Promise<any> => {
+    const next = responses.shift();
+    if (next instanceof Error) throw next;
+    return next;
+  };
+  const model = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+    cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model,
+    hasUI: true,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "warmer-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    completeStub as any,
+  );
+  warmer.bindContext(ctx);
+  warmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+  });
+  warmer.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "warmer-test",
+    },
+    ctx,
+  );
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+
+  const transient = await warmer.warmNow(ctx);
+  assert(transient.probeOutcome === "transient-miss", "first implicit miss should be transient");
+  assert(transient.retryState === "1/3", "transient miss should expose retry state");
+  assert(warmer.getLatestRealTurnObservation()?.state === "unknown", "probe must not classify the real turn");
+  assert(warmer.getLatestProbeObservation()?.outcome === "transient-miss", "latest probe should show transient miss");
+  assert(notifications.every((entry) => entry.level !== "warning"), "first transient miss must not warn immediately");
+
+  const hit = await warmer.warmNow(ctx);
+  assert(hit.probeOutcome === "hit", "retry hit should be labelled as a probe hit");
+  assert(warmer.getLatestProbeObservation()?.outcome === "hit", "latest probe should be a hit");
+  assert(warmer.getLatestRealTurnObservation()?.state === "unknown", "probe hit must not change real-turn state");
+  assert(warmer.getStatusText().includes("probeHits=1"), "status should expose probe hits");
+  assert(warmer.getStatusText().includes("probeMisses=1"), "status should expose probe misses");
+  assert(warmer.getStatusText().includes("probeFailStreak=0/3"), "successful probe should reset retry state");
+
+  const providerError = await warmer.warmNow(ctx);
+  assert(!providerError.ok && providerError.probeOutcome === "error", "provider error should be an error outcome");
+  assert(warmer.getLatestProbeObservation()?.outcome === "error", "provider error should remain a probe error");
+  assert(warmer.getStatusText().includes("probeMisses=1"), "provider errors must not increment probe misses");
+
+  const drift = await warmer.warmNow(ctx);
+  assert(drift.probeOutcome === "payload-drift", "write without read should require re-anchor");
+  assert(warmer.getLatestProbeObservation()?.outcome === "payload-drift", "status should retain payload drift");
+  assert(warmer.getStatusText().includes("payload=none"), "payload drift should clear the replay payload");
+  assert(notifications.some((entry) => entry.level === "warning"), "payload drift should warn immediately");
+  warmer.dispose();
 }
 
 console.log("provider.test.ts: all assertions passed");

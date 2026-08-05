@@ -51,7 +51,7 @@ export function resolveModelPricing(model: Model<any> | undefined): ResolvedPric
 }
 
 /**
- * Estimate USD saved by a cache hit versus a full cold input re-read.
+ * Estimate USD saved by a warm-probe cache hit versus a full cold input re-read.
  * Uses (inputPrice - cacheReadPrice) * cacheReadTokens.
  */
 export function estimateSavedUsd(
@@ -78,7 +78,7 @@ export function formatSavingsLabel(
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
   if (!anchor.savingsKnown) return "n/a (no model pricing)";
   const n = anchor.estimatedSavingsUsd;
-  // Large warm output can make net negative even on a cache hit.
+  // Large probe output can make net negative even on a cache hit.
   if (n < 0) {
     const loss = Math.abs(n) < 0.01 ? Math.abs(n).toFixed(4) : Math.abs(n).toFixed(2);
     return `est. net cost $${loss} (warm output expensive)`;
@@ -105,6 +105,7 @@ export function buildWarmResult(args: {
     return {
       ok: false,
       cacheHit: false,
+      probeOutcome: args.unavailable ? "unavailable" : "error",
       cacheRead: 0,
       cacheWrite: 0,
       input: 0,
@@ -128,6 +129,7 @@ export function buildWarmResult(args: {
   return {
     ok: true,
     cacheHit,
+    probeOutcome: cacheHit ? "hit" : "miss",
     cacheRead,
     cacheWrite,
     input,

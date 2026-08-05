@@ -29,11 +29,11 @@ export function renderWaitingUi(
   const title = `Cache-warm wait · 1 monitor on duty`;
   const line1 = `Continuation deferred ${waitLabel} - the timed wake stays inside the ${plan.ttlLabel}.`;
   const line2 =
-    anchor.warmHitCount > 0
+    anchor.probeHitCount > 0
       ? anchor.savingsKnown
         ? `~${tokens} tokens kept warm · ${saved} vs cold re-reads`
         : `~${tokens} tokens kept warm · savings ${saved}`
-      : `~${tokens} tokens kept warm · waiting for first verified cache hit`;
+      : `~${tokens} tokens kept warm · waiting for first verified probe hit`;
 
   ctx.ui.setWidget(WIDGET_ID, [
     ctx.ui.theme.fg("accent", `⚡ ${title}`),
@@ -59,19 +59,19 @@ export function renderWarmHitUi(
   const saved = formatSavingsLabel(anchor);
 
   ctx.ui.setWidget(WIDGET_ID, [
-    ctx.ui.theme.fg("success", `⚡ Cache warm · hit ~${tokens} tokens`),
-    ctx.ui.theme.fg("dim", `Next ping in ${plan.waitLabel ?? "n/a"} (${plan.ttlLabel}).`),
+    ctx.ui.theme.fg("success", `⚡ Cache warm · probe hit ~${tokens} tokens`),
+    ctx.ui.theme.fg("dim", `Next probe in ${plan.waitLabel ?? "n/a"} (${plan.ttlLabel}).`),
     ctx.ui.theme.fg(
       "warning",
       anchor.savingsKnown
-        ? `Session ${saved} across ${anchor.warmHitCount} warm hit(s).`
-        : `Session savings ${saved} · ${anchor.warmHitCount} warm hit(s).`,
+        ? `Session ${saved} across ${anchor.probeHitCount} probe hit(s).`
+        : `Session savings ${saved} · ${anchor.probeHitCount} probe hit(s).`,
     ),
   ]);
 
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("success", `warm hit · ~${tokens}`),
+    ctx.ui.theme.fg("success", `probe hit · ~${tokens}`),
   );
 }
 
@@ -101,6 +101,32 @@ export function renderIdleUi(
     STATUS_ID,
     ctx.ui.theme.fg("dim", `warm idle · ${reason}`),
   );
+}
+
+/**
+ * Quiet retry state for the first implicit-cache no-read/no-write response.
+ * This is intentionally neutral rather than an error notification.
+ */
+export function renderProbeRetryUi(
+  ctx: ExtensionContext,
+  config: WarmCacheConfig,
+  detail: string,
+  nextDueAt?: number,
+): void {
+  if (!ctx.hasUI) return;
+
+  const retryLine =
+    typeof nextDueAt === "number" && nextDueAt > Date.now()
+      ? `Next probe in ${formatDurationShort(nextDueAt - Date.now())}.`
+      : "Retrying the probe.";
+  if (config.showWidget) {
+    ctx.ui.setWidget(WIDGET_ID, [
+      ctx.ui.theme.fg("warning", "⚡ Cache-warm retry · transient probe miss"),
+      ctx.ui.theme.fg("dim", detail),
+      ctx.ui.theme.fg("dim", retryLine),
+    ]);
+  }
+  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "probe retry · transient miss"));
 }
 
 /**

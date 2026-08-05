@@ -3,9 +3,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
+  classifyProbeOutcome,
+  classifyRealTurnObservation,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
   decideCodexOversizedAction,
   DEFER_BACKOFF_MS,
+  isPayloadContinuation,
   isSafeReplayPayload,
   resolveProviderCapability,
   resolveStrategy,
@@ -17,13 +20,17 @@ import {
   clearWarmUi,
   renderFailureUi,
   renderIdleUi,
+  renderProbeRetryUi,
   renderWaitingUi,
   renderWarmHitUi,
 } from "./ui.ts";
 import type { StrategyResolution } from "./provider.ts";
 import type {
   CacheAnchor,
+  ProbeObservation,
+  ProbeOutcome,
   ProviderCapability,
+  RealTurnObservation,
   WarmCacheConfig,
   WarmResult,
 } from "./types.ts";
@@ -44,6 +51,8 @@ class WarmConcurrencyGate {
 
 const globalGate = new WarmConcurrencyGate();
 
+type CompleteRequest = typeof complete;
+
 export type RescheduleOptions = {
   /** Explicit delay. When set, skips TTL-from-lastActivity math. */
   delayMs?: number;
@@ -52,6 +61,8 @@ export type RescheduleOptions = {
 };
 
 export class SessionWarmer {
+  private readonly pi: ExtensionAPI;
+  private readonly completeRequest: CompleteRequest;
   private config: WarmCacheConfig = { ...DEFAULT_CONFIG };
   private timer: ReturnType<typeof setTimeout> | null = null;
   private uiTimer: ReturnType<typeof setInterval> | null = null;
@@ -63,6 +74,9 @@ export class SessionWarmer {
   private lastPayload: unknown | null = null;
   private capability: ProviderCapability | null = null;
   private ctx: ExtensionContext | null = null;
+  /** Continuity boundary applied to the next captured real turn. */
+  private realTurnBoundaryReason = "first real turn";
+  private realTurnContinuity = false;
   private plan: StrategyResolution | null = null;
   private lastLongTtlWarning: string | null = null;
   private logFile: string | null = null;
@@ -82,7 +96,10 @@ export class SessionWarmer {
     detail: string;
   } | null = null;
 
-  constructor(private readonly pi: ExtensionAPI) {}
+  constructor(pi: ExtensionAPI, completeRequest: CompleteRequest = complete) {
+    this.pi = pi;
+    this.completeRequest = completeRequest;
+  }
 
   isWarming(): boolean {
     return this.warming;
@@ -94,6 +111,14 @@ export class SessionWarmer {
 
   getCapability(): ProviderCapability {
     return this.currentCapability();
+  }
+
+  getLatestRealTurnObservation(): RealTurnObservation | null {
+    return this.anchor?.latestRealTurn ?? null;
+  }
+
+  getLatestProbeObservation(): ProbeObservation | null {
+    return this.anchor?.latestProbe ?? null;
   }
 
   private currentCapability(ctx?: ExtensionContext | null): ProviderCapability {
@@ -159,6 +184,8 @@ export class SessionWarmer {
     this.anchor = null;
     this.lastPayload = null;
     this.capability = null;
+    this.realTurnBoundaryReason = "session ended";
+    this.realTurnContinuity = false;
     if (this.ctx) clearWarmUi(this.ctx);
     this.ctx = null;
   }
@@ -175,6 +202,8 @@ export class SessionWarmer {
     this.capability = resolveProviderCapability(ctx.model);
     this.anchor = null;
     this.lastPayload = null;
+    this.realTurnBoundaryReason = reason;
+    this.realTurnContinuity = false;
     this.plan = null;
     this.clearTimers();
     this.abort?.abort();
@@ -182,6 +211,7 @@ export class SessionWarmer {
     this.recordAttempt("system", false, `invalidated: ${reason}`);
     this.log({
       event: "anchor_invalidated",
+      source: "system",
       provider: ctx.model?.provider,
       modelId: ctx.model?.id,
       api: ctx.model?.api,
@@ -211,12 +241,15 @@ export class SessionWarmer {
     if (!model || this.capability.state === "unsupported") {
       this.anchor = null;
       this.lastPayload = null;
+      this.realTurnBoundaryReason = this.capability.reason;
+      this.realTurnContinuity = false;
       this.plan = null;
       this.clearTimers();
       this.abort?.abort();
       this.abort = null;
       this.log({
         event: "capture",
+        source: "real_turn",
         provider: model?.provider,
         modelId: model?.id,
         api: model?.api,
@@ -230,7 +263,33 @@ export class SessionWarmer {
     }
 
     const prev = this.anchor;
-    const prefixChanged = Boolean(prev && prev.payloadFingerprint !== payloadFingerprint);
+    const previousPayload = this.lastPayload;
+    const sameRoute = Boolean(
+      prev &&
+        prev.provider === model.provider &&
+        prev.modelId === model.id &&
+        prev.modelApi === model.api &&
+        prev.capability.state === this.capability.state &&
+        prev.capability.reason === this.capability.reason,
+    );
+    const samePayload = Boolean(prev && prev.payloadFingerprint === payloadFingerprint);
+    const payloadContinuation = Boolean(
+      sameRoute &&
+        (samePayload ||
+          (previousPayload && isPayloadContinuation(previousPayload, payload, model.api))),
+    );
+    const previousTurnObserved = Boolean(prev && prev.latestRealTurn.observedAt !== null);
+    const comparableContinuation = payloadContinuation && previousTurnObserved;
+    const continuityReason = !prev
+      ? this.realTurnBoundaryReason
+      : !sameRoute
+        ? "model or provider route changed"
+        : !payloadContinuation
+          ? "prefix changed"
+          : comparableContinuation
+            ? "comparable continuation"
+            : "no comparable prior real turn";
+    const prefixChanged = Boolean(prev && !payloadContinuation);
 
     this.lastPayload = structuredClone(payload);
     this.plan = resolveStrategy(model, this.config, this.lastPayload);
@@ -247,14 +306,14 @@ export class SessionWarmer {
     const sessionId = ctx.sessionManager.getSessionId();
     const pricing = resolveModelPricing(model);
     const savingsKnown = this.capability.state === "verified" && pricing.savingsKnown;
-    const preserveSessionStats = Boolean(
-      prev &&
-        prev.provider === model.provider &&
-        prev.modelId === model.id &&
-        prev.modelApi === model.api &&
-        prev.capability.state === this.capability.state &&
-        prev.capability.reason === this.capability.reason,
-    );
+    const preserveSessionStats = payloadContinuation;
+    const realTurn = makeUnknownRealTurnObservation({
+      provider: model.provider,
+      modelId: model.id,
+      api: model.api,
+      payloadFingerprint,
+      reason: continuityReason,
+    });
 
     this.anchor = {
       sessionId,
@@ -267,46 +326,31 @@ export class SessionWarmer {
       cacheFamily: this.plan.family,
       cacheRetention: this.plan.cacheRetention,
       payloadFingerprint,
-      cachedTokens: prefixChanged || !preserveSessionStats ? 0 : (prev?.cachedTokens ?? 0),
-      promptTokens: prefixChanged || !preserveSessionStats ? 0 : (prev?.promptTokens ?? 0),
+      // These fields remain as compatibility aliases for the scheduler and
+      // older integrations. The authoritative observations are below.
+      cachedTokens: 0,
+      promptTokens: 0,
       cacheReadPricePerMTok: pricing.cacheReadPricePerMTok,
       inputPricePerMTok: pricing.inputPricePerMTok,
       savingsKnown,
       pricingSource: pricing.source,
       lastActivityAt: Date.now(),
-      lastWarmAt:
-        this.capability.state === "verified" && !prefixChanged
-          ? (prev?.lastWarmAt ?? null)
-          : null,
+      lastProbeAt: null,
       estimatedSavingsUsd:
         savingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
-      warmHitCount:
-        this.capability.state === "verified" && preserveSessionStats
-          ? (prev?.warmHitCount ?? 0)
-          : 0,
-      warmMissCount:
-        this.capability.state === "verified" && preserveSessionStats
-          ? (prev?.warmMissCount ?? 0)
-          : 0,
-      // Verified warm counters are session totals; unverified probe counters
-      // describe the current captured anchor and reset when its prefix changes.
-      probeCount:
-        this.capability.state === "unverified" && preserveSessionStats && !prefixChanged
-          ? (prev?.probeCount ?? 0)
-          : 0,
-      probeHitCount:
-        this.capability.state === "unverified" && preserveSessionStats && !prefixChanged
-          ? (prev?.probeHitCount ?? 0)
-          : 0,
-      probeMissCount:
-        this.capability.state === "unverified" && preserveSessionStats && !prefixChanged
-          ? (prev?.probeMissCount ?? 0)
-          : 0,
+      probeCount: preserveSessionStats ? (prev?.probeCount ?? 0) : 0,
+      probeHitCount: preserveSessionStats ? (prev?.probeHitCount ?? 0) : 0,
+      probeMissCount: preserveSessionStats ? (prev?.probeMissCount ?? 0) : 0,
       consecutiveFailures: 0,
+      latestRealTurn: realTurn,
+      latestProbe: null,
     };
+    this.realTurnBoundaryReason = "awaiting real-turn usage";
+    this.realTurnContinuity = comparableContinuation;
 
     this.log({
       event: "capture",
+      source: "real_turn",
       sessionId,
       provider: model.provider,
       modelId: model.id,
@@ -319,6 +363,8 @@ export class SessionWarmer {
       manualProbeAvailable,
       payloadFingerprint,
       prefixChanged,
+      realTurnContinuity: comparableContinuation ? "comparable" : "unknown",
+      realTurnContinuityReason: continuityReason,
       modelCost: model.cost ?? null,
       pricingSource: pricing.source,
       savingsKnown,
@@ -342,18 +388,56 @@ export class SessionWarmer {
       cacheWrite?: number;
     },
   ): void {
-    if (!this.anchor) return;
+    this.ctx = ctx;
     const cacheRead = usage.cacheRead ?? 0;
     const cacheWrite = usage.cacheWrite ?? 0;
     const input = usage.input ?? 0;
+    const output = usage.output ?? 0;
     const promptTokens = input + cacheRead + cacheWrite;
+
+    if (!this.anchor) {
+      this.log({
+        event: "usage",
+        source: "real_turn",
+        provider: ctx.model?.provider,
+        modelId: ctx.model?.id,
+        api: ctx.model?.api,
+        capabilityState: this.capability?.state,
+        capabilityReason: this.capability?.reason,
+        cacheRead,
+        cacheWrite,
+        input,
+        output,
+        promptTokens,
+        realTurnState: "unknown",
+        realTurnReason: "no anchor",
+      });
+      return;
+    }
+
+    const observation = classifyRealTurnObservation({
+      input,
+      output,
+      cacheRead,
+      cacheWrite,
+      minCachedTokens: this.config.minCachedTokens,
+      continuity: this.realTurnContinuity,
+      continuityReason: this.anchor.latestRealTurn.reason,
+      provider: this.anchor.provider,
+      modelId: this.anchor.modelId,
+      api: this.anchor.modelApi,
+      payloadFingerprint: this.anchor.payloadFingerprint,
+    });
+    this.anchor.latestRealTurn = observation;
+    // Keep these legacy anchor fields useful for scheduling and integrations,
+    // but do not use them as the probe counters or real-turn classification.
     if (cacheRead > 0) this.anchor.cachedTokens = cacheRead;
     if (promptTokens > 0) this.anchor.promptTokens = promptTokens;
     this.anchor.lastActivityAt = Date.now();
     this.anchor.consecutiveFailures = 0;
-    this.ctx = ctx;
     this.log({
       event: "usage",
+      source: "real_turn",
       sessionId: this.anchor.sessionId,
       provider: this.anchor.provider,
       modelId: this.anchor.modelId,
@@ -363,7 +447,12 @@ export class SessionWarmer {
       cacheRead,
       cacheWrite,
       input,
+      output,
       promptTokens,
+      realTurnState: observation.state,
+      realTurnReason: observation.reason,
+      payloadFingerprint: observation.payloadFingerprint,
+      retryState: "probe failure streak reset by real turn",
     });
   }
 
@@ -378,6 +467,7 @@ export class SessionWarmer {
     }
     this.log({
       event: "agent_start",
+      source: "system",
       sessionId: this.anchor?.sessionId,
       provider: ctx.model?.provider,
       modelId: ctx.model?.id,
@@ -398,6 +488,7 @@ export class SessionWarmer {
     }
     this.log({
       event: "agent_settled",
+      source: "system",
       sessionId: this.anchor?.sessionId,
       provider: ctx.model?.provider,
       modelId: ctx.model?.id,
@@ -406,12 +497,20 @@ export class SessionWarmer {
       capabilityReason: this.anchor?.capability.reason ?? this.capability?.reason,
       hasPayload: Boolean(this.lastPayload),
       cachedTokens: this.anchor?.cachedTokens ?? 0,
+      realTurnState: this.anchor?.latestRealTurn.state,
+      realTurnReason: this.anchor?.latestRealTurn.reason,
+      probeOutcome: this.anchor?.latestProbe?.outcome,
+      probeHits: this.anchor?.probeHitCount,
+      probeMisses: this.anchor?.probeMissCount,
+      retryState: this.anchor
+        ? `${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
+        : undefined,
     });
     this.reschedule();
   }
 
   onModelChange(ctx: ExtensionContext): void {
-    this.invalidateAnchor(ctx, "waiting for next turn");
+    this.invalidateAnchor(ctx, "model or thinking level changed · waiting for next turn");
   }
 
   /** Manual warm for /warm now */
@@ -434,6 +533,11 @@ export class SessionWarmer {
         ? `${model.provider}/${model.id}`
         : "none";
     const api = this.anchor?.modelApi ?? model?.api ?? "none";
+    const realTurn = this.anchor ? formatRealTurnStatus(this.anchor.latestRealTurn) : "none";
+    const probe = this.anchor ? formatProbeStatus(this.anchor.latestProbe) : "none";
+    const retry = this.anchor
+      ? `probeFailStreak=${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
+      : "probeFailStreak=none";
     const last = this.lastAttempt
       ? `last=${this.lastAttempt.detail} at=${new Date(this.lastAttempt.at).toISOString()}`
       : "last=none";
@@ -444,7 +548,7 @@ export class SessionWarmer {
         : "autoWarm=off";
 
     if (capability.state !== "verified") {
-      const probe = this.anchor
+      const manualProbe = this.anchor
         ? this.anchor.manualProbeAvailable
           ? "ready"
           : "unsafe-payload"
@@ -456,8 +560,14 @@ export class SessionWarmer {
         `provider=${route}`,
         `api=${api}`,
         `reason=${capability.reason}`,
-        `manualProbe=${probe}`,
-        this.anchor ? `probes=${this.anchor.probeCount} probeHits=${this.anchor.probeHitCount}` : "",
+        `manualProbe=${manualProbe}`,
+        this.anchor
+          ? `probes=${this.anchor.probeCount} probeHits=${this.anchor.probeHitCount} probeMisses=${this.anchor.probeMissCount}`
+          : "probes=0 probeHits=0 probeMisses=0",
+        `realTurn=${realTurn}`,
+        `probe=${probe}`,
+        retry,
+        this.anchor ? `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}` : "pfp=none",
         last,
         log.trim(),
       ]
@@ -471,6 +581,9 @@ export class SessionWarmer {
         "capability=verified",
         `provider=${route}`,
         `api=${api}`,
+        "realTurn=none",
+        "probe=none",
+        retry,
         blocked,
         last,
         log.trim(),
@@ -483,10 +596,15 @@ export class SessionWarmer {
         `enabled family=${this.anchor.cacheFamily}`,
         "payload=none (needs re-anchor)",
         "capability=verified",
+        `capabilityReason=${this.anchor.capability.reason}`,
         `provider=${route}`,
         `api=${api}`,
-        `hits=${this.anchor.warmHitCount}`,
-        `misses=${this.anchor.warmMissCount}`,
+        `probeHits=${this.anchor.probeHitCount}`,
+        `probeMisses=${this.anchor.probeMissCount}`,
+        `realTurn=${realTurn}`,
+        `probe=${probe}`,
+        retry,
+        `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
         last,
         log.trim(),
       ]
@@ -498,7 +616,12 @@ export class SessionWarmer {
         "inactive capability=verified",
         `provider=${route}`,
         `api=${api}`,
+        `capabilityReason=${this.anchor.capability.reason}`,
         "reason=no automatic strategy",
+        `realTurn=${realTurn}`,
+        `probe=${probe}`,
+        retry,
+        `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
         last,
         log.trim(),
       ]
@@ -507,16 +630,28 @@ export class SessionWarmer {
     }
 
     const due = this.nextDueAt ? new Date(this.nextDueAt).toISOString() : "n/a";
+    const promptTokens = Math.max(
+      this.anchor.latestRealTurn.promptTokens,
+      this.anchor.latestProbe?.input ?? 0,
+      this.anchor.latestProbe
+        ? this.anchor.latestProbe.cacheRead + this.anchor.latestProbe.cacheWrite
+        : 0,
+    );
     return [
       `enabled family=${this.anchor.cacheFamily}`,
       "capability=verified",
       `capabilityReason=${this.anchor.capability.reason}`,
       `provider=${route}`,
       `api=${api}`,
-      `cached≈${this.anchor.cachedTokens}`,
-      `hits=${this.anchor.warmHitCount}`,
-      `misses=${this.anchor.warmMissCount}`,
-      `failStreak=${this.anchor.consecutiveFailures}`,
+      `realRead=${this.anchor.latestRealTurn.cacheRead}`,
+      `realWrite=${this.anchor.latestRealTurn.cacheWrite}`,
+      `probeRead=${this.anchor.latestProbe?.cacheRead ?? "none"}`,
+      `prompt≈${promptTokens}`,
+      `probeHits=${this.anchor.probeHitCount}`,
+      `probeMisses=${this.anchor.probeMissCount}`,
+      `realTurn=${realTurn}`,
+      `probe=${probe}`,
+      retry,
       `savings=${formatSavingsLabel(this.anchor)}`,
       `pricing=${this.anchor.pricingSource}`,
       `nextDue=${due}`,
@@ -548,6 +683,7 @@ export class SessionWarmer {
       this.clearTimers();
       this.log({
         event: "schedule_skipped",
+        source: "system",
         sessionId: this.anchor?.sessionId,
         provider: this.anchor?.provider ?? ctx.model?.provider,
         modelId: this.anchor?.modelId ?? ctx.model?.id,
@@ -594,7 +730,8 @@ export class SessionWarmer {
       );
       return;
     }
-    if ((anchor.cachedTokens || anchor.promptTokens) < this.config.minCachedTokens) {
+    const knownPromptTokens = getKnownPromptTokens(anchor);
+    if (knownPromptTokens < this.config.minCachedTokens) {
       this.showIdle(ctx, `prefix < ${this.config.minCachedTokens} tok`);
       return;
     }
@@ -621,6 +758,7 @@ export class SessionWarmer {
     renderWaitingUi(ctx, this.config, anchor, plan, this.nextDueAt);
     this.log({
       event: "schedule",
+      source: "system",
       sessionId: anchor.sessionId,
       provider: anchor.provider,
       modelId: anchor.modelId,
@@ -694,6 +832,66 @@ export class SessionWarmer {
     );
   }
 
+  private observeProbeResult(
+    anchor: CacheAnchor,
+    result: WarmResult,
+    model: NonNullable<ExtensionContext["model"]>,
+    outcome: ProbeOutcome,
+    fingerprint: string,
+  ): ProbeObservation {
+    anchor.probeCount += 1;
+    if (result.cacheHit) {
+      anchor.probeHitCount += 1;
+      anchor.cachedTokens = result.cacheRead;
+      anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
+      anchor.lastProbeAt = Date.now();
+    } else {
+      anchor.probeMissCount += 1;
+    }
+    if (result.input + result.cacheRead + result.cacheWrite > 0) {
+      anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
+    }
+    result.probeOutcome = outcome;
+    const observation: ProbeObservation = {
+      outcome,
+      cacheRead: result.cacheRead,
+      cacheWrite: result.cacheWrite,
+      input: result.input,
+      output: result.output,
+      costUsd: result.costUsd,
+      provider: model.provider,
+      modelId: model.id,
+      api: model.api,
+      payloadFingerprint: fingerprint,
+      observedAt: Date.now(),
+      error: result.error,
+    };
+    anchor.latestProbe = observation;
+    return observation;
+  }
+
+  private observeProbeError(
+    anchor: CacheAnchor,
+    model: NonNullable<ExtensionContext["model"]>,
+    fingerprint: string,
+    error: string,
+  ): void {
+    anchor.latestProbe = {
+      outcome: "error",
+      cacheRead: 0,
+      cacheWrite: 0,
+      input: 0,
+      output: 0,
+      costUsd: 0,
+      provider: model.provider,
+      modelId: model.id,
+      api: model.api,
+      payloadFingerprint: fingerprint,
+      observedAt: Date.now(),
+      error,
+    };
+  }
+
   private recordAttempt(
     reason: "timer" | "manual" | "system",
     ok: boolean,
@@ -705,11 +903,13 @@ export class SessionWarmer {
       cacheWrite?: number;
       costTotal?: number;
     },
+    probeOutcome?: ProbeOutcome,
   ): void {
     this.lastAttempt = { at: Date.now(), reason, ok, detail };
     const capability = this.currentCapability(this.ctx);
     this.log({
       event: "attempt",
+      source: reason === "system" ? "system" : "warm_probe",
       sessionId: this.anchor?.sessionId,
       provider: this.anchor?.provider ?? this.ctx?.model?.provider,
       modelId: this.anchor?.modelId ?? this.ctx?.model?.id,
@@ -721,6 +921,11 @@ export class SessionWarmer {
       reason,
       ok,
       detail,
+      probeOutcome,
+      payloadFingerprint: this.anchor?.payloadFingerprint,
+      retryState: this.anchor
+        ? `${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
+        : undefined,
       // Raw usage for diagnosis (input/output/cacheRead/cacheWrite).
       // Note: OpenAI/Codex implicit caching often leaves cacheWrite at 0 even on
       // cold prompts; do not treat write=0 as incomplete mapping by itself.
@@ -759,6 +964,9 @@ export class SessionWarmer {
       provider: result.provider ?? anchor?.provider ?? model?.provider,
       modelId: result.modelId ?? anchor?.modelId ?? model?.id,
       api: result.api ?? anchor?.modelApi ?? model?.api,
+      retryState:
+        result.retryState ??
+        (anchor ? `${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}` : "none"),
     };
   }
 
@@ -776,6 +984,7 @@ export class SessionWarmer {
       return {
         ok: false,
         cacheHit: false,
+        probeOutcome: "unavailable",
         cacheRead: 0,
         cacheWrite: 0,
         input: 0,
@@ -795,6 +1004,7 @@ export class SessionWarmer {
       return {
         ok: false,
         cacheHit: false,
+        probeOutcome: "unavailable",
         cacheRead: 0,
         cacheWrite: 0,
         input: 0,
@@ -815,6 +1025,7 @@ export class SessionWarmer {
       return {
         ok: false,
         cacheHit: false,
+        probeOutcome: "unavailable",
         cacheRead: 0,
         cacheWrite: 0,
         input: 0,
@@ -928,6 +1139,7 @@ export class SessionWarmer {
     }
     this.log({
       event: "warm_start",
+      source: "warm_probe",
       sessionId: anchor.sessionId,
       reason,
       provider: model.provider,
@@ -946,7 +1158,7 @@ export class SessionWarmer {
         throw new Error(auth.ok ? "missing api key" : auth.error);
       }
 
-      const response = await complete(
+      const response = await this.completeRequest(
         model,
         {
           systemPrompt: "cache-warm",
@@ -1005,30 +1217,38 @@ export class SessionWarmer {
         costTotal: result.costUsd,
       };
 
+      if (anchor.savingsKnown && result.costUsd > 0) {
+        // Probe cost is real spend. Real-turn usage never enters this ledger.
+        anchor.estimatedSavingsUsd -= result.costUsd;
+      }
+
+      // Classify probe outcome once before observation and updates.
+      const outcome: ProbeOutcome = result.cacheHit
+        ? "hit"
+        : classifyProbeOutcome({
+            cacheFamily: anchor.cacheFamily,
+            cacheRead: result.cacheRead,
+            cacheWrite: result.cacheWrite,
+            consecutiveFailuresBefore: anchor.consecutiveFailures,
+          });
+      this.observeProbeResult(anchor, result, model, outcome, fingerprint);
+
       if (unverifiedProbe) {
-        anchor.probeCount += 1;
-        if (result.cacheHit) {
-          anchor.probeHitCount += 1;
-          anchor.cachedTokens = result.cacheRead;
-          anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
-        } else {
-          anchor.probeMissCount += 1;
-        }
-        const outcome = result.cacheHit ? "observed cache read" : "no cache read observed";
+        const payloadDrift = outcome === "payload-drift";
         const detail =
-          `unverified probe ${outcome} provider=${model.provider} api=${model.api} ` +
+          `unverified probe ${payloadDrift ? "payload-drift" : result.cacheHit ? "hit" : "miss"} provider=${model.provider} api=${model.api} ` +
           `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
           `out=${result.output} cost=${result.costUsd}`;
-        this.recordAttempt(reason, result.cacheHit, detail, usageSnap);
+        this.recordAttempt(reason, result.cacheHit, detail, usageSnap, outcome);
+        if (payloadDrift) this.lastPayload = null;
         if (ctx.hasUI) {
-          ctx.ui.notify(`pi-warm-cache: ${detail}. No active keepalive or verified savings claim.`, result.cacheHit ? "info" : "warning");
+          ctx.ui.notify(
+            `pi-warm-cache: ${detail}. No active keepalive or verified savings claim.`,
+            result.cacheHit ? "info" : "warning",
+          );
         }
         this.clearCapabilityUi(ctx);
         return result;
-      }
-
-      if (anchor.savingsKnown && result.costUsd > 0) {
-        anchor.estimatedSavingsUsd -= result.costUsd;
       }
 
       // Codex has no API output cap. OK-suffix ticks are usually small (out≈5-32).
@@ -1039,31 +1259,25 @@ export class SessionWarmer {
         this.consecutiveCodexOversized = policy.consecutiveAfter;
         if (policy.decision !== "ok") {
           if (result.cacheHit) {
-            anchor.warmHitCount += 1;
-            anchor.cachedTokens = result.cacheRead;
-            anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
-            anchor.lastWarmAt = Date.now();
             anchor.lastActivityAt = Date.now();
-          } else {
-            anchor.warmMissCount += 1;
           }
           const usageBit =
             `out=${result.output} read=${result.cacheRead} write=${result.cacheWrite} in=${result.input}`;
           if (policy.decision === "soft-skip") {
             const detail =
-              `Codex warm oversized (${usageBit}). Soft-skip #${policy.consecutiveAfter}; ` +
+              `Codex probe oversized (${usageBit}). Soft-skip #${policy.consecutiveAfter}; ` +
               `sticky-block on a second consecutive spike (threshold=${CODEX_WARM_OUTPUT_ABORT_TOKENS}).`;
-            this.recordAttempt(reason, false, detail, usageSnap);
+            this.recordAttempt(reason, false, detail, usageSnap, outcome);
             if (ctx.hasUI) ctx.ui.notify(`pi-warm-cache: ${detail}`, "warning");
-            this.showFailure(ctx, "codex out high · retry", detail);
+            this.showFailure(ctx, "codex probe output high · retry", detail);
             return result;
           }
           shouldRescheduleAfter = false;
           const detail =
-            `Codex warm oversized twice (${usageBit}). ` +
+            `Codex probe oversized twice (${usageBit}). ` +
             `Auto-warm blocked for this session until /warm resume.`;
           this.blockAutoWarm(detail);
-          this.recordAttempt(reason, false, detail, usageSnap);
+          this.recordAttempt(reason, false, detail, usageSnap, outcome);
           if (ctx.hasUI) ctx.ui.notify(`pi-warm-cache: ${detail}`, "warning");
           this.showFailure(ctx, "codex auto-warm blocked", detail);
           return result;
@@ -1071,68 +1285,89 @@ export class SessionWarmer {
       }
 
       if (result.cacheHit) {
-        anchor.warmHitCount += 1;
-        anchor.cachedTokens = result.cacheRead;
-        anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
         if (anchor.savingsKnown) {
           anchor.estimatedSavingsUsd += result.estimatedSavedUsd;
         }
-        anchor.lastWarmAt = Date.now();
         anchor.lastActivityAt = Date.now();
         anchor.consecutiveFailures = 0;
         this.recordAttempt(
           reason,
           true,
-          `hit read=${result.cacheRead} write=${result.cacheWrite} out=${result.output} in=${result.input}`,
+          `probe hit read=${result.cacheRead} write=${result.cacheWrite} out=${result.output} in=${result.input}`,
           usageSnap,
+          outcome,
         );
         renderWarmHitUi(ctx, this.config, anchor, plan, result.cacheRead);
       } else {
-        anchor.warmMissCount += 1;
+        const payloadDrift = outcome === "payload-drift";
+        const transientImplicitMiss = outcome === "transient-miss";
         anchor.consecutiveFailures += 1;
-        this.recordAttempt(
-          reason,
-          false,
-          `miss read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} out=${result.output}`,
-          usageSnap,
-        );
-        if (ctx.hasUI) {
-          ctx.ui.notify(
-            `pi-warm-cache: warm miss (read=${result.cacheRead} write=${result.cacheWrite}).`,
-            "warning",
-          );
-        }
-        if (result.cacheWrite > 0 && result.cacheRead === 0) {
+        const detail =
+          `probe ${outcome} read=${result.cacheRead} write=${result.cacheWrite} ` +
+          `in=${result.input} out=${result.output} cost=${result.costUsd}`;
+        this.recordAttempt(reason, false, detail, usageSnap, outcome);
+
+        if (payloadDrift) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `pi-warm-cache: probe miss with cache write (read=${result.cacheRead} write=${result.cacheWrite}); re-anchor required.`,
+              "warning",
+            );
+          }
           this.lastPayload = null;
           shouldRescheduleAfter = false;
           this.showFailure(
             ctx,
-            "warm miss · re-anchor needed",
+            "probe miss · re-anchor needed",
             `write=${result.cacheWrite} read=0. Payload likely diverged from provider cache.`,
           );
           return result;
         }
-        this.showFailure(
-          ctx,
-          `warm miss · retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`,
-          `read=${result.cacheRead} write=${result.cacheWrite}`,
-        );
+
+        if (transientImplicitMiss) {
+          // The first implicit-cache no-read/no-write response is retryable and
+          // intentionally quiet. The manual command still reports raw usage.
+          renderProbeRetryUi(
+            ctx,
+            this.config,
+            `read=${result.cacheRead} write=${result.cacheWrite} · retry scheduled`,
+            this.nextDueAt > Date.now() ? this.nextDueAt : undefined,
+          );
+        } else {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `pi-warm-cache: persistent probe miss (read=${result.cacheRead} write=${result.cacheWrite}).`,
+              "warning",
+            );
+          }
+          this.showFailure(
+            ctx,
+            `probe miss · retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`,
+            `read=${result.cacheRead} write=${result.cacheWrite}`,
+          );
+        }
       }
 
       return result;
     } catch (err) {
       if (!unverifiedProbe) anchor.consecutiveFailures += 1;
       const message = err instanceof Error ? err.message : String(err);
+      this.observeProbeError(anchor, model, fingerprint, message);
       this.recordAttempt(
         reason,
         false,
-        `${unverifiedProbe ? "unverified probe error" : "error"}: ${message}`,
+        `${unverifiedProbe ? "unverified probe error" : "probe error"}: ${message}`,
+        undefined,
+        "error",
       );
       if (ctx.hasUI) {
-        ctx.ui.notify(`pi-warm-cache: ${unverifiedProbe ? "unverified probe error" : "warm error"} - ${message}`, "error");
+        ctx.ui.notify(
+          `pi-warm-cache: ${unverifiedProbe ? "unverified probe error" : "probe error"} - ${message}`,
+          "error",
+        );
       }
       if (unverifiedProbe) this.clearCapabilityUi(ctx);
-      else this.showFailure(ctx, "warm error", message);
+      else this.showFailure(ctx, "probe error", message);
       return buildWarmResult({
         fingerprint,
         error: message,
@@ -1147,6 +1382,65 @@ export class SessionWarmer {
       }
     }
   }
+}
+
+function formatRealTurnStatus(observation: RealTurnObservation): string {
+  return [
+    observation.state,
+    `(read=${observation.cacheRead}`,
+    `write=${observation.cacheWrite}`,
+    `input=${observation.input}`,
+    `prompt=${observation.promptTokens}`,
+    `reason=${compactDiagnostic(observation.reason)})`,
+  ].join(" ");
+}
+
+function formatProbeStatus(observation: ProbeObservation | null): string {
+  if (!observation) return "none";
+  return [
+    observation.outcome,
+    `(read=${observation.cacheRead}`,
+    `write=${observation.cacheWrite}`,
+    `in=${observation.input}`,
+    `out=${observation.output}`,
+    `cost=$${observation.costUsd.toFixed(4)}`,
+    `pfp=${observation.payloadFingerprint.slice(0, 8)}${observation.error ? ` error=${compactDiagnostic(observation.error)}` : ""})`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function getKnownPromptTokens(anchor: CacheAnchor): number {
+  const probePrompt = anchor.latestProbe
+    ? anchor.latestProbe.input + anchor.latestProbe.cacheRead + anchor.latestProbe.cacheWrite
+    : 0;
+  return Math.max(anchor.latestRealTurn.promptTokens, probePrompt, anchor.promptTokens);
+}
+
+function makeUnknownRealTurnObservation(args: {
+  provider: string;
+  modelId: string;
+  api: string;
+  payloadFingerprint: string;
+  reason: string;
+}): RealTurnObservation {
+  return {
+    state: "unknown",
+    cacheRead: 0,
+    cacheWrite: 0,
+    input: 0,
+    promptTokens: 0,
+    provider: args.provider,
+    modelId: args.modelId,
+    api: args.api,
+    payloadFingerprint: args.payloadFingerprint,
+    observedAt: null,
+    reason: args.reason,
+  };
+}
+
+function compactDiagnostic(value: string): string {
+  return value.trim().replace(/\s+/g, "_");
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>): void {

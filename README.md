@@ -23,7 +23,8 @@ session_start
 real agent turn
     │
     ├─ before_provider_request ──► snapshot EXACT provider payload (anchor)
-    ├─ message_end(assistant)  ──► record cacheRead / prompt tokens / prices
+    ├─ message_end(assistant)  ──► record real-turn cache observation
+    │                              (read/write/input/prompt/continuity)
     └─ agent_settled           ──► start provider-specific keepalive timer
                                       │
                                       ▼
@@ -37,8 +38,8 @@ real agent turn
                            onPayload: () => mutate(clonedAnchorPayload)
                          })
                                       │
-                                      ├─ cache hit  ► update savings UI, reschedule
-                                      └─ cache miss ► stop and wait for re-anchor
+                                      ├─ probe hit  ► update savings UI, reschedule
+                                      └─ probe miss ► retry or wait for re-anchor
 session_shutdown ──► clear timers / abort in-flight warm
 ```
 
@@ -78,7 +79,7 @@ That cost is usually far below a cold re-read of a 100k-300k prefix.
 | `session_start` | Bind context, load config/flags |
 | `before_provider_request` | Read-only anchor of exact payload (never rewrite real turns) |
 | `session_compact` / `session_tree` | Drop anchor (prefix changed) |
-| `message_end` | Track cacheRead / prompt size / pricing |
+| `message_end` | Track real-turn cacheRead / cacheWrite / prompt size / pricing |
 | `agent_start` | Pause timer (real work already refreshes cache) |
 | `agent_settled` | Schedule next warm tick |
 | `model_select` / `thinking_level_select` | Drop anchor (cache key changed) |
@@ -86,13 +87,13 @@ That cost is usually far below a cold re-read of a 100k-300k prefix.
 
 ### Drift / re-anchor policy
 
-Prefix invalidation is **event-only**:
+Anchor invalidation is event-driven, with a strict payload-continuity check on the next real turn:
 
 - `session_compact`
 - `session_tree`
 - `model_select`
 - `thinking_level_select`
-- next real `before_provider_request` capture
+- next real `before_provider_request` capture marks a non-continuing prefix as unknown
 
 Idle `custom_message` / advisor injections do **not** drop the warm payload.
 Those entries do not invalidate the provider cache written by the last real turn.
@@ -121,6 +122,16 @@ Then inspect:
 ```
 
 Failures keep the widget visible with a reason. They do not silently clear to a blank editor.
+
+`/warm` reports `realTurn=...` and `probe=...` as separate observations.
+
+`realTurn=unknown` is used for the first turn, invalidation boundaries, changed prefixes, and prompts below the configured minimum.
+
+`probeHits` and `probeMisses` count only extension warm probes.
+
+A first implicit-cache `read=0 write=0` probe is labelled `transient-miss` and retries quietly.
+
+A provider error is labelled as an error and does not increment `probeMisses`.
 
 ### 1h Anthropic mode
 
@@ -257,20 +268,21 @@ interface WarmCacheConfig {
 
 ## Edge cases (handle early)
 
-1. **Payload drift / miss with write** - stop warming until the next real turn re-anchors. Do not keep paying write premium.
-2. **Model or thinking-level change** - drop anchor immediately. Caches are per model and often per effort.
-3. **Compaction / branch navigation** - next real turn produces a new payload; old anchor is replaced on capture.
-4. **Agent busy at tick** - skip and reschedule. Never steer or follow-up a live turn for warming.
-5. **Concurrency** - process-wide gate limits simultaneous warm HTTP calls across sessions.
-6. **Unsupported provider** - clear the active widget and status; do not call the provider or arm timers.
-7. **Small prefix** - below `minCachedTokens`, warming is not worth the request overhead.
-8. **Session resume** - do not restore old payloads. Wait for the first real turn.
-9. **Print/RPC modes** - still warm if enabled, but skip TUI widgets when `!ctx.hasUI`.
-10. **1h Anthropic mode** - follow on-wire Pi long TTL only. This extension does not rewrite real turns.
-11. **Codex / openai-codex-responses** - never send `max_output_tokens` (API rejects it).
-12. **OpenAI Responses** - `max_output_tokens` floor is 16, not 1.
-11. **Do not use `sendUserMessage`** - it pollutes history and can trigger tool loops.
-12. **Abort on shutdown / disable** - clear `setTimeout` / `setInterval` and abort in-flight `complete()`.
+1. **Payload drift / probe miss with write** - stop warming until the next real turn re-anchors. Do not keep paying write premium.
+2. **Implicit-cache probe miss** - retry the first `read=0 write=0` result quietly, then expose repeated misses.
+3. **Model or thinking-level change** - drop anchor immediately. Caches are per model and often per effort.
+4. **Compaction / branch navigation** - next real turn produces a new payload; old anchor is replaced on capture.
+5. **Agent busy at tick** - skip and reschedule. Never steer or follow-up a live turn for warming.
+6. **Concurrency** - process-wide gate limits simultaneous warm HTTP calls across sessions.
+7. **Unsupported provider** - clear the active widget and status; do not call the provider or arm timers.
+8. **Small prefix** - below `minCachedTokens`, warming is not worth the request overhead and real-turn classification stays unknown.
+9. **Session resume** - do not restore old payloads. Wait for the first real turn.
+10. **Print/RPC modes** - still warm if enabled, but skip TUI widgets when `!ctx.hasUI`.
+11. **1h Anthropic mode** - follow on-wire Pi long TTL only. This extension does not rewrite real turns.
+12. **Codex / openai-codex-responses** - never send `max_output_tokens` (API rejects it).
+13. **OpenAI Responses** - `max_output_tokens` floor is 16, not 1.
+14. **Do not use `sendUserMessage`** - it pollutes history and can trigger tool loops.
+15. **Abort on shutdown / disable** - clear `setTimeout` / `setInterval` and abort in-flight `complete()`.
 
 ## Package layout
 
@@ -286,10 +298,10 @@ src/
   types.ts      # interfaces
 ```
 
-## Next implementation steps
+## Validation follow-ups
 
 1. Verify `onPayload` full replacement is honored for Anthropic and OpenAI routes in your Pi version.
-2. Add unit tests for `applyWarmOutputLimit`, strategy intervals, and savings math.
-3. Log warm hits via `pi.appendEntry("pi-warm-cache-stats", ...)` for session-level totals.
+2. Add broader provider fixtures to the session-warmer double for Anthropic and Codex policy paths.
+3. Log probe totals via `pi.appendEntry("pi-warm-cache-stats", ...)` for session-level totals.
 4. Optionally hide warm HTTP from user-visible TPS footer (it already stays out of the transcript).
-5. E2E: idle past 4 minutes with a large cached prefix and confirm `cacheRead > 0` on the warm response.
+5. E2E: idle past 4 minutes with a large cached prefix and confirm both `probeOutcome=hit` and the final `realTurn=hit` observation.
