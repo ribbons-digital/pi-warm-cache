@@ -105,7 +105,7 @@ Without this control you have only proven the extension runs, not that it works.
 
 | Check | Expected |
 |-------|----------|
-| `/warm now` | `probeOutcome=hit`, `cacheRead` ≈ full prefix, `cacheWrite` ≈ 0 |
+| `/warm now` | `probe=hit`, `cacheRead` ≈ full prefix, `cacheWrite` ≈ 0 |
 | 3+ timer ticks | `probeHits` increments, `probeMisses=0` |
 | Post-idle real turn, warming on | `realTurn=hit` and `cacheRead > 0` |
 | Post-idle real turn, warming off | `cacheRead = 0` |

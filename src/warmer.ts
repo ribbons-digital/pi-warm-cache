@@ -1222,21 +1222,19 @@ export class SessionWarmer {
         anchor.estimatedSavingsUsd -= result.costUsd;
       }
 
-      const initialOutcome: ProbeOutcome = result.cacheHit ? "hit" : "miss";
-      this.observeProbeResult(anchor, result, model, initialOutcome, fingerprint);
+      // Classify probe outcome once before observation and updates.
+      const outcome: ProbeOutcome = result.cacheHit
+        ? "hit"
+        : classifyProbeOutcome({
+            cacheFamily: anchor.cacheFamily,
+            cacheRead: result.cacheRead,
+            cacheWrite: result.cacheWrite,
+            consecutiveFailuresBefore: anchor.consecutiveFailures,
+          });
+      this.observeProbeResult(anchor, result, model, outcome, fingerprint);
 
       if (unverifiedProbe) {
-        const outcome: ProbeOutcome = result.cacheHit
-          ? "hit"
-          : classifyProbeOutcome({
-              cacheFamily: anchor.cacheFamily,
-              cacheRead: result.cacheRead,
-              cacheWrite: result.cacheWrite,
-              consecutiveFailuresBefore: anchor.consecutiveFailures,
-            });
         const payloadDrift = outcome === "payload-drift";
-        result.probeOutcome = outcome;
-        if (anchor.latestProbe) anchor.latestProbe.outcome = outcome;
         const detail =
           `unverified probe ${payloadDrift ? "payload-drift" : result.cacheHit ? "hit" : "miss"} provider=${model.provider} api=${model.api} ` +
           `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
@@ -1269,7 +1267,7 @@ export class SessionWarmer {
             const detail =
               `Codex probe oversized (${usageBit}). Soft-skip #${policy.consecutiveAfter}; ` +
               `sticky-block on a second consecutive spike (threshold=${CODEX_WARM_OUTPUT_ABORT_TOKENS}).`;
-            this.recordAttempt(reason, false, detail, usageSnap, initialOutcome);
+            this.recordAttempt(reason, false, detail, usageSnap, outcome);
             if (ctx.hasUI) ctx.ui.notify(`pi-warm-cache: ${detail}`, "warning");
             this.showFailure(ctx, "codex probe output high · retry", detail);
             return result;
@@ -1279,7 +1277,7 @@ export class SessionWarmer {
             `Codex probe oversized twice (${usageBit}). ` +
             `Auto-warm blocked for this session until /warm resume.`;
           this.blockAutoWarm(detail);
-          this.recordAttempt(reason, false, detail, usageSnap, initialOutcome);
+          this.recordAttempt(reason, false, detail, usageSnap, outcome);
           if (ctx.hasUI) ctx.ui.notify(`pi-warm-cache: ${detail}`, "warning");
           this.showFailure(ctx, "codex auto-warm blocked", detail);
           return result;
@@ -1297,21 +1295,13 @@ export class SessionWarmer {
           true,
           `probe hit read=${result.cacheRead} write=${result.cacheWrite} out=${result.output} in=${result.input}`,
           usageSnap,
-          "hit",
+          outcome,
         );
         renderWarmHitUi(ctx, this.config, anchor, plan, result.cacheRead);
       } else {
-        const outcome = classifyProbeOutcome({
-          cacheFamily: anchor.cacheFamily,
-          cacheRead: result.cacheRead,
-          cacheWrite: result.cacheWrite,
-          consecutiveFailuresBefore: anchor.consecutiveFailures,
-        });
         const payloadDrift = outcome === "payload-drift";
         const transientImplicitMiss = outcome === "transient-miss";
         anchor.consecutiveFailures += 1;
-        result.probeOutcome = outcome;
-        if (anchor.latestProbe) anchor.latestProbe.outcome = outcome;
         const detail =
           `probe ${outcome} read=${result.cacheRead} write=${result.cacheWrite} ` +
           `in=${result.input} out=${result.output} cost=${result.costUsd}`;
