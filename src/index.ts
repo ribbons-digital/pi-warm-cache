@@ -54,10 +54,14 @@ export default function piWarmCache(pi: ExtensionAPI) {
     // Stats persistence can be added later via appendEntry.
 
     if (event.reason === "startup" && config.enabled && ctx.hasUI) {
-      ctx.ui.setStatus(
-        "pi-warm-cache",
-        ctx.ui.theme.fg("dim", "warm ready · waiting for first cached turn"),
-      );
+      if (warmer.getCapability().state === "verified") {
+        ctx.ui.setStatus(
+          "pi-warm-cache",
+          ctx.ui.theme.fg("dim", "warm ready · waiting for first cached turn"),
+        );
+      } else {
+        clearWarmUi(ctx);
+      }
     }
   });
 
@@ -137,14 +141,32 @@ export default function piWarmCache(pi: ExtensionAPI) {
         }
         // Manual ping is allowed even when auto-warm is sticky-blocked.
         const result = await warmer.warmNow(ctx);
+        const route = `${result.provider ?? "unknown"}/${result.modelId ?? "unknown"} api=${result.api ?? "unknown"}`;
+        const usage =
+          `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
+          `out=${result.output} cost=$${result.costUsd.toFixed(4)}`;
         if (!result.ok) {
-          ctx.ui.notify(`Warm failed: ${result.error}`, "error");
+          const failureLabel =
+            result.unavailable || result.capabilityState === "unsupported"
+              ? "Warm unavailable"
+              : "Warm failed";
+          ctx.ui.notify(
+            `${failureLabel}: ${result.error} (${route})`,
+            "error",
+          );
+          return;
+        }
+        if (result.capabilityState === "unverified") {
+          ctx.ui.notify(
+            `Unverified probe ${result.cacheHit ? "observed a cache read" : "completed without a cache read"} (${route}; ${usage}). No active keepalive or verified savings claim.`,
+            result.cacheHit ? "info" : "warning",
+          );
           return;
         }
         ctx.ui.notify(
           result.cacheHit
-            ? `Warm hit cacheRead=${result.cacheRead} out=${result.output}`
-            : `Warm done but no cache hit (read=${result.cacheRead} write=${result.cacheWrite} out=${result.output})`,
+            ? `Warm hit (${route}; ${usage})`
+            : `Warm done but no cache hit (${route}; ${usage})`,
           result.cacheHit ? "info" : "warning",
         );
         return;

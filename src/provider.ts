@@ -1,6 +1,21 @@
 import type { CacheRetention, Model } from "@earendil-works/pi-ai";
-import type { AnthropicTtlMode, CacheFamily, StrategyPlan, WarmCacheConfig } from "./types.ts";
 import { formatDurationShort } from "./config.ts";
+import { isSafeReplayPayload, resolveProviderCapability } from "./capability.ts";
+import type {
+  AnthropicTtlMode,
+  CacheFamily,
+  ProviderCapability,
+  ProviderCapabilityState,
+  StrategyPlan,
+  WarmCacheConfig,
+} from "./types.ts";
+
+export {
+  canManualProbe,
+  isSafeReplayPayload,
+  resolveProviderCapability,
+} from "./capability.ts";
+export type { ProviderCapability, ProviderCapabilityState } from "./types.ts";
 
 /** Anthropic short TTL. Ping inside the window. */
 export const ANTHROPIC_SHORT_TTL_MS = 5 * 60_000;
@@ -26,21 +41,29 @@ export function isAnthropicModel(model: Model<any> | undefined): boolean {
 }
 
 export function isOpenAIModel(model: Model<any> | undefined): boolean {
-  if (!model) return false;
-  if (isAnthropicModel(model)) return false;
+  if (!model || isAnthropicModel(model)) return false;
   return (
-    model.api === "openai-responses" ||
-    model.api === "openai-completions" ||
-    model.api === "openai-codex-responses" ||
-    model.api === "azure-openai-responses" ||
-    model.provider === "openai" ||
-    model.provider === "openai-codex"
+    (model.provider === "openai" &&
+      (model.api === "openai-responses" || model.api === "openai-completions")) ||
+    (model.provider === "openai-codex" && model.api === "openai-codex-responses") ||
+    (model.provider === "azure-openai-responses" && model.api === "azure-openai-responses")
   );
 }
 
 export function supportsPromptCache(model: Model<any> | undefined): boolean {
-  if (!model) return false;
-  return isAnthropicModel(model) || isOpenAIModel(model);
+  return resolveProviderCapability(model).state !== "unsupported";
+}
+
+/** True when the route has a verified automatic keepalive strategy. */
+export function supportsAutomaticWarm(model: Model<any> | undefined): boolean {
+  return resolveProviderCapability(model).automaticWarm;
+}
+
+/** True when the route is allowed to make a one-shot manual probe. */
+export function supportsManualProbe(model: Model<any> | undefined, payload?: unknown): boolean {
+  const capability = resolveProviderCapability(model);
+  if (!capability.manualProbe) return false;
+  return payload === undefined ? true : isSafeReplayPayload(payload, model?.api);
 }
 
 type ModelCompat = {
@@ -101,6 +124,7 @@ export function payloadHasAnthropicLongTtl(payload: unknown): boolean {
 }
 
 export type StrategyResolution = StrategyPlan & {
+  capability: ProviderCapability;
   /**
    * User asked for 1h, but we stayed on short because either:
    * - model/route rejects long retention, or
@@ -109,12 +133,11 @@ export type StrategyResolution = StrategyPlan & {
   longTtlDegradedReason: string | null;
 };
 
-export function resolveCacheFamily(
-  model: Model<any> | undefined,
+function resolveVerifiedCacheFamily(
+  model: Model<any>,
   anthropicTtl: AnthropicTtlMode,
   payload?: unknown,
 ): CacheFamily {
-  if (!model) return "unsupported";
   if (isAnthropicModel(model)) {
     // Actual on-wire TTL wins. We never inject 1h onto real turns.
     if (payloadHasAnthropicLongTtl(payload)) return "anthropic-long";
@@ -130,6 +153,17 @@ export function resolveCacheFamily(
   return "unsupported";
 }
 
+export function resolveCacheFamily(
+  model: Model<any> | undefined,
+  anthropicTtl: AnthropicTtlMode,
+  payload?: unknown,
+): CacheFamily {
+  const capability = resolveProviderCapability(model);
+  if (capability.state === "unverified") return "unverified";
+  if (capability.state === "unsupported" || !model) return "unsupported";
+  return resolveVerifiedCacheFamily(model, anthropicTtl, payload);
+}
+
 export function resolveCacheRetention(family: CacheFamily): CacheRetention {
   switch (family) {
     case "anthropic-long":
@@ -138,6 +172,8 @@ export function resolveCacheRetention(family: CacheFamily): CacheRetention {
     case "openai-explicit":
     case "openai-implicit":
       return "short";
+    case "unverified":
+    case "unsupported":
     default:
       return "none";
   }
@@ -148,8 +184,26 @@ export function resolveStrategy(
   config: WarmCacheConfig,
   payload?: unknown,
 ): StrategyResolution {
+  const capability = resolveProviderCapability(model);
   const family = resolveCacheFamily(model, config.anthropicTtl, payload);
   const cacheRetention = resolveCacheRetention(family);
+
+  if (capability.state !== "verified") {
+    return {
+      capability,
+      family,
+      cacheRetention,
+      intervalMs: null,
+      ttlLabel:
+        capability.state === "unverified"
+          ? "unverified route (manual probe only)"
+          : "unsupported route",
+      waitLabel: null,
+      automaticWarm: false,
+      manualProbe: capability.manualProbe,
+      longTtlDegradedReason: null,
+    };
+  }
 
   let longTtlDegradedReason: string | null = null;
   if (isAnthropicModel(model) && config.anthropicTtl === "1h" && family !== "anthropic-long") {
@@ -182,19 +236,37 @@ export function resolveStrategy(
       ttlLabel = "~8m idle cache window";
       break;
     default:
-      ttlMs = ANTHROPIC_SHORT_TTL_MS;
-      ttlLabel = "unsupported";
+      return {
+        capability: {
+          ...capability,
+          state: "unsupported",
+          automaticWarm: false,
+          manualProbe: false,
+          reason: `verified route resolved to an unsupported cache family: ${family}`,
+        },
+        family: "unsupported",
+        cacheRetention: "none",
+        intervalMs: null,
+        ttlLabel: "unsupported route",
+        waitLabel: null,
+        automaticWarm: false,
+        manualProbe: false,
+        longTtlDegradedReason: null,
+      };
   }
 
   const intervalMs =
     config.intervalMs ?? Math.max(30_000, Math.floor(ttlMs * DEFAULT_TTL_FRACTION));
 
   return {
+    capability,
     family,
     cacheRetention,
     intervalMs,
     ttlLabel,
     waitLabel: formatDurationShort(intervalMs),
+    automaticWarm: true,
+    manualProbe: false,
     longTtlDegradedReason,
   };
 }

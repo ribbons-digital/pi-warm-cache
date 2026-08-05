@@ -9,21 +9,29 @@
 import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
+  canManualProbe,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
   decideCodexOversizedAction,
   isCodexPayload,
   minimumOutputTokensForPayload,
   modelSupportsLongCacheRetention,
+  isSafeReplayPayload,
   OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
   payloadHasAnthropicLongTtl,
+  resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
   WARM_MUTABLE_PAYLOAD_KEYS,
 } from "./provider.ts";
-import { estimateSavedUsd, formatSavingsLabel, resolveModelPricing } from "./savings.ts";
+import {
+  buildWarmResult,
+  estimateSavedUsd,
+  formatSavingsLabel,
+  resolveModelPricing,
+} from "./savings.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 
-function assert(cond: unknown, msg: string): void {
+function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
 }
 
@@ -150,8 +158,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   } as any;
 
   const short = resolveStrategy(anthropic, { ...DEFAULT_CONFIG, anthropicTtl: "5m" });
-  assert(short.intervalMs < 5 * 60_000, "short interval must be inside 5m");
-  assert(short.intervalMs >= 3 * 60_000, "short interval should be roughly 4m");
+  const shortInterval = short.intervalMs;
+  assert(shortInterval !== null, "short strategy must have an interval");
+  assert(shortInterval < 5 * 60_000, "short interval must be inside 5m");
+  assert(shortInterval >= 3 * 60_000, "short interval should be roughly 4m");
 
   const degraded = resolveStrategy(anthropic, { ...DEFAULT_CONFIG, anthropicTtl: "1h" }, {
     system: [{ cache_control: { type: "ephemeral" } }],
@@ -164,7 +174,9 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   };
   const long = resolveStrategy(anthropic, { ...DEFAULT_CONFIG, anthropicTtl: "1h" }, longPayload);
   assert(long.family === "anthropic-long", "payload 1h markers select long family");
-  assert(long.intervalMs < 60 * 60_000, "long interval must be inside 1h");
+  const longInterval = long.intervalMs;
+  assert(longInterval !== null, "long strategy must have an interval");
+  assert(longInterval < 60 * 60_000, "long interval must be inside 1h");
   assert(long.cacheRetention === "long", "1h mode uses long retention");
   assert(payloadHasAnthropicLongTtl(longPayload), "detector finds 1h markers");
 
@@ -184,7 +196,9 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   } as any;
   const oai = resolveStrategy(openaiExplicit, DEFAULT_CONFIG);
   assert(oai.family === "openai-explicit", "compat flag selects explicit 30m family");
-  assert(oai.intervalMs < 30 * 60_000, "openai interval inside 30m");
+  const openAiInterval = oai.intervalMs;
+  assert(openAiInterval !== null, "OpenAI strategy must have an interval");
+  assert(openAiInterval < 30 * 60_000, "openai interval inside 30m");
 
   const openaiOld = {
     id: "o3",
@@ -193,6 +207,114 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   } as any;
   const old = resolveStrategy(openaiOld, DEFAULT_CONFIG);
   assert(old.family === "openai-implicit", "without compat flag, OpenAI stays implicit");
+
+  const directXai = {
+    id: "grok-4.5",
+    provider: "xai",
+    api: "openai-responses",
+    baseUrl: "https://api.x.ai/v1",
+  } as any;
+  const xaiCapability = resolveProviderCapability(directXai);
+  assert(xaiCapability.state === "unverified", "direct xAI must be unverified");
+  assert(!xaiCapability.automaticWarm, "unverified xAI must not auto-warm");
+  assert(xaiCapability.manualProbe, "direct xAI may expose a manual probe");
+  const insecureXai = { ...directXai, baseUrl: "http://api.x.ai/v1" } as any;
+  assert(
+    resolveProviderCapability(insecureXai).state === "unsupported",
+    "HTTP xAI routes must not receive first-party capability",
+  );
+  const xai = resolveStrategy(directXai, DEFAULT_CONFIG);
+  assert(xai.family === "unverified", "xAI must not inherit OpenAI family wording");
+  assert(xai.intervalMs === null, "unverified xAI must not receive a timer interval");
+  assert(xai.ttlLabel.includes("unverified"), "xAI must not receive a fixed TTL label");
+
+  const xaiPayload = {
+    model: "grok-4.5",
+    input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+  };
+  assert(isSafeReplayPayload(xaiPayload, directXai.api), "Responses payload should be probe-safe");
+  assert(canManualProbe(directXai, xaiPayload), "safe xAI payload should allow a manual probe");
+  assert(
+    !canManualProbe(directXai, { model: "grok-4.5", messages: [] }),
+    "unsafe xAI payload should not allow a manual probe",
+  );
+
+  const openRouterXai = {
+    id: "x-ai/grok-4.5",
+    provider: "openrouter",
+    api: "openai-responses",
+    baseUrl: "https://openrouter.ai/api/v1",
+  } as any;
+  const openRouterCapability = resolveProviderCapability(openRouterXai);
+  assert(openRouterCapability.state === "unsupported", "OpenRouter must not inherit xAI support");
+  assert(!openRouterCapability.manualProbe, "unsupported OpenRouter route must not probe");
+  assert(!canManualProbe(openRouterXai, xaiPayload), "OpenRouter must reject manual probes");
+  const openRouterStrategy = resolveStrategy(openRouterXai, DEFAULT_CONFIG);
+  assert(!openRouterStrategy.automaticWarm, "unsupported OpenRouter route must not auto-warm");
+  assert(openRouterStrategy.intervalMs === null, "unsupported route must not receive a timer");
+
+  const openCodeGrok = {
+    id: "grok-4.5",
+    provider: "opencode-go",
+    api: "openai-responses",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  assert(
+    resolveProviderCapability(openCodeGrok).state === "unsupported",
+    "OpenCode Go must not inherit OpenAI support",
+  );
+  assert(!canManualProbe(openCodeGrok, xaiPayload), "OpenCode Go must reject manual probes");
+
+  const unknownResponses = {
+    id: "gpt-compatible",
+    provider: "my-proxy",
+    api: "openai-responses",
+  } as any;
+  assert(
+    resolveProviderCapability(unknownResponses).state === "unsupported",
+    "unknown OpenAI-compatible routes must be unsupported",
+  );
+  assert(!canManualProbe(unknownResponses, xaiPayload), "unknown routes must reject manual probes");
+
+  const unverifiedProbe = buildWarmResult({
+    fingerprint: "xai-payload",
+    usage: {
+      input: 4,
+      output: 2,
+      cacheRead: 1200,
+      cacheWrite: 0,
+      cost: { total: 0.01 },
+    },
+    anchor: {
+      inputPricePerMTok: 2,
+      cacheReadPricePerMTok: 0.3,
+      savingsKnown: true,
+      capability: xaiCapability,
+    },
+  });
+  assert(unverifiedProbe.cacheHit, "unverified probe should retain observed cache-read result");
+  assert(unverifiedProbe.estimatedSavedUsd === 0, "unverified probe must not claim savings");
+  const rejectedProbe = buildWarmResult({
+    fingerprint: "unsafe-xai-payload",
+    error: "captured payload shape is not safe",
+    unavailable: true,
+    anchor: {
+      inputPricePerMTok: 2,
+      cacheReadPricePerMTok: 0.3,
+      savingsKnown: false,
+      capability: xaiCapability,
+    },
+  });
+  assert(rejectedProbe.unavailable === true, "policy rejection must be marked unavailable");
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0,
+      savingsKnown: false,
+      pricingSource: "model",
+      capability: xaiCapability,
+    }) === "n/a (unverified route)",
+    "unverified route must not use the no-pricing message for savings",
+  );
 }
 
 // 4) minimumOutputTokensForPayload helper

@@ -37,11 +37,19 @@ There is no log file. All evidence comes from:
    Expect:
 
    ```
-   enabled family=anthropic-short cached≈<big> hits=0 misses=0 saved≈$0.0000 nextDue=<~4m out> ctx=<hash> pfp=<hash>
+   enabled family=anthropic-short capability=verified capabilityReason=first-party Anthropic Messages route with cache markers provider=anthropic/claude-fable-5 api=anthropic-messages cached≈<big> hits=0 misses=0 failStreak=0 savings=est. $0.0000 saved pricing=model nextDue=<ISO timestamp> pfp=<8-char hash> autoWarm=on last=none
    ```
 
-   - `family=unsupported` or `idle (no anchor)` -> capture failed, abort.
+   - `inactive capability=unsupported` -> this route is unsupported and the provider will not be called, abort.
    - `cached≈0` -> `message_end` usage tracking is not landing.
+
+4. Confirm the exact route before waiting.
+
+   The status must show `capability=verified`, the expected provider/model route, and the expected API transport.
+
+   Do not start a timer test for `capability=unverified` or `capability=unsupported`.
+
+   Direct xAI is currently unverified and supports only a clearly labelled manual probe when its captured payload is safe.
 
 ## Step 1: smoke test (before any waiting)
 
@@ -49,10 +57,10 @@ There is no log file. All evidence comes from:
 /warm now
 ```
 
-Expect `Warm hit cacheRead=<~prefix size> saved≈$...`.
+Expect `Warm hit (anthropic/claude-fable-5 api=anthropic-messages; read=<~prefix size> write=0 in=<input tokens> out=<output tokens> cost=$<cost>)`.
 
 This is the highest-value check: it isolates payload replay from timing.
-If it reports `no cache hit (read=0 write=N)`, the replayed payload does not
+If it reports `Warm done but no cache hit (anthropic/claude-fable-5 api=anthropic-messages; read=0 write=<N> in=<input tokens> out=<output tokens> cost=$<cost>)`, the replayed payload does not
 byte-match the real one. That is the failure mode described in the README
 ("payload replay, not Context rebuild"), and the timer test will only reproduce
 it more slowly.
@@ -98,7 +106,7 @@ Without this control you have only proven the extension runs, not that it works.
 | 3+ timer ticks | `hits` increments, `misses=0` |
 | Post-idle real turn, warming on | `cacheRead > 0` |
 | Post-idle real turn, warming off | `cacheRead = 0` |
-| `saved≈$` | positive and growing |
+| `savings=est. $... saved` | positive and growing for verified routes with model pricing |
 
 Caveat on the last row: the savings figure is an estimate computed from model
 pricing in `savings.ts`, not billed data. It debits actual warm spend on every
