@@ -654,6 +654,30 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(warmer.getLatestProbeObservation()?.outcome === "payload-drift", "status should retain payload drift");
   assert(warmer.getStatusText().includes("payload=none"), "payload drift should clear the replay payload");
   assert(notifications.some((entry) => entry.level === "warning"), "payload drift should warn immediately");
+
+  // Recapturing the same payload after drift must create a fresh anchor. The
+  // old fingerprint alone is not enough to prove continuity because the old
+  // replay payload was deliberately discarded.
+  warmer.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "warmer-test",
+    },
+    ctx,
+  );
+  const reanchoredStatus = warmer.getStatusText();
+  assert(warmer.getLatestProbeObservation() === null, "re-anchor should clear the prior probe observation");
+  assert(
+    warmer.getLatestRealTurnObservation()?.reason === "prefix changed",
+    "re-anchor should mark the continuity boundary",
+  );
+  assert(reanchoredStatus.includes("probeHits=0"), "re-anchor should reset probe hits");
+  assert(reanchoredStatus.includes("probeMisses=0"), "re-anchor should reset probe misses");
+  assert(
+    reanchoredStatus.includes("savings=est. $0.0000 saved"),
+    "re-anchor should reset probe savings",
+  );
   warmer.dispose();
 }
 
