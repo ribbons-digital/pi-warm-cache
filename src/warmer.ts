@@ -1385,6 +1385,8 @@ export class SessionWarmer {
           }
           this.lastPayload = null;
           shouldRescheduleAfter = false;
+          if (this.uiTimer) clearInterval(this.uiTimer);
+          this.uiTimer = null;
           this.showFailure(ctx, "probe miss · re-anchor needed", reanchorDetail);
           return result;
         }

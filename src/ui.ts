@@ -84,7 +84,7 @@ export function renderWarmHitUi(
 
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("success", `probe hit · ~${tokens}`),
+    ctx.ui.theme.fg("success", `${hitLabel} · ~${tokens}`),
   );
 }
 
