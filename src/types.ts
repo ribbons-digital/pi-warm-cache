@@ -124,6 +124,8 @@ export interface WarmResult {
   cacheHit: boolean;
   capabilityState?: ProviderCapabilityState;
   capabilityReason?: string;
+  /** True when a probe was rejected before any provider request. */
+  unavailable?: boolean;
   provider?: string;
   modelId?: string;
   api?: string;

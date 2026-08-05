@@ -146,8 +146,12 @@ export default function piWarmCache(pi: ExtensionAPI) {
           `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
           `out=${result.output} cost=$${result.costUsd.toFixed(4)}`;
         if (!result.ok) {
+          const failureLabel =
+            result.unavailable || result.capabilityState === "unsupported"
+              ? "Warm unavailable"
+              : "Warm failed";
           ctx.ui.notify(
-            `${result.capabilityState === "unsupported" ? "Warm unavailable" : "Warm failed"}: ${result.error} (${route})`,
+            `${failureLabel}: ${result.error} (${route})`,
             "error",
           );
           return;

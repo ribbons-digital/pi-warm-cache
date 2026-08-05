@@ -97,6 +97,7 @@ export function buildWarmResult(args: {
     cost?: { total?: number };
   };
   error?: string;
+  unavailable?: boolean;
   anchor: Pick<CacheAnchor, "inputPricePerMTok" | "cacheReadPricePerMTok" | "savingsKnown"> &
     Partial<Pick<CacheAnchor, "capability">>;
 }): WarmResult {
@@ -111,6 +112,7 @@ export function buildWarmResult(args: {
       costUsd: 0,
       estimatedSavedUsd: 0,
       error: args.error,
+      unavailable: args.unavailable,
       fingerprint: args.fingerprint,
     };
   }

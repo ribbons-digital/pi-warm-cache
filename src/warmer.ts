@@ -93,7 +93,12 @@ export class SessionWarmer {
   }
 
   getCapability(): ProviderCapability {
-    return this.capability ?? resolveProviderCapability(this.ctx?.model);
+    return this.currentCapability();
+  }
+
+  private currentCapability(ctx?: ExtensionContext | null): ProviderCapability {
+    const context = ctx ?? this.ctx;
+    return this.anchor?.capability ?? this.capability ?? resolveProviderCapability(context?.model);
   }
 
   getLogFile(): string | null {
@@ -283,6 +288,8 @@ export class SessionWarmer {
         this.capability.state === "verified" && preserveSessionStats
           ? (prev?.warmMissCount ?? 0)
           : 0,
+      // Verified warm counters are session totals; unverified probe counters
+      // describe the current captured anchor and reset when its prefix changes.
       probeCount:
         this.capability.state === "unverified" && preserveSessionStats && !prefixChanged
           ? (prev?.probeCount ?? 0)
@@ -419,7 +426,7 @@ export class SessionWarmer {
     if (!this.config.enabled) return "disabled";
     const log =
       this.config.logToFile && this.getLogFile() ? ` log=${this.getLogFile()}` : "";
-    const capability = this.capability ?? resolveProviderCapability(this.ctx?.model);
+    const capability = this.currentCapability(this.ctx);
     const model = this.ctx?.model;
     const route = this.anchor
       ? `${this.anchor.provider}/${this.anchor.modelId}`
@@ -535,7 +542,7 @@ export class SessionWarmer {
     if (this.disposed || !this.config.enabled) return;
     const ctx = this.ctx;
     if (!ctx) return;
-    const capability = this.anchor?.capability ?? resolveProviderCapability(ctx.model);
+    const capability = this.currentCapability(ctx);
     this.capability = capability;
     if (capability.state !== "verified" || !capability.automaticWarm) {
       this.clearTimers();
@@ -580,7 +587,11 @@ export class SessionWarmer {
       return;
     }
     if (!plan.automaticWarm || plan.intervalMs === null) {
-      this.clearCapabilityUi(ctx);
+      this.showIdle(
+        ctx,
+        "automatic warming unavailable",
+        "No verified keepalive strategy is available for this route.",
+      );
       return;
     }
     if ((anchor.cachedTokens || anchor.promptTokens) < this.config.minCachedTokens) {
@@ -648,7 +659,7 @@ export class SessionWarmer {
     this.abort?.abort();
     this.abort = null;
     if (!this.ctx) return;
-    if ((this.capability ?? resolveProviderCapability(this.ctx.model)).state === "verified") {
+    if (this.currentCapability(this.ctx).state === "verified") {
       this.showIdle(this.ctx, reason);
     } else {
       this.clearCapabilityUi(this.ctx);
@@ -661,7 +672,7 @@ export class SessionWarmer {
 
   /** Benign non-warming states (not painted as errors). */
   private showIdle(ctx: ExtensionContext, reason: string, detail?: string): void {
-    if ((this.capability ?? resolveProviderCapability(ctx.model)).state !== "verified") {
+    if (this.currentCapability(ctx).state !== "verified") {
       this.clearCapabilityUi(ctx);
       return;
     }
@@ -670,7 +681,7 @@ export class SessionWarmer {
 
   /** Real failures / retries (keep panel visible with reason). */
   private showFailure(ctx: ExtensionContext, reason: string, detail?: string): void {
-    if ((this.anchor?.capability ?? this.capability ?? resolveProviderCapability(ctx.model)).state !== "verified") {
+    if (this.currentCapability(ctx).state !== "verified") {
       this.clearCapabilityUi(ctx);
       return;
     }
@@ -696,7 +707,7 @@ export class SessionWarmer {
     },
   ): void {
     this.lastAttempt = { at: Date.now(), reason, ok, detail };
-    const capability = this.anchor?.capability ?? this.capability;
+    const capability = this.currentCapability(this.ctx);
     this.log({
       event: "attempt",
       sessionId: this.anchor?.sessionId,
@@ -740,7 +751,7 @@ export class SessionWarmer {
   private withRouteDiagnostics(result: WarmResult): WarmResult {
     const anchor = this.anchor;
     const model = this.ctx?.model;
-    const capability = anchor?.capability ?? this.capability ?? resolveProviderCapability(model);
+    const capability = this.currentCapability(this.ctx);
     return {
       ...result,
       capabilityState: result.capabilityState ?? capability.state,
@@ -756,7 +767,7 @@ export class SessionWarmer {
     const anchor = this.anchor;
     const payload = this.lastPayload;
     const plan = this.plan;
-    const capability = anchor?.capability ?? this.capability ?? resolveProviderCapability(ctx?.model);
+    const capability = this.currentCapability(ctx);
 
     if (capability.state === "unsupported") {
       this.clearTimers();
@@ -772,6 +783,7 @@ export class SessionWarmer {
         costUsd: 0,
         estimatedSavedUsd: 0,
         error: capability.reason,
+        unavailable: true,
         fingerprint: anchor?.payloadFingerprint ?? "",
       };
     }
@@ -790,6 +802,7 @@ export class SessionWarmer {
         costUsd: 0,
         estimatedSavedUsd: 0,
         error: "automatic warming is disabled for an unverified route",
+        unavailable: true,
         fingerprint: anchor?.payloadFingerprint ?? "",
       };
     }
@@ -830,6 +843,7 @@ export class SessionWarmer {
         costUsd: 0,
         estimatedSavedUsd: 0,
         error: detail,
+        unavailable: capability.state === "unverified",
         fingerprint: "",
       };
     }
@@ -841,6 +855,7 @@ export class SessionWarmer {
       return buildWarmResult({
         fingerprint: anchor.payloadFingerprint,
         error: detail,
+        unavailable: true,
         anchor,
       });
     }

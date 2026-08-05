@@ -20,8 +20,8 @@ function hasFirstPartyBaseUrl(model: Model<any>, hosts: Set<string>): boolean {
   // the explicit route registration in that case.
   if (!model.baseUrl) return true;
   try {
-    const hostname = new URL(model.baseUrl).hostname.toLowerCase();
-    return hosts.has(hostname);
+    const url = new URL(model.baseUrl);
+    return url.protocol === "https:" && hosts.has(url.hostname.toLowerCase());
   } catch {
     return false;
   }

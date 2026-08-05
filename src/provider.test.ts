@@ -218,6 +218,11 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(xaiCapability.state === "unverified", "direct xAI must be unverified");
   assert(!xaiCapability.automaticWarm, "unverified xAI must not auto-warm");
   assert(xaiCapability.manualProbe, "direct xAI may expose a manual probe");
+  const insecureXai = { ...directXai, baseUrl: "http://api.x.ai/v1" } as any;
+  assert(
+    resolveProviderCapability(insecureXai).state === "unsupported",
+    "HTTP xAI routes must not receive first-party capability",
+  );
   const xai = resolveStrategy(directXai, DEFAULT_CONFIG);
   assert(xai.family === "unverified", "xAI must not inherit OpenAI family wording");
   assert(xai.intervalMs === null, "unverified xAI must not receive a timer interval");
@@ -229,6 +234,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   };
   assert(isSafeReplayPayload(xaiPayload, directXai.api), "Responses payload should be probe-safe");
   assert(canManualProbe(directXai, xaiPayload), "safe xAI payload should allow a manual probe");
+  assert(
+    !canManualProbe(directXai, { model: "grok-4.5", messages: [] }),
+    "unsafe xAI payload should not allow a manual probe",
+  );
 
   const openRouterXai = {
     id: "x-ai/grok-4.5",
@@ -239,6 +248,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   const openRouterCapability = resolveProviderCapability(openRouterXai);
   assert(openRouterCapability.state === "unsupported", "OpenRouter must not inherit xAI support");
   assert(!openRouterCapability.manualProbe, "unsupported OpenRouter route must not probe");
+  assert(!canManualProbe(openRouterXai, xaiPayload), "OpenRouter must reject manual probes");
   const openRouterStrategy = resolveStrategy(openRouterXai, DEFAULT_CONFIG);
   assert(!openRouterStrategy.automaticWarm, "unsupported OpenRouter route must not auto-warm");
   assert(openRouterStrategy.intervalMs === null, "unsupported route must not receive a timer");
@@ -253,6 +263,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     resolveProviderCapability(openCodeGrok).state === "unsupported",
     "OpenCode Go must not inherit OpenAI support",
   );
+  assert(!canManualProbe(openCodeGrok, xaiPayload), "OpenCode Go must reject manual probes");
 
   const unknownResponses = {
     id: "gpt-compatible",
@@ -263,6 +274,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     resolveProviderCapability(unknownResponses).state === "unsupported",
     "unknown OpenAI-compatible routes must be unsupported",
   );
+  assert(!canManualProbe(unknownResponses, xaiPayload), "unknown routes must reject manual probes");
 
   const unverifiedProbe = buildWarmResult({
     fingerprint: "xai-payload",
@@ -282,6 +294,18 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   });
   assert(unverifiedProbe.cacheHit, "unverified probe should retain observed cache-read result");
   assert(unverifiedProbe.estimatedSavedUsd === 0, "unverified probe must not claim savings");
+  const rejectedProbe = buildWarmResult({
+    fingerprint: "unsafe-xai-payload",
+    error: "captured payload shape is not safe",
+    unavailable: true,
+    anchor: {
+      inputPricePerMTok: 2,
+      cacheReadPricePerMTok: 0.3,
+      savingsKnown: false,
+      capability: xaiCapability,
+    },
+  });
+  assert(rejectedProbe.unavailable === true, "policy rejection must be marked unavailable");
   assert(
     formatSavingsLabel({
       estimatedSavingsUsd: 0,
