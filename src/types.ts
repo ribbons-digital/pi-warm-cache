@@ -1,11 +1,25 @@
 import type { CacheRetention, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 
+/** Capability state for the exact provider route, not only the model name. */
+export type ProviderCapabilityState = "verified" | "unverified" | "unsupported";
+
+export interface ProviderCapability {
+  state: ProviderCapabilityState;
+  /** Why this route received its capability state. */
+  reason: string;
+  /** Whether a timer may invoke the provider for this route. */
+  automaticWarm: boolean;
+  /** Whether an explicit one-shot probe may be attempted for this route. */
+  manualProbe: boolean;
+}
+
 /** Detected cache family for interval + payload strategy. */
 export type CacheFamily =
   | "anthropic-short"
   | "anthropic-long"
   | "openai-explicit"
   | "openai-implicit"
+  | "unverified"
   | "unsupported";
 
 export type AnthropicTtlMode = "5m" | "1h" | "auto";
@@ -71,6 +85,9 @@ export interface CacheAnchor {
   modelId: string;
   modelApi: string;
   thinkingLevel: ThinkingLevel | "off" | undefined;
+  capability: ProviderCapability;
+  /** True when this captured payload has a safe manual-probe shape. */
+  manualProbeAvailable: boolean;
   cacheFamily: CacheFamily;
   cacheRetention: CacheRetention;
   /** Hash of the captured provider payload (identity / logging). */
@@ -95,12 +112,21 @@ export interface CacheAnchor {
   estimatedSavingsUsd: number;
   warmHitCount: number;
   warmMissCount: number;
+  /** One-shot observations on an unverified route are kept separate. */
+  probeCount: number;
+  probeHitCount: number;
+  probeMissCount: number;
   consecutiveFailures: number;
 }
 
 export interface WarmResult {
   ok: boolean;
   cacheHit: boolean;
+  capabilityState?: ProviderCapabilityState;
+  capabilityReason?: string;
+  provider?: string;
+  modelId?: string;
+  api?: string;
   cacheRead: number;
   cacheWrite: number;
   input: number;
@@ -114,12 +140,16 @@ export interface WarmResult {
 export interface StrategyPlan {
   family: CacheFamily;
   cacheRetention: CacheRetention;
-  /** Delay from last activity until next warm attempt. */
-  intervalMs: number;
+  /** Delay from last activity until next warm attempt. Null means no timer. */
+  intervalMs: number | null;
   /** Human label for UI, e.g. "5m prompt-cache TTL". */
   ttlLabel: string;
-  /** Human label for deferred wait, e.g. "4m". */
-  waitLabel: string;
+  /** Human label for deferred wait, e.g. "4m". Null means no timer. */
+  waitLabel: string | null;
+  /** Whether this plan is allowed to arm an automatic timer. */
+  automaticWarm: boolean;
+  /** Whether this plan permits a manual one-shot probe. */
+  manualProbe: boolean;
 }
 
 export interface ResolvedModelRef {

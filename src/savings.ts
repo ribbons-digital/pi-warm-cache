@@ -71,8 +71,11 @@ export function estimateSavedUsd(
  * Unknown: "savings n/a (no model pricing)"
  */
 export function formatSavingsLabel(
-  anchor: Pick<CacheAnchor, "estimatedSavingsUsd" | "savingsKnown" | "pricingSource">,
+  anchor: Pick<CacheAnchor, "estimatedSavingsUsd" | "savingsKnown" | "pricingSource"> &
+    Partial<Pick<CacheAnchor, "capability">>,
 ): string {
+  if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
+  if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
   if (!anchor.savingsKnown) return "n/a (no model pricing)";
   const n = anchor.estimatedSavingsUsd;
   // Large warm output can make net negative even on a cache hit.
@@ -94,7 +97,8 @@ export function buildWarmResult(args: {
     cost?: { total?: number };
   };
   error?: string;
-  anchor: Pick<CacheAnchor, "inputPricePerMTok" | "cacheReadPricePerMTok" | "savingsKnown">;
+  anchor: Pick<CacheAnchor, "inputPricePerMTok" | "cacheReadPricePerMTok" | "savingsKnown"> &
+    Partial<Pick<CacheAnchor, "capability">>;
 }): WarmResult {
   if (args.error) {
     return {
@@ -127,9 +131,11 @@ export function buildWarmResult(args: {
     input,
     output,
     costUsd,
-    estimatedSavedUsd: args.anchor.savingsKnown
-      ? estimateSavedUsd(cacheRead, args.anchor.inputPricePerMTok, args.anchor.cacheReadPricePerMTok)
-      : 0,
+    estimatedSavedUsd:
+      args.anchor.savingsKnown &&
+      (args.anchor.capability === undefined || args.anchor.capability.state === "verified")
+        ? estimateSavedUsd(cacheRead, args.anchor.inputPricePerMTok, args.anchor.cacheReadPricePerMTok)
+        : 0,
     fingerprint: args.fingerprint,
   };
 }

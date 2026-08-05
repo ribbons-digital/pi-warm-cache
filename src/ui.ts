@@ -22,7 +22,7 @@ export function renderWaitingUi(
   if (!ctx.hasUI || !config.showWidget) return;
 
   const remainingMs = Math.max(0, nextDueAt - Date.now());
-  const waitLabel = formatDurationShort(remainingMs || plan.intervalMs);
+  const waitLabel = formatDurationShort(remainingMs || plan.intervalMs || 0);
   const tokens = formatTokens(anchor.cachedTokens || anchor.promptTokens);
   const saved = formatSavingsLabel(anchor);
 
@@ -60,7 +60,7 @@ export function renderWarmHitUi(
 
   ctx.ui.setWidget(WIDGET_ID, [
     ctx.ui.theme.fg("success", `⚡ Cache warm · hit ~${tokens} tokens`),
-    ctx.ui.theme.fg("dim", `Next ping in ${plan.waitLabel} (${plan.ttlLabel}).`),
+    ctx.ui.theme.fg("dim", `Next ping in ${plan.waitLabel ?? "n/a"} (${plan.ttlLabel}).`),
     ctx.ui.theme.fg(
       "warning",
       anchor.savingsKnown

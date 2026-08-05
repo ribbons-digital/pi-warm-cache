@@ -43,6 +43,14 @@ There is no log file. All evidence comes from:
    - `family=unsupported` or `idle (no anchor)` -> capture failed, abort.
    - `cached≈0` -> `message_end` usage tracking is not landing.
 
+4. Confirm the exact route before waiting.
+
+   The status must show `capability=verified`, the expected provider/model route, and the expected API transport.
+
+   Do not start a timer test for `capability=unverified` or `capability=unsupported`.
+
+   Direct xAI is currently unverified and supports only a clearly labelled manual probe when its captured payload is safe.
+
 ## Step 1: smoke test (before any waiting)
 
 ```

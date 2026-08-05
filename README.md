@@ -144,6 +144,20 @@ Do not guess from model id strings.
 | `openai-explicit` | 30m min | ~24m | `short` (+ keep key) |
 | `openai-implicit` | ~8m idle | ~6.4m | `short` |
 
+Automatic warming uses only a verified provider-route capability.
+
+A verified route has an explicit provider, API transport, and compatibility registration for the strategy shown above.
+
+Direct xAI routes are currently unverified.
+
+They have no automatic timer or fixed TTL claim, but `/warm now` may run one clearly labelled probe when the captured payload shape is safe to replay.
+
+OpenRouter, OpenCode Go, and other API-compatible routes do not inherit a first-party strategy.
+
+They are unsupported until a route-specific capability is registered.
+
+`/warm` diagnostics always include the provider, model, API route, capability state, and capability reason.
+
 ### UI (reference style)
 
 Widget above the editor while waiting:
@@ -248,7 +262,7 @@ interface WarmCacheConfig {
 3. **Compaction / branch navigation** - next real turn produces a new payload; old anchor is replaced on capture.
 4. **Agent busy at tick** - skip and reschedule. Never steer or follow-up a live turn for warming.
 5. **Concurrency** - process-wide gate limits simultaneous warm HTTP calls across sessions.
-6. **Unsupported provider** - show disabled status; no timers.
+6. **Unsupported provider** - clear the active widget and status; do not call the provider or arm timers.
 7. **Small prefix** - below `minCachedTokens`, warming is not worth the request overhead.
 8. **Session resume** - do not restore old payloads. Wait for the first real turn.
 9. **Print/RPC modes** - still warm if enabled, but skip TUI widgets when `!ctx.hasUI`.
@@ -264,6 +278,7 @@ interface WarmCacheConfig {
 src/
   index.ts      # extension entry, hooks, /warm command
   warmer.ts     # timer + payload replay loop
+  capability.ts # explicit provider-route capability classification
   provider.ts   # family detection + payload mutation
   config.ts     # config parsing + formatters
   savings.ts    # estimated USD saved

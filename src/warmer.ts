@@ -6,11 +6,12 @@ import {
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
   decideCodexOversizedAction,
   DEFER_BACKOFF_MS,
+  isSafeReplayPayload,
+  resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
-  supportsPromptCache,
 } from "./provider.ts";
-import { appendWarmLog, warmLogPath } from "./log.ts";
+import { appendWarmLog, warmLogPath, type WarmLogEvent } from "./log.ts";
 import { buildWarmResult, formatSavingsLabel, resolveModelPricing } from "./savings.ts";
 import {
   clearWarmUi,
@@ -19,7 +20,13 @@ import {
   renderWaitingUi,
   renderWarmHitUi,
 } from "./ui.ts";
-import type { CacheAnchor, StrategyPlan, WarmCacheConfig, WarmResult } from "./types.ts";
+import type { StrategyResolution } from "./provider.ts";
+import type {
+  CacheAnchor,
+  ProviderCapability,
+  WarmCacheConfig,
+  WarmResult,
+} from "./types.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 
 /** Process-wide gate so many sessions do not warm at once. */
@@ -54,8 +61,9 @@ export class SessionWarmer {
   private nextDueAt = 0;
   private anchor: CacheAnchor | null = null;
   private lastPayload: unknown | null = null;
+  private capability: ProviderCapability | null = null;
   private ctx: ExtensionContext | null = null;
-  private plan: StrategyPlan | null = null;
+  private plan: StrategyResolution | null = null;
   private lastLongTtlWarning: string | null = null;
   private logFile: string | null = null;
   /**
@@ -82,6 +90,10 @@ export class SessionWarmer {
 
   getConfig(): WarmCacheConfig {
     return this.config;
+  }
+
+  getCapability(): ProviderCapability {
+    return this.capability ?? resolveProviderCapability(this.ctx?.model);
   }
 
   getLogFile(): string | null {
@@ -130,6 +142,7 @@ export class SessionWarmer {
 
   bindContext(ctx: ExtensionContext): void {
     this.ctx = ctx;
+    this.capability = resolveProviderCapability(ctx.model);
     this.logFile = warmLogPath(ctx.cwd);
   }
 
@@ -140,6 +153,7 @@ export class SessionWarmer {
     this.abort = null;
     this.anchor = null;
     this.lastPayload = null;
+    this.capability = null;
     if (this.ctx) clearWarmUi(this.ctx);
     this.ctx = null;
   }
@@ -153,6 +167,7 @@ export class SessionWarmer {
    */
   invalidateAnchor(ctx: ExtensionContext, reason: string): void {
     this.ctx = ctx;
+    this.capability = resolveProviderCapability(ctx.model);
     this.anchor = null;
     this.lastPayload = null;
     this.plan = null;
@@ -160,8 +175,17 @@ export class SessionWarmer {
     this.abort?.abort();
     this.abort = null;
     this.recordAttempt("system", false, `invalidated: ${reason}`);
-    if (!supportsPromptCache(ctx.model)) {
-      this.showIdle(ctx, "unsupported model");
+    this.log({
+      event: "anchor_invalidated",
+      provider: ctx.model?.provider,
+      modelId: ctx.model?.id,
+      api: ctx.model?.api,
+      capabilityState: this.capability.state,
+      capabilityReason: this.capability.reason,
+      reason,
+    });
+    if (this.capability.state !== "verified") {
+      this.clearCapabilityUi(ctx);
       return;
     }
     // Compaction / branch / model change are expected idle states, not errors.
@@ -177,12 +201,26 @@ export class SessionWarmer {
     this.logFile = warmLogPath(ctx.cwd);
     const payloadFingerprint = stableFingerprint(payload);
     const model = ctx.model;
+    this.capability = resolveProviderCapability(model);
 
-    if (!model || !supportsPromptCache(model)) {
+    if (!model || this.capability.state === "unsupported") {
       this.anchor = null;
       this.lastPayload = null;
       this.plan = null;
-      this.showIdle(ctx, "unsupported model");
+      this.clearTimers();
+      this.abort?.abort();
+      this.abort = null;
+      this.log({
+        event: "capture",
+        provider: model?.provider,
+        modelId: model?.id,
+        api: model?.api,
+        payloadFingerprint,
+        capabilityState: this.capability.state,
+        capabilityReason: this.capability.reason,
+        ignored: true,
+      });
+      this.clearCapabilityUi(ctx);
       return;
     }
 
@@ -191,6 +229,8 @@ export class SessionWarmer {
 
     this.lastPayload = structuredClone(payload);
     this.plan = resolveStrategy(model, this.config, this.lastPayload);
+    const manualProbeAvailable =
+      this.capability.manualProbe && isSafeReplayPayload(this.lastPayload, model.api);
 
     if (this.plan.longTtlDegradedReason && this.plan.longTtlDegradedReason !== this.lastLongTtlWarning) {
       this.lastLongTtlWarning = this.plan.longTtlDegradedReason;
@@ -201,6 +241,15 @@ export class SessionWarmer {
 
     const sessionId = ctx.sessionManager.getSessionId();
     const pricing = resolveModelPricing(model);
+    const savingsKnown = this.capability.state === "verified" && pricing.savingsKnown;
+    const preserveSessionStats = Boolean(
+      prev &&
+        prev.provider === model.provider &&
+        prev.modelId === model.id &&
+        prev.modelApi === model.api &&
+        prev.capability.state === this.capability.state &&
+        prev.capability.reason === this.capability.reason,
+    );
 
     this.anchor = {
       sessionId,
@@ -208,20 +257,44 @@ export class SessionWarmer {
       modelId: model.id,
       modelApi: model.api,
       thinkingLevel: ctx.thinkingLevel ?? this.pi.getThinkingLevel?.(),
+      capability: this.capability,
+      manualProbeAvailable,
       cacheFamily: this.plan.family,
       cacheRetention: this.plan.cacheRetention,
       payloadFingerprint,
-      cachedTokens: prefixChanged ? 0 : (prev?.cachedTokens ?? 0),
-      promptTokens: prefixChanged ? 0 : (prev?.promptTokens ?? 0),
+      cachedTokens: prefixChanged || !preserveSessionStats ? 0 : (prev?.cachedTokens ?? 0),
+      promptTokens: prefixChanged || !preserveSessionStats ? 0 : (prev?.promptTokens ?? 0),
       cacheReadPricePerMTok: pricing.cacheReadPricePerMTok,
       inputPricePerMTok: pricing.inputPricePerMTok,
-      savingsKnown: pricing.savingsKnown,
+      savingsKnown,
       pricingSource: pricing.source,
       lastActivityAt: Date.now(),
-      lastWarmAt: prefixChanged ? null : (prev?.lastWarmAt ?? null),
-      estimatedSavingsUsd: prev?.estimatedSavingsUsd ?? 0,
-      warmHitCount: prev?.warmHitCount ?? 0,
-      warmMissCount: prev?.warmMissCount ?? 0,
+      lastWarmAt:
+        this.capability.state === "verified" && !prefixChanged
+          ? (prev?.lastWarmAt ?? null)
+          : null,
+      estimatedSavingsUsd:
+        savingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
+      warmHitCount:
+        this.capability.state === "verified" && preserveSessionStats
+          ? (prev?.warmHitCount ?? 0)
+          : 0,
+      warmMissCount:
+        this.capability.state === "verified" && preserveSessionStats
+          ? (prev?.warmMissCount ?? 0)
+          : 0,
+      probeCount:
+        this.capability.state === "unverified" && preserveSessionStats && !prefixChanged
+          ? (prev?.probeCount ?? 0)
+          : 0,
+      probeHitCount:
+        this.capability.state === "unverified" && preserveSessionStats && !prefixChanged
+          ? (prev?.probeHitCount ?? 0)
+          : 0,
+      probeMissCount:
+        this.capability.state === "unverified" && preserveSessionStats && !prefixChanged
+          ? (prev?.probeMissCount ?? 0)
+          : 0,
       consecutiveFailures: 0,
     };
 
@@ -232,14 +305,24 @@ export class SessionWarmer {
       modelId: model.id,
       api: model.api,
       family: this.plan.family,
+      capabilityState: this.capability.state,
+      capabilityReason: this.capability.reason,
+      automaticWarm: this.capability.automaticWarm,
+      manualProbe: this.capability.manualProbe,
+      manualProbeAvailable,
       payloadFingerprint,
       prefixChanged,
       modelCost: model.cost ?? null,
       pricingSource: pricing.source,
-      savingsKnown: pricing.savingsKnown,
+      savingsKnown,
       inputPricePerMTok: pricing.inputPricePerMTok,
       cacheReadPricePerMTok: pricing.cacheReadPricePerMTok,
     });
+
+    if (this.capability.state !== "verified") {
+      this.clearTimers();
+      this.clearCapabilityUi(ctx);
+    }
   }
 
   /** Update token stats after a real assistant message. */
@@ -265,6 +348,11 @@ export class SessionWarmer {
     this.log({
       event: "usage",
       sessionId: this.anchor.sessionId,
+      provider: this.anchor.provider,
+      modelId: this.anchor.modelId,
+      api: this.anchor.modelApi,
+      capabilityState: this.anchor.capability.state,
+      capabilityReason: this.anchor.capability.reason,
       cacheRead,
       cacheWrite,
       input,
@@ -274,11 +362,22 @@ export class SessionWarmer {
 
   onAgentStart(ctx: ExtensionContext): void {
     this.ctx = ctx;
+    this.capability = resolveProviderCapability(ctx.model);
     this.clearTimers();
-    if (ctx.hasUI && this.config.showWidget) {
+    if (this.capability.state === "verified" && ctx.hasUI && this.config.showWidget) {
       ctx.ui.setStatus("pi-warm-cache", ctx.ui.theme.fg("dim", "warm paused · agent active"));
+    } else if (this.capability.state !== "verified") {
+      this.clearCapabilityUi(ctx);
     }
-    this.log({ event: "agent_start", sessionId: this.anchor?.sessionId });
+    this.log({
+      event: "agent_start",
+      sessionId: this.anchor?.sessionId,
+      provider: ctx.model?.provider,
+      modelId: ctx.model?.id,
+      api: ctx.model?.api,
+      capabilityState: this.capability.state,
+      capabilityReason: this.capability.reason,
+    });
   }
 
   onAgentSettled(ctx: ExtensionContext): void {
@@ -293,6 +392,11 @@ export class SessionWarmer {
     this.log({
       event: "agent_settled",
       sessionId: this.anchor?.sessionId,
+      provider: ctx.model?.provider,
+      modelId: ctx.model?.id,
+      api: ctx.model?.api,
+      capabilityState: this.anchor?.capability.state ?? this.capability?.state,
+      capabilityReason: this.anchor?.capability.reason ?? this.capability?.reason,
       hasPayload: Boolean(this.lastPayload),
       cachedTokens: this.anchor?.cachedTokens ?? 0,
     });
@@ -306,43 +410,102 @@ export class SessionWarmer {
   /** Manual warm for /warm now */
   async warmNow(ctx: ExtensionContext): Promise<WarmResult> {
     this.ctx = ctx;
-    return this.runWarm("manual");
+    this.capability = resolveProviderCapability(ctx.model);
+    const result = await this.runWarm("manual");
+    return this.withRouteDiagnostics(result);
   }
 
   getStatusText(): string {
     if (!this.config.enabled) return "disabled";
     const log =
       this.config.logToFile && this.getLogFile() ? ` log=${this.getLogFile()}` : "";
+    const capability = this.capability ?? resolveProviderCapability(this.ctx?.model);
+    const model = this.ctx?.model;
+    const route = this.anchor
+      ? `${this.anchor.provider}/${this.anchor.modelId}`
+      : model
+        ? `${model.provider}/${model.id}`
+        : "none";
+    const api = this.anchor?.modelApi ?? model?.api ?? "none";
+    const last = this.lastAttempt
+      ? `last=${this.lastAttempt.detail} at=${new Date(this.lastAttempt.at).toISOString()}`
+      : "last=none";
     const blocked = this.autoWarmBlockReason
-      ? ` autoWarm=blocked (${this.autoWarmBlockReason})`
-      : " autoWarm=on";
-    if (!this.anchor) {
-      const attempt = this.lastAttempt
-        ? ` last=${this.lastAttempt.detail} at=${new Date(this.lastAttempt.at).toISOString()}`
-        : "";
-      return `idle (no anchor)${blocked}${attempt}${log}`;
-    }
-    if (!this.lastPayload) {
+      ? "autoWarm=blocked"
+      : capability.automaticWarm
+        ? "autoWarm=on"
+        : "autoWarm=off";
+
+    if (capability.state !== "verified") {
+      const probe = this.anchor
+        ? this.anchor.manualProbeAvailable
+          ? "ready"
+          : "unsafe-payload"
+        : capability.manualProbe
+          ? "waiting-for-safe-payload"
+          : "off";
       return [
-        `enabled family=${this.anchor.cacheFamily}`,
-        "payload=none (needs re-anchor)",
-        `hits=${this.anchor.warmHitCount}`,
-        `misses=${this.anchor.warmMissCount}`,
-        this.lastAttempt
-          ? `last=${this.lastAttempt.detail} at=${new Date(this.lastAttempt.at).toISOString()}`
-          : "",
+        `inactive capability=${capability.state}`,
+        `provider=${route}`,
+        `api=${api}`,
+        `reason=${capability.reason}`,
+        `manualProbe=${probe}`,
+        this.anchor ? `probes=${this.anchor.probeCount} probeHits=${this.anchor.probeHitCount}` : "",
+        last,
         log.trim(),
       ]
         .filter(Boolean)
         .join(" ");
     }
-    if (!this.plan) return `idle (no plan)${log}`;
+
+    if (!this.anchor) {
+      return [
+        "idle (no anchor)",
+        "capability=verified",
+        `provider=${route}`,
+        `api=${api}`,
+        blocked,
+        last,
+        log.trim(),
+      ]
+        .filter(Boolean)
+        .join(" ");
+    }
+    if (!this.lastPayload) {
+      return [
+        `enabled family=${this.anchor.cacheFamily}`,
+        "payload=none (needs re-anchor)",
+        "capability=verified",
+        `provider=${route}`,
+        `api=${api}`,
+        `hits=${this.anchor.warmHitCount}`,
+        `misses=${this.anchor.warmMissCount}`,
+        last,
+        log.trim(),
+      ]
+        .filter(Boolean)
+        .join(" ");
+    }
+    if (!this.plan || !this.plan.automaticWarm || this.plan.intervalMs === null) {
+      return [
+        "inactive capability=verified",
+        `provider=${route}`,
+        `api=${api}`,
+        "reason=no automatic strategy",
+        last,
+        log.trim(),
+      ]
+        .filter(Boolean)
+        .join(" ");
+    }
 
     const due = this.nextDueAt ? new Date(this.nextDueAt).toISOString() : "n/a";
     return [
       `enabled family=${this.anchor.cacheFamily}`,
-      `provider=${this.anchor.provider}/${this.anchor.modelId}`,
-      `api=${this.anchor.modelApi}`,
+      "capability=verified",
+      `capabilityReason=${this.anchor.capability.reason}`,
+      `provider=${route}`,
+      `api=${api}`,
       `cached≈${this.anchor.cachedTokens}`,
       `hits=${this.anchor.warmHitCount}`,
       `misses=${this.anchor.warmMissCount}`,
@@ -351,19 +514,12 @@ export class SessionWarmer {
       `pricing=${this.anchor.pricingSource}`,
       `nextDue=${due}`,
       `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
-      this.autoWarmBlockReason
-        ? `autoWarm=blocked`
-        : this.anchor.modelApi === "openai-codex-responses" && !this.config.allowCodexAutoWarm
-          ? `autoWarm=codex-off`
-          : `autoWarm=on`,
-      this.autoWarmBlockReason ? `blockReason=${this.autoWarmBlockReason}` : "",
-      // Only relevant on Codex routes; avoid noise on Anthropic/OpenAI Responses.
+      blocked,
       this.anchor.modelApi === "openai-codex-responses" && this.config.allowCodexAutoWarm
-        ? `codexAuto=on`
+        ? "codexAuto=on"
         : "",
-      this.lastAttempt
-        ? `last=${this.lastAttempt.detail} at=${new Date(this.lastAttempt.at).toISOString()}`
-        : "last=none",
+      this.autoWarmBlockReason ? `blockReason=${this.autoWarmBlockReason}` : "",
+      last,
       log.trim(),
     ]
       .filter(Boolean)
@@ -379,6 +535,24 @@ export class SessionWarmer {
     if (this.disposed || !this.config.enabled) return;
     const ctx = this.ctx;
     if (!ctx) return;
+    const capability = this.anchor?.capability ?? resolveProviderCapability(ctx.model);
+    this.capability = capability;
+    if (capability.state !== "verified" || !capability.automaticWarm) {
+      this.clearTimers();
+      this.log({
+        event: "schedule_skipped",
+        sessionId: this.anchor?.sessionId,
+        provider: this.anchor?.provider ?? ctx.model?.provider,
+        modelId: this.anchor?.modelId ?? ctx.model?.id,
+        api: this.anchor?.modelApi ?? ctx.model?.api,
+        capabilityState: capability.state,
+        capabilityReason: capability.reason,
+        automaticWarm: capability.automaticWarm,
+        reason: "capability does not permit automatic warming",
+      });
+      this.clearCapabilityUi(ctx);
+      return;
+    }
     if (this.autoWarmBlockReason) {
       this.showIdle(
         ctx,
@@ -398,19 +572,22 @@ export class SessionWarmer {
       );
       return;
     }
-    if (!this.anchor || !this.lastPayload || !this.plan) {
+    const anchor = this.anchor;
+    const payload = this.lastPayload;
+    const plan = this.plan;
+    if (!anchor || !payload || !plan) {
       this.showIdle(ctx, options.reason ?? "waiting for next turn");
       return;
     }
-    if (this.plan.family === "unsupported") {
-      this.showIdle(ctx, "unsupported model");
+    if (!plan.automaticWarm || plan.intervalMs === null) {
+      this.clearCapabilityUi(ctx);
       return;
     }
-    if ((this.anchor.cachedTokens || this.anchor.promptTokens) < this.config.minCachedTokens) {
+    if ((anchor.cachedTokens || anchor.promptTokens) < this.config.minCachedTokens) {
       this.showIdle(ctx, `prefix < ${this.config.minCachedTokens} tok`);
       return;
     }
-    if (this.anchor.consecutiveFailures >= this.config.maxConsecutiveFailures) {
+    if (anchor.consecutiveFailures >= this.config.maxConsecutiveFailures) {
       this.showFailure(
         ctx,
         "too many failures",
@@ -425,15 +602,22 @@ export class SessionWarmer {
     if (typeof options.delayMs === "number") {
       delay = Math.max(1_000, options.delayMs);
     } else {
-      const elapsed = Date.now() - this.anchor.lastActivityAt;
-      delay = Math.max(1_000, this.plan.intervalMs - elapsed);
+      const elapsed = Date.now() - anchor.lastActivityAt;
+      delay = Math.max(1_000, plan.intervalMs - elapsed);
     }
     this.nextDueAt = Date.now() + delay;
 
-    renderWaitingUi(ctx, this.config, this.anchor, this.plan, this.nextDueAt);
+    renderWaitingUi(ctx, this.config, anchor, plan, this.nextDueAt);
     this.log({
       event: "schedule",
-      sessionId: this.anchor.sessionId,
+      sessionId: anchor.sessionId,
+      provider: anchor.provider,
+      modelId: anchor.modelId,
+      api: anchor.modelApi,
+      capabilityState: anchor.capability.state,
+      capabilityReason: anchor.capability.reason,
+      automaticWarm: anchor.capability.automaticWarm,
+      family: anchor.cacheFamily,
       delayMs: delay,
       nextDueAt: new Date(this.nextDueAt).toISOString(),
       reason: options.reason ?? "ttl",
@@ -446,7 +630,7 @@ export class SessionWarmer {
     if (!ctx.hasUI) unrefTimer(this.timer);
 
     this.uiTimer = setInterval(() => {
-      if (!this.ctx || !this.anchor || !this.plan) return;
+      if (!this.ctx || !this.anchor || !this.plan || this.plan.intervalMs === null) return;
       renderWaitingUi(this.ctx, this.config, this.anchor, this.plan, this.nextDueAt);
     }, 15_000);
     unrefTimer(this.uiTimer);
@@ -463,16 +647,33 @@ export class SessionWarmer {
     this.clearTimers();
     this.abort?.abort();
     this.abort = null;
-    if (this.ctx) this.showIdle(this.ctx, reason);
+    if (!this.ctx) return;
+    if ((this.capability ?? resolveProviderCapability(this.ctx.model)).state === "verified") {
+      this.showIdle(this.ctx, reason);
+    } else {
+      this.clearCapabilityUi(this.ctx);
+    }
+  }
+
+  private clearCapabilityUi(ctx: ExtensionContext): void {
+    clearWarmUi(ctx);
   }
 
   /** Benign non-warming states (not painted as errors). */
   private showIdle(ctx: ExtensionContext, reason: string, detail?: string): void {
+    if ((this.capability ?? resolveProviderCapability(ctx.model)).state !== "verified") {
+      this.clearCapabilityUi(ctx);
+      return;
+    }
     renderIdleUi(ctx, this.config, reason, detail);
   }
 
   /** Real failures / retries (keep panel visible with reason). */
   private showFailure(ctx: ExtensionContext, reason: string, detail?: string): void {
+    if ((this.anchor?.capability ?? this.capability ?? resolveProviderCapability(ctx.model)).state !== "verified") {
+      this.clearCapabilityUi(ctx);
+      return;
+    }
     renderFailureUi(
       ctx,
       this.config,
@@ -495,9 +696,17 @@ export class SessionWarmer {
     },
   ): void {
     this.lastAttempt = { at: Date.now(), reason, ok, detail };
+    const capability = this.anchor?.capability ?? this.capability;
     this.log({
       event: "attempt",
       sessionId: this.anchor?.sessionId,
+      provider: this.anchor?.provider ?? this.ctx?.model?.provider,
+      modelId: this.anchor?.modelId ?? this.ctx?.model?.id,
+      api: this.anchor?.modelApi ?? this.ctx?.model?.api,
+      capabilityState: capability?.state,
+      capabilityReason: capability?.reason,
+      automaticWarm: capability?.automaticWarm,
+      manualProbe: capability?.manualProbe,
       reason,
       ok,
       detail,
@@ -516,13 +725,30 @@ export class SessionWarmer {
     });
   }
 
-  private log(event: Parameters<typeof appendWarmLog>[1]): void {
+  private log(event: Omit<WarmLogEvent, "ts">): void {
     if (!this.config.logToFile) return;
-    const path = appendWarmLog(this.ctx?.cwd, {
+    const { event: eventName, ...fields } = event;
+    const logEvent: WarmLogEvent = {
       ts: new Date().toISOString(),
-      ...event,
-    });
+      event: eventName as string,
+      ...fields,
+    };
+    const path = appendWarmLog(this.ctx?.cwd, logEvent);
     if (path) this.logFile = path;
+  }
+
+  private withRouteDiagnostics(result: WarmResult): WarmResult {
+    const anchor = this.anchor;
+    const model = this.ctx?.model;
+    const capability = anchor?.capability ?? this.capability ?? resolveProviderCapability(model);
+    return {
+      ...result,
+      capabilityState: result.capabilityState ?? capability.state,
+      capabilityReason: result.capabilityReason ?? capability.reason,
+      provider: result.provider ?? anchor?.provider ?? model?.provider,
+      modelId: result.modelId ?? anchor?.modelId ?? model?.id,
+      api: result.api ?? anchor?.modelApi ?? model?.api,
+    };
   }
 
   private async runWarm(reason: "timer" | "manual"): Promise<WarmResult> {
@@ -530,6 +756,43 @@ export class SessionWarmer {
     const anchor = this.anchor;
     const payload = this.lastPayload;
     const plan = this.plan;
+    const capability = anchor?.capability ?? this.capability ?? resolveProviderCapability(ctx?.model);
+
+    if (capability.state === "unsupported") {
+      this.clearTimers();
+      this.recordAttempt(reason, false, `unsupported: ${capability.reason}`);
+      if (ctx) this.clearCapabilityUi(ctx);
+      return {
+        ok: false,
+        cacheHit: false,
+        cacheRead: 0,
+        cacheWrite: 0,
+        input: 0,
+        output: 0,
+        costUsd: 0,
+        estimatedSavedUsd: 0,
+        error: capability.reason,
+        fingerprint: anchor?.payloadFingerprint ?? "",
+      };
+    }
+
+    if (capability.state === "unverified" && reason === "timer") {
+      this.clearTimers();
+      this.recordAttempt(reason, false, `automatic warming disabled: ${capability.reason}`);
+      if (ctx) this.clearCapabilityUi(ctx);
+      return {
+        ok: false,
+        cacheHit: false,
+        cacheRead: 0,
+        cacheWrite: 0,
+        input: 0,
+        output: 0,
+        costUsd: 0,
+        estimatedSavedUsd: 0,
+        error: "automatic warming is disabled for an unverified route",
+        fingerprint: anchor?.payloadFingerprint ?? "",
+      };
+    }
 
     if (reason === "timer" && this.autoWarmBlockReason) {
       this.recordAttempt(reason, false, `blocked: ${this.autoWarmBlockReason}`);
@@ -551,8 +814,12 @@ export class SessionWarmer {
     }
 
     if (!ctx || !anchor || !payload || !plan) {
-      this.recordAttempt(reason, false, "no anchor");
-      if (ctx) this.showFailure(ctx, "no anchor");
+      const detail =
+        capability.state === "unverified"
+          ? `no safe captured payload for manual probe: ${capability.reason}`
+          : "no anchor";
+      this.recordAttempt(reason, false, detail);
+      if (ctx) this.clearCapabilityUi(ctx);
       return {
         ok: false,
         cacheHit: false,
@@ -562,9 +829,20 @@ export class SessionWarmer {
         output: 0,
         costUsd: 0,
         estimatedSavedUsd: 0,
-        error: "no anchor",
+        error: detail,
         fingerprint: "",
       };
+    }
+
+    if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
+      const detail = "captured payload shape is not safe for an unverified manual probe";
+      this.recordAttempt(reason, false, detail);
+      this.clearCapabilityUi(ctx);
+      return buildWarmResult({
+        fingerprint: anchor.payloadFingerprint,
+        error: detail,
+        anchor,
+      });
     }
 
     if (!ctx.isIdle() && reason === "timer") {
@@ -597,8 +875,15 @@ export class SessionWarmer {
       });
     }
 
-    if (model.provider !== anchor.provider || model.id !== anchor.modelId) {
-      this.recordAttempt(reason, false, "model changed");
+    const currentCapability = resolveProviderCapability(model);
+    if (
+      model.provider !== anchor.provider ||
+      model.id !== anchor.modelId ||
+      model.api !== anchor.modelApi ||
+      currentCapability.state !== anchor.capability.state ||
+      currentCapability.reason !== anchor.capability.reason
+    ) {
+      this.recordAttempt(reason, false, "model/provider route changed");
       this.onModelChange(ctx);
       return buildWarmResult({
         fingerprint: anchor.payloadFingerprint,
@@ -622,7 +907,8 @@ export class SessionWarmer {
     const fingerprint = anchor.payloadFingerprint;
     let shouldRescheduleAfter = true;
 
-    if (ctx.hasUI) {
+    const unverifiedProbe = anchor.capability.state === "unverified";
+    if (ctx.hasUI && !unverifiedProbe) {
       ctx.ui.setStatus("pi-warm-cache", ctx.ui.theme.fg("dim", "warm ping · in flight"));
     }
     this.log({
@@ -632,6 +918,10 @@ export class SessionWarmer {
       provider: model.provider,
       modelId: model.id,
       api: model.api,
+      capabilityState: anchor.capability.state,
+      capabilityReason: anchor.capability.reason,
+      automaticWarm: anchor.capability.automaticWarm,
+      manualProbe: anchor.capability.manualProbe,
       payloadFingerprint: fingerprint,
     });
 
@@ -699,6 +989,28 @@ export class SessionWarmer {
         cacheWrite: result.cacheWrite,
         costTotal: result.costUsd,
       };
+
+      if (unverifiedProbe) {
+        anchor.probeCount += 1;
+        if (result.cacheHit) {
+          anchor.probeHitCount += 1;
+          anchor.cachedTokens = result.cacheRead;
+          anchor.promptTokens = result.input + result.cacheRead + result.cacheWrite;
+        } else {
+          anchor.probeMissCount += 1;
+        }
+        const outcome = result.cacheHit ? "observed cache read" : "no cache read observed";
+        const detail =
+          `unverified probe ${outcome} provider=${model.provider} api=${model.api} ` +
+          `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
+          `out=${result.output} cost=${result.costUsd}`;
+        this.recordAttempt(reason, result.cacheHit, detail, usageSnap);
+        if (ctx.hasUI) {
+          ctx.ui.notify(`pi-warm-cache: ${detail}. No active keepalive or verified savings claim.`, result.cacheHit ? "info" : "warning");
+        }
+        this.clearCapabilityUi(ctx);
+        return result;
+      }
 
       if (anchor.savingsKnown && result.costUsd > 0) {
         anchor.estimatedSavingsUsd -= result.costUsd;
@@ -794,13 +1106,18 @@ export class SessionWarmer {
 
       return result;
     } catch (err) {
-      anchor.consecutiveFailures += 1;
+      if (!unverifiedProbe) anchor.consecutiveFailures += 1;
       const message = err instanceof Error ? err.message : String(err);
-      this.recordAttempt(reason, false, `error: ${message}`);
+      this.recordAttempt(
+        reason,
+        false,
+        `${unverifiedProbe ? "unverified probe error" : "error"}: ${message}`,
+      );
       if (ctx.hasUI) {
-        ctx.ui.notify(`pi-warm-cache: warm error - ${message}`, "error");
+        ctx.ui.notify(`pi-warm-cache: ${unverifiedProbe ? "unverified probe error" : "warm error"} - ${message}`, "error");
       }
-      this.showFailure(ctx, "warm error", message);
+      if (unverifiedProbe) this.clearCapabilityUi(ctx);
+      else this.showFailure(ctx, "warm error", message);
       return buildWarmResult({
         fingerprint,
         error: message,
