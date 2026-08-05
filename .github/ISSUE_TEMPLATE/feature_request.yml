@@ -4,6 +4,10 @@ title: "feature: "
 labels:
   - enhancement
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include provider credentials, prompt contents, or other private data.
   - type: textarea
     id: problem
     attributes:

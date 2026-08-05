@@ -11,5 +11,5 @@
 ## Checklist
 
 - [ ] Documentation is updated when behavior or commands changed.
-- [ ] No provider credentials or personal data are included.
+- [ ] No provider credentials, prompt contents, personal data, or other private data are included.
 - [ ] The change keeps unsupported routes fail-closed.
