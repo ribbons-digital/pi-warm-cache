@@ -44,13 +44,13 @@ Routes without an explicit registered capability are rejected before the provide
 
 ## Install
 
-After the first npm release, install the package for normal use:
+Install the published package from npm:
 
 ```bash
 pi install npm:pi-warm-cache
 ```
 
-Until that release is available, install the repository checkout when developing or testing an unreleased change:
+For development or testing of an unreleased change, install the repository checkout:
 
 ```bash
 pi install /absolute/path/to/pi-warm-cache
@@ -68,27 +68,46 @@ Restart or reload Pi after changing an installed package.
 
 ```text
 session_start
-    |
-    v
-real agent turn
-    |
-    +- before_provider_request -> snapshot the exact provider payload
-    +- message_end(assistant)  -> record real-turn cache usage
-    `- agent_settled           -> start the provider-specific keepalive timer
-                                      |
-                                      v
-                                 timer fires while idle
-                                      |
-                                      v
-                         complete(model, dummyContext, {
-                           sessionId: same as session,
-                           cacheRetention: short|long,
-                           onPayload: () => mutate(clonedAnchorPayload)
-                         })
-                                      |
-                                      +- probe hit  -> update diagnostics and reschedule
-                                      `- probe miss -> retry or wait for a new anchor
-session_shutdown -> clear timers and abort in-flight warm requests
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Real agent turn                                             │
+│                                                             │
+│ before_provider_request                                     │
+│   Capture the exact provider payload                        │
+│ message_end(assistant)                                      │
+│   Record real-turn cache usage                              │
+│ agent_settled                                               │
+│   Schedule the provider-specific keepalive timer            │
+└─────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Idle keepalive timer                                        │
+└─────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Replay the captured payload                                 │
+│                                                             │
+│ complete(model, dummyContext, {                             │
+│   sessionId: same as session,                               │
+│   cacheRetention: short | long,                             │
+│   onPayload: () => mutate(clonedAnchorPayload)              │
+│ })                                                          │
+└─────────────────────────────────────────────────────────────┘
+                               │
+              ┌────────────────┴────────────────┐
+              │                                 │
+              ▼                                 ▼
+┌───────────────────────────┐     ┌───────────────────────────┐
+│ Probe hit                 │     │ Probe miss                │
+│ Update diagnostics        │     │ Retry, or wait for a new  │
+│ and reschedule            │     │ real-turn anchor          │
+└───────────────────────────┘     └───────────────────────────┘
+
+session_shutdown
+    └─ Clear timers and abort in-flight warm requests
 ```
 
 ### Design rule: payload replay, not context rebuild
