@@ -265,6 +265,24 @@ pnpm exec tsc --noEmit
 
 Build changes on a feature branch and open a pull request against `main`.
 
+## Release
+
+The repository includes a manual GitHub Actions release workflow that uses npm Trusted Publishing.
+It does not require an npm token or an interactive OTP.
+
+Before the first release, register the repository and `release.yml` as a trusted publisher for `pi-warm-cache` on npmjs.com.
+Use the `npm-release` GitHub environment name when configuring the trusted publisher.
+Under "Allowed actions", ensure npm publish is listed as a required configuration.
+
+For each release:
+
+1. Update `package.json` and commit the version on `main`.
+2. Create and push the matching tag, such as `v0.2.0`.
+3. Run **Publish npm package** from the GitHub Actions tab with that tag.
+4. Confirm the package version on npmjs.com.
+
+The workflow checks the tag, runs tests and type checks, validates the exact publish tarball, and publishes with provenance.
+
 ## Manual validation
 
 Use the E2E procedure in [`docs/e2e-idle-test.md`](docs/e2e-idle-test.md) with a real provider account.
