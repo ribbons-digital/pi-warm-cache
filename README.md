@@ -270,8 +270,9 @@ Build changes on a feature branch and open a pull request against `main`.
 The repository includes a manual GitHub Actions release workflow that uses npm Trusted Publishing.
 It does not require an npm token or an interactive OTP.
 
-Before the first release, register the repository and `.github/workflows/release.yml` as a trusted publisher for `pi-warm-cache` on npmjs.com.
+Before the first release, register the repository and `release.yml` as a trusted publisher for `pi-warm-cache` on npmjs.com.
 Use the `npm-release` GitHub environment name when configuring the trusted publisher.
+Under "Allowed actions", ensure npm publish is listed as a required configuration.
 
 For each release:
 
