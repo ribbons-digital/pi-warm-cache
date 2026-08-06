@@ -1,0 +1,98 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing approved release tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    environment:
+      name: npm-release
+      url: https://www.npmjs.com/package/pi-warm-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out approved release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Type check
+        run: pnpm exec tsc --noEmit
+
+      - name: Verify approved tag and publishable manifest
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node <<'NODE'
+          const manifest = require('./package.json');
+          const expectedTag = `v${manifest.version}`;
+          if (process.env.RELEASE_TAG !== expectedTag) {
+            throw new Error(`Requested tag ${process.env.RELEASE_TAG} does not match ${expectedTag}`);
+          }
+          if (manifest.private) {
+            throw new Error('package.json is not publishable');
+          }
+          if (manifest.publishConfig?.access !== 'public' || manifest.publishConfig?.provenance !== true) {
+            throw new Error('package publishConfig must require public access and provenance');
+          }
+          NODE
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+
+      - name: Prepare publish tarball
+        id: pack
+        run: |
+          rm -rf release
+          mkdir -p release
+          pnpm pack --pack-destination release
+          tarball="$(find release -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Validate publish tarball
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          tar -tzf "$TARBALL" | grep -q '^package/package.json$'
+          tar -tzf "$TARBALL" | grep -q '^package/README.md$'
+          tar -tzf "$TARBALL" | grep -q '^package/LICENSE$'
+          tar -tzf "$TARBALL" | grep -q '^package/src/index.ts$'
+          if tar -tzf "$TARBALL" | grep -qE '(^|/)(provider\.test\.ts|docs/|scripts/)'; then
+            echo 'Unexpected development file in publish tarball' >&2
+            exit 1
+          fi
+
+      - name: Publish with npm trusted publishing provenance
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: pnpm exec npm publish "$TARBALL" --access public --provenance
