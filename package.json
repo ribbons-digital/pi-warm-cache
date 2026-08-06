@@ -1,16 +1,44 @@
 {
   "name": "pi-warm-cache",
-  "version": "0.1.0",
-  "description": "Pi extension that keeps Anthropic, OpenAI, and direct xAI Grok prompt caches warm during long idle gaps",
+  "version": "0.2.0",
+  "description": "Pi extension that keeps supported provider prompt caches warm during long idle gaps",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
     "prompt-cache",
     "anthropic",
-    "openai"
+    "openai",
+    "xai",
+    "grok",
+    "cache"
   ],
   "license": "MIT",
+  "author": "Ribbons Digital",
+  "homepage": "https://github.com/ribbons-digital/pi-warm-cache#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ribbons-digital/pi-warm-cache.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ribbons-digital/pi-warm-cache/issues"
+  },
+  "files": [
+    "src/capability.ts",
+    "src/config.ts",
+    "src/index.ts",
+    "src/log.ts",
+    "src/provider.ts",
+    "src/savings.ts",
+    "src/types.ts",
+    "src/ui.ts",
+    "src/warmer.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "node scripts/run-unit-tests.mjs"
   },

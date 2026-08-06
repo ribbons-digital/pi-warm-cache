@@ -4,3 +4,10 @@ node_modules/
 dist/
 *.log
 .DS_Store
+
+# Local agent metadata and generated workspace files
+.agents/
+.claude/
+.memory-lane-scope
+docs/specs/
+skills-lock.json

@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible problem with pi-warm-cache
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include provider credentials, prompt contents, or other private data.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: route
+    attributes:
+      label: Provider route
+      description: Include the provider, model, API transport, and capability status.
+      placeholder: anthropic / claude-model / anthropic-messages / verified
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the smallest sequence of commands or turns that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Pi version, Node.js version, operating system, and package version.
+    validations:
+      required: true

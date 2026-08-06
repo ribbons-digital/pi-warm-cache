@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a provider, strategy, or usability improvement
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include provider credentials, prompt contents, or other private data.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the behavior you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: route
+    attributes:
+      label: Provider route or integration
+      description: If relevant, include the provider, API transport, endpoint, and model family.
+    validations:
+      required: false

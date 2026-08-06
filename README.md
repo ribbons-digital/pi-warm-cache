@@ -1,274 +1,206 @@
 # pi-warm-cache
 
-Pi extension that keeps Anthropic, OpenAI, and direct xAI Grok prompt caches warm during long idle gaps in agent sessions.
+Pi extension that keeps supported provider prompt caches warm during long idle gaps in agent sessions.
 
 ## Why
 
 Large-context agent loops often hold 100k-300k+ tokens in the prompt prefix.
-Provider prompt caches expire after a short idle TTL.
+Provider prompt caches expire after a short idle period.
 
-- Anthropic default: 5 minutes (sliding). Optional 1h TTL at higher write cost.
-- OpenAI GPT-5.6+: explicit `prompt_cache_options.ttl = "30m"` (minimum lifetime).
-- Direct xAI Grok 4.5: best-effort probe cadence with no fixed cache-lifetime promise.
-- Older OpenAI routes: shorter in-memory idle windows.
+When a cache expires, the next turn pays a cold read or a costly rewrite.
+This extension runs a lightweight keepalive probe before the provider cache is likely to expire.
 
-When the cache expires, the next turn pays a cold re-read (or a costly rewrite).
-This extension runs a lightweight "monitor on duty" that refreshes the cache before TTL expiry.
+## Current provider support
+
+The extension verifies the complete provider route before it enables automatic warming.
+Provider identity, API transport, endpoint, compatibility metadata, model, and captured payload shape must agree.
+
+### Verified automatic warming
+
+| Provider route | API transport | Strategy | Notes |
+|---|---|---|---|
+| Anthropic first-party | `anthropic-messages` | `anthropic-short` or `anthropic-long` | Uses cache markers from the captured payload. |
+| Registered Anthropic-compatible route | `anthropic-messages` | `anthropic-short` or `anthropic-long` | Requires `compat.cacheControlFormat = "anthropic"`. |
+| OpenAI first-party | `openai-responses` or `openai-completions` | `openai-explicit` or `openai-implicit` | Requires the first-party OpenAI route. |
+| Azure OpenAI | `azure-openai-responses` | OpenAI response strategy | Uses the registered Azure route. |
+| OpenAI Codex | `openai-codex-responses` | Codex policy | Uses the Codex-specific output policy. |
+| xAI Grok 4.5 | `openai-responses` | `xai-best-effort` | Requires `https://api.x.ai` and a captured `prompt_cache_key`. |
+
+Direct xAI Grok 4.5 warming is best effort.
+Its default probe cadence is 4 minutes, but this is an operational heuristic and not a provider TTL guarantee.
+
+xAI may expose cached reads without exposing a separate cache-write token count through Pi.
+Repeated no-read/no-write probes stop warming and request a new real-turn anchor after the configured failure budget.
+
+### Manual probe only
+
+Other direct xAI models on the first-party xAI endpoint can use one clearly labelled manual probe when their captured payload is safe to replay.
+They do not receive an automatic timer or a verified savings claim.
+
+### Unsupported routes
+
+OpenRouter, OpenCode Go, and other API-compatible proxy routes do not inherit first-party support.
+Routes without an explicit registered capability are rejected before the provider is called.
+
+## Install
+
+After the first npm release, install the package for normal use:
+
+```bash
+pi install npm:pi-warm-cache
+```
+
+Until that release is available, install the repository checkout when developing or testing an unreleased change:
+
+```bash
+pi install /absolute/path/to/pi-warm-cache
+```
+
+Run the source extension for one session without installing it:
+
+```bash
+pi -e /absolute/path/to/pi-warm-cache/src/index.ts
+```
+
+Restart or reload Pi after changing an installed package.
 
 ## Architecture
 
-```
+```text
 session_start
-    │
-    ▼
+    |
+    v
 real agent turn
-    │
-    ├─ before_provider_request ──► snapshot EXACT provider payload (anchor)
-    ├─ message_end(assistant)  ──► record real-turn cache observation
-    │                              (read/write/input/prompt/continuity)
-    └─ agent_settled           ──► start provider-specific keepalive timer
-                                      │
-                                      ▼
+    |
+    +- before_provider_request -> snapshot the exact provider payload
+    +- message_end(assistant)  -> record real-turn cache usage
+    `- agent_settled           -> start the provider-specific keepalive timer
+                                      |
+                                      v
                                  timer fires while idle
-                                      │
-                                      ▼
+                                      |
+                                      v
                          complete(model, dummyContext, {
                            sessionId: same as session,
                            cacheRetention: short|long,
-                           maxTokens: 1,
                            onPayload: () => mutate(clonedAnchorPayload)
                          })
-                                      │
-                                      ├─ probe hit  ► update savings UI, reschedule
-                                      └─ probe miss ► retry or wait for re-anchor
-session_shutdown ──► clear timers / abort in-flight warm
+                                      |
+                                      +- probe hit  -> update diagnostics and reschedule
+                                      `- probe miss -> retry or wait for a new anchor
+session_shutdown -> clear timers and abort in-flight warm requests
 ```
 
-### Design rule: payload replay, not Context rebuild
+### Design rule: payload replay, not context rebuild
 
-Do **not** rebuild a warm request from `getSystemPrompt()` + tools + `convertToLlm(branch)`.
+Do not rebuild a warm request from `getSystemPrompt()` plus tools and `convertToLlm(branch)`.
 
-That path will not byte-match Pi's real provider payload:
+That path can change the provider payload through tool ordering, schema serialization, system prompt blocks, cache markers, thinking fields, or session affinity.
 
-- tool order and schema serialization
-- system prompt block splitting
-- Anthropic `cache_control` breakpoints on last tool + last text block
-- thinking / effort fields
-- OpenAI `prompt_cache_key` / session affinity
+A mismatch can turn every warm tick into a full cache write on a large prefix.
+That is worse than the cold read the probe tried to avoid.
 
-A mismatch can turn every warm tick into a full cache **write** on a huge prefix.
-That is worse than the cold read you tried to avoid.
+The extension therefore:
 
-Instead:
+1. Captures `event.payload` from `before_provider_request` on real turns.
+2. Replays a structured clone through `complete()` and `onPayload`.
+3. Changes only the output field allowed by the selected route.
+4. Preserves the same session identity, cache retention, tools, messages, system blocks, reasoning fields, and cache-routing fields.
+5. Drops the anchor when the provider payload or cache identity changes.
 
-1. Capture `event.payload` from `before_provider_request` on real turns.
-2. Replay a structured clone through `complete()` `onPayload`.
-3. Change only output limits.
-   Prefer `max_tokens = 1`.
-   If Anthropic thinking is enabled, set `max_tokens = thinking.budget_tokens + 1`.
-   Never mutate `thinking`, `reasoning.effort`, tools, messages, system blocks, or `cache_control`.
-   Direct xAI Responses probes use only the legal `max_output_tokens` field and preserve `prompt_cache_key`.
-4. Keep the same `sessionId` and `cacheRetention`.
-5. Never copy the summarize/handoff pattern of `cacheRetention: "none"` + fresh `uuidv7()` session ids.
-
-Note: on high-thinking models a warm tick may still spend thinking tokens.
-That cost is usually far below a cold re-read of a 100k-300k prefix.
+Anthropic probes use `max_tokens` with the minimum required by the thinking budget.
+OpenAI Responses and xAI Responses probes use a legal `max_output_tokens` floor of 16.
+Codex Responses probes never add `max_output_tokens` and use the Codex-specific policy.
 
 ### Lifecycle hooks
 
 | Hook | Role |
-|------|------|
-| `session_start` | Bind context, load config/flags |
-| `before_provider_request` | Read-only anchor of exact payload (never rewrite real turns) |
-| `session_compact` / `session_tree` | Drop anchor (prefix changed) |
-| `message_end` | Track real-turn cacheRead / cacheWrite / prompt size / pricing |
-| `agent_start` | Pause timer (real work already refreshes cache) |
-| `agent_settled` | Schedule next warm tick |
-| `model_select` / `thinking_level_select` | Drop anchor (cache key changed) |
-| `session_shutdown` | Dispose timers and abort controllers |
+|---|---|
+| `session_start` | Bind context and load configuration. |
+| `before_provider_request` | Capture the exact real-turn payload. |
+| `session_compact` / `session_tree` | Drop the anchor because the prefix changed. |
+| `message_end` | Track real-turn cache usage, prompt size, and pricing. |
+| `agent_start` | Pause the timer while the agent is working. |
+| `agent_settled` | Schedule the next keepalive probe. |
+| `model_select` / `thinking_level_select` | Drop the anchor because the cache identity changed. |
+| `session_shutdown` | Dispose timers and abort in-flight requests. |
 
-### Drift / re-anchor policy
+### Drift and re-anchor policy
 
-Anchor invalidation is event-driven, with a strict payload-continuity check on the next real turn:
+The anchor is invalidated by compaction, tree navigation, model changes, and thinking-level changes.
 
-- `session_compact`
-- `session_tree`
-- `model_select`
-- `thinking_level_select`
-- next real `before_provider_request` capture marks a non-continuing prefix as unknown
+The next real turn also performs a payload-continuity check.
+A non-continuing prefix becomes an unknown real-turn observation and replaces the old anchor.
 
-Idle `custom_message` / advisor injections do **not** drop the warm payload.
-Those entries do not invalidate the provider cache written by the last real turn.
+Idle custom messages and advisor injections do not drop the warm payload.
+Those entries do not change the provider cache written by the last real turn.
 
-### Diagnostics
+## Diagnostics
 
-File logging is **off by default** (no project dotfile unless you opt in).
-
-Enable with either:
+File logging is off by default.
+Enable it with an environment variable or the `/warm log` command:
 
 ```bash
 PI_WARM_CACHE_DEBUG=1 pi
 ```
 
-or:
-
-```
+```text
 /warm log
 ```
 
-Then inspect:
-
-```
-.pi/warm-cache.jsonl
-/warm          # includes last=... and log= path when enabled
-```
-
-Failures keep the widget visible with a reason. They do not silently clear to a blank editor.
-
-`/warm` reports `realTurn=...` and `probe=...` as separate observations.
-
-Diagnostics also include the named strategy, cadence, payload fingerprint, and redacted cache-key identity.
+When enabled, diagnostics are written to `.pi/warm-cache.jsonl`.
+The `/warm` status and `/warm now` result include the provider route, capability state, strategy, cadence, payload fingerprint, redacted cache-key identity, observed usage, and retry state.
 
 `realTurn=unknown` is used for the first turn, invalidation boundaries, changed prefixes, and prompts below the configured minimum.
 
-`probeHits` and `probeMisses` count only extension warm probes.
+`probeHits` and `probeMisses` count extension probes only.
 
 A first implicit-cache `read=0 write=0` probe is labelled `transient-miss` and retries quietly.
 
-A provider error is labelled as an error and does not increment `probeMisses`.
+A provider error is reported as an error and does not increment `probeMisses`.
 
-### 1h Anthropic mode
+## Keepalive strategies
 
-This extension does **not** stamp `cache_control.ttl: "1h"` onto real turns.
-That bypasses Pi's `supportsLongCacheRetention` gate and can 400 some routes.
+| Strategy | Cache behavior | Default interval | Cache retention |
+|---|---|---:|---|
+| `anthropic-short` | 5-minute sliding cache window | about 4 minutes | `short` |
+| `anthropic-long` | 1-hour cache markers already present on the wire | about 48 minutes | `long` |
+| `openai-explicit` | 30-minute explicit prompt-cache mode | about 24 minutes | `short` |
+| `openai-implicit` | older in-memory idle window | about 6.4 minutes | `short` |
+| `xai-best-effort` | no fixed provider TTL claim | 4-minute heuristic | `short` plus captured key |
 
-Long TTL is detected from the on-wire payload Pi already sent.
-To use 1h caches, set Pi cache retention to long.
-`/warm 1h` only selects the long cadence when the captured payload already has 1h markers.
-Otherwise it stays on the 5m strategy and warns.
+The existing `interval` configuration overrides the default interval for every strategy, including xAI best-effort probes.
 
-OpenAI explicit vs implicit mode uses `model.compat.supportsExplicitPromptCacheMode` (default false).
-Do not guess from model id strings.
-
-### Keepalive strategy
-
-| Family | TTL | Default interval | cacheRetention |
-|--------|-----|------------------|----------------|
-| `anthropic-short` | 5m | ~4m (0.8 × TTL) | `short` |
-| `anthropic-long` | 1h | ~48m | `long` |
-| `openai-explicit` | 30m min | ~24m | `short` (+ keep key) |
-| `openai-implicit` | ~8m idle | ~6.4m | `short` |
-| `xai-best-effort` | no fixed TTL claim | 4m heuristic | `short` (+ captured key) |
-
-Automatic warming uses only a verified provider-route capability.
-
-A verified route has an explicit provider, API transport, and compatibility registration for the strategy shown above.
-
-Direct xAI Grok 4.5 on the first-party OpenAI Responses route is a verified best-effort strategy.
-
-It uses the exact captured payload, requires the captured `prompt_cache_key`, and uses a configurable 4m probe cadence by default.
-
-The cadence is an operational heuristic, not a provider TTL guarantee.
-
-xAI Responses exposes cached reads but may not expose cache-write tokens through Pi.
-
-The first no-read/no-write probe retries quietly.
-
-Repeated no-read/no-write probes stop warming and request a new real-turn anchor when the configured failure budget is reached.
-
-A write-without-read response, if reported by the route, stops warming immediately as a payload-drift candidate.
-
-OpenRouter, OpenCode Go, and other API-compatible routes do not inherit a first-party strategy.
-
-They are unsupported until a route-specific capability is registered.
-
-`/warm` diagnostics always include the provider, model, API route, capability state, and capability reason.
-
-### UI (reference style)
-
-Widget above the editor while waiting:
-
-```
-⚡ Cache-warm wait · 1 monitor on duty
-Continuation deferred 4m - the timed wake stays inside the 5m prompt-cache TTL.
-~281.6K tokens kept warm · est. $2.53 saved vs a cold re-read
-```
+The 1-hour Anthropic mode follows the cache retention already present in the Pi payload.
+The extension does not stamp `cache_control.ttl = "1h"` onto real turns.
 
 ## Commands
 
-```
-/warm              # status
-/warm on           # enable (also clears sticky auto-warm block)
-/warm off          # disable
-/warm now          # force one warm tick (allowed even when auto-warm is blocked)
-/warm resume       # clear sticky large-output block
-/warm codex-on     # enable Codex timer auto-warm (on by default)
-/warm codex-off    # disable Codex timer auto-warm
-/warm 5m           # Anthropic short TTL mode
-/warm 1h           # Anthropic long cadence only when Pi on-wire payload already uses 1h
-/warm auto         # detect
-/warm log|nolog    # JSONL diagnostics on/off (.pi/warm-cache.jsonl)
+```text
+/warm                  # show status
+/warm on               # enable and clear a sticky automatic-warm block
+/warm off              # disable warming
+/warm now              # force one probe when the captured route permits it
+/warm resume           # clear a sticky large-output block
+/warm codex-on         # enable Codex timer warming
+/warm codex-off        # disable Codex timer warming
+/warm 5m               # select Anthropic short cadence
+/warm 1h               # select Anthropic long cadence when the payload supports it
+/warm auto              # select the provider strategy automatically
+/warm log              # enable JSONL diagnostics
+/warm nolog            # disable JSONL diagnostics
 /warm interval=3.5m max=2
 ```
 
-The existing `interval` override also controls the direct xAI best-effort cadence.
+The extension can also be configured when Pi starts:
 
-Use `/warm now` to inspect observed xAI read, write, input, output, cost, strategy, cache-key identity, and retry values.
-
-Codex (`openai-codex-responses`) has no API output-token cap, so bare payload replay
-can continue the agent trajectory and bill large `out` (measured `out=1127` on a hit).
-
-**Working path (measured):** replay exact prefix + append constrained OK user suffix.
-
-| Probe | read | write | out |
-|---|---:|---:|---:|
-| Bare replay hit | 38400 | 0 | 1127 |
-| Manual `/warm now` + OK suffix | 41472 | 0 | 5 |
-| Fresh session `/warm now` + OK suffix | 39424 | 0 | 17 |
-| Timer tick after `/warm codex-on` | 39424 | 0 | 32 |
-
-Policy:
-
-- Codex timer auto-warm **on by default** (`allowCodexAutoWarm: true`) using OK-suffix.
-- Sticky-block if a tick still emits huge output (`out >= 64`); `/warm resume` clears it.
-- `/warm codex-off` disables Codex timers; `/warm now` still works.
-- Anthropic / OpenAI Responses: exact replay + legal output caps (no suffix).
-- Never send `max_output_tokens` on Codex (API rejects it).
-- Do not mutate Codex `reasoning.effort` without a same-session proof.
-
-### OpenAI workaround evaluation (adopted parts)
-
-Sound ideas we adopted:
-
-- Stable `prompt_cache_key` / session id.
-- Lowest practical output cap where the API allows it.
-- Extremely constrained warm user text as a **Codex suffix** after the real prefix.
-- Accept small non-zero output cost; aim for manageable, not free.
-
-Ideas we did **not** copy as-is:
-
-- Rebuilding from a chat `messages` array instead of Pi's exact provider payload.
-- Sending `max_output_tokens` on **Codex** ChatGPT routes.
-- Treating this as equivalent to Anthropic `max_tokens: 0`.
-
-
-Flag:
-
-```
+```bash
 pi --warm-cache
 pi --warm-cache=off
 pi --warm-cache="1h interval=45m"
 ```
 
-## Install
-
-```bash
-pi install /absolute/path/to/pi-warm-cache
-# or for a one-off test:
-pi -e ./src/index.ts
-```
-
-## Config schema
+## Configuration
 
 ```ts
 interface WarmCacheConfig {
@@ -279,49 +211,68 @@ interface WarmCacheConfig {
   minCachedTokens: number;           // default 512
   maxConsecutiveFailures: number;    // default 3
   showWidget: boolean;               // default true
-  warmSuffix: string;                // unused on payload-replay path
-  maxOutputTokens: number;           // preferred floor; API may raise (e.g. OpenAI >= 16)
-  logToFile: boolean;                // default false; PI_WARM_CACHE_DEBUG=1 or /warm log
+  warmSuffix: string;                // reserved for route-specific policies
+  maxOutputTokens: number;           // preferred output floor
+  logToFile: boolean;                // default false
 }
 ```
 
-## Edge cases (handle early)
+## Edge cases
 
-1. **Payload drift / probe miss with write** - stop warming until the next real turn re-anchors. Do not keep paying write premium.
-2. **Implicit-cache probe miss** - retry the first `read=0 write=0` result quietly, then expose repeated misses.
-3. **Model or thinking-level change** - drop anchor immediately. Caches are per model and often per effort.
-4. **Compaction / branch navigation** - next real turn produces a new payload; old anchor is replaced on capture.
-5. **Agent busy at tick** - skip and reschedule. Never steer or follow-up a live turn for warming.
-6. **Concurrency** - process-wide gate limits simultaneous warm HTTP calls across sessions.
-7. **Unsupported provider** - clear the active widget and status; do not call the provider or arm timers.
-8. **Small prefix** - below `minCachedTokens`, warming is not worth the request overhead and real-turn classification stays unknown.
-9. **Session resume** - do not restore old payloads. Wait for the first real turn.
-10. **Print/RPC modes** - still warm if enabled, but skip TUI widgets when `!ctx.hasUI`.
-11. **1h Anthropic mode** - follow on-wire Pi long TTL only. This extension does not rewrite real turns.
-12. **Direct xAI Grok 4.5** - require the first-party Responses route and a captured `prompt_cache_key`; best-effort probes do not promise cache retention.
-13. **Codex / openai-codex-responses** - never send `max_output_tokens` (API rejects it).
-14. **OpenAI and xAI Responses** - `max_output_tokens` floor is 16, not 1.
-15. **Do not use `sendUserMessage`** - it pollutes history and can trigger tool loops.
-16. **Abort on shutdown / disable** - clear `setTimeout` / `setInterval` and abort in-flight `complete()`.
+1. **Payload drift or a probe miss with a write** - stop warming until the next real turn re-anchors.
+2. **Implicit-cache probe miss** - retry the first no-read/no-write result quietly, then expose repeated misses.
+3. **Model or thinking-level change** - drop the anchor immediately.
+4. **Compaction or branch navigation** - replace the old anchor on the next real turn.
+5. **Agent busy at a tick** - skip the tick and reschedule without steering the live turn.
+6. **Concurrency** - a process-wide gate limits simultaneous warm requests across sessions.
+7. **Unsupported provider** - clear the active widget and status without calling the provider.
+8. **Small prefix** - do not warm below the configured minimum cached-token threshold.
+9. **Session resume** - wait for the first real turn instead of restoring an old payload.
+10. **Print or RPC mode** - keep warming when enabled, but skip TUI widgets when no UI exists.
+11. **Direct xAI Grok 4.5** - require the first-party Responses route and a captured `prompt_cache_key`.
+12. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 
 ## Package layout
 
-```
+```text
 src/
-  index.ts      # extension entry, hooks, /warm command
-  warmer.ts     # timer + payload replay loop
+  index.ts      # extension entry and /warm command
+  warmer.ts     # timer and payload replay loop
   capability.ts # explicit provider-route capability classification
-  provider.ts   # family detection + payload mutation
-  config.ts     # config parsing + formatters
-  savings.ts    # estimated USD saved
-  ui.ts         # widget / status line
-  types.ts      # interfaces
+  provider.ts   # strategy selection and payload mutation
+  config.ts     # configuration parsing and formatters
+  savings.ts    # estimated savings calculation
+  ui.ts         # widget and status rendering
+  types.ts      # shared interfaces
 ```
 
-## Validation follow-ups
+## Development
 
-1. Verify `onPayload` full replacement is honored for Anthropic and OpenAI routes in your Pi version.
-2. Add broader provider fixtures to the session-warmer double for Anthropic and Codex policy paths.
-3. Log probe totals via `pi.appendEntry("pi-warm-cache-stats", ...)` for session-level totals.
-4. Optionally hide warm HTTP from user-visible TPS footer (it already stays out of the transcript).
-5. E2E: idle past 4 minutes with a large cached prefix and confirm both `probeOutcome=hit` and the final `realTurn=hit` observation.
+Clone the repository and install its development dependencies:
+
+```bash
+git clone https://github.com/ribbons-digital/pi-warm-cache.git
+cd pi-warm-cache
+pnpm install
+```
+
+Run the unit tests and type check:
+
+```bash
+pnpm test
+pnpm exec tsc --noEmit
+```
+
+Build changes on a feature branch and open a pull request against `main`.
+
+## Manual validation
+
+Use the E2E procedure in [`docs/e2e-idle-test.md`](docs/e2e-idle-test.md) with a real provider account.
+
+The most useful check is a large captured prefix, one manual `/warm now` probe, and at least three idle timer ticks.
+
+A live xAI validation must record the route, prompt-cache key identity, cache reads, cache writes, output, cost, and retry values.
+
+## License
+
+MIT
