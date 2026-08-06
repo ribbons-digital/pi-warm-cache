@@ -37,7 +37,8 @@
     "LICENSE"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "test": "node scripts/run-unit-tests.mjs"
