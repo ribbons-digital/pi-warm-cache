@@ -95,4 +95,4 @@ jobs:
       - name: Publish with npm trusted publishing provenance
         env:
           TARBALL: ${{ steps.pack.outputs.tarball }}
-        run: pnpm exec npm publish "$TARBALL" --access public --provenance
+        run: pnpm exec npm publish "./$TARBALL" --access public --provenance
