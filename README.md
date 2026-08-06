@@ -73,6 +73,8 @@ session_start
 ┌─────────────────────────────────────────────────────────────┐
 │ Real agent turn                                             │
 │                                                             │
+│ agent_start                                                 │
+│   Pause the keepalive timer                                 │
 │ before_provider_request                                     │
 │   Capture the exact provider payload                        │
 │ message_end(assistant)                                      │
