@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { formatDurationShort, formatTokens } from "./config.ts";
+import { formatDurationShort } from "./config.ts";
 import { formatSavingsLabel } from "./savings.ts";
 import type { CacheAnchor, StrategyPlan, WarmCacheConfig } from "./types.ts";
 
@@ -19,38 +19,33 @@ export function renderWaitingUi(
   plan: StrategyPlan,
   nextDueAt: number,
 ): void {
-  if (!ctx.hasUI || !config.showWidget) return;
+  if (!ctx.hasUI) return;
 
   const remainingMs = Math.max(0, nextDueAt - Date.now());
   const waitLabel = formatDurationShort(remainingMs || plan.intervalMs || 0);
-  const tokens = formatTokens(anchor.cachedTokens || anchor.promptTokens);
-  const saved = formatSavingsLabel(anchor);
-
+  const tokens = formatStatusTokens(anchor.cachedTokens || anchor.promptTokens);
+  const ratio = formatProbeRatio(anchor);
   const bestEffort = plan.family === "xai-best-effort";
-  const title = bestEffort
-    ? `Cache-warm wait · xAI best-effort monitor`
-    : `Cache-warm wait · 1 monitor on duty`;
-  const line1 = bestEffort
-    ? `Best-effort probe scheduled in ${waitLabel}. xAI cache retention is not guaranteed.`
-    : `Continuation deferred ${waitLabel} - the timed wake stays inside the ${plan.ttlLabel}.`;
-  const line2 =
-    anchor.probeHitCount > 0
-      ? anchor.savingsKnown
-        ? `~${tokens} tokens kept warm · ${saved} vs cold re-reads`
-        : `~${tokens} tokens kept warm · savings ${saved}`
-      : bestEffort
-        ? `~${tokens} tokens kept warm · waiting for first observed xAI probe hit`
-        : `~${tokens} tokens kept warm · waiting for first verified probe hit`;
+  const savings = formatSessionSavings(anchor);
+  // showWidget controls the editor widget only. The status line remains available
+  // as the compact extension surface when the widget is hidden.
+  const lines = [
+    ctx.ui.theme.fg("accent", `⚡ Cache-warm wait · extension probe in ${waitLabel}`),
+    ctx.ui.theme.fg(
+      "dim",
+      bestEffort
+        ? `xAI best-effort cadence · ~${tokens} prefix`
+        : `Inside ${plan.ttlLabel} · ~${tokens} prefix`,
+    ),
+    ctx.ui.theme.fg("warning", `${savings} · extension probes ${ratio}`),
+  ];
 
-  ctx.ui.setWidget(WIDGET_ID, [
-    ctx.ui.theme.fg("accent", `⚡ ${title}`),
-    ctx.ui.theme.fg("dim", line1),
-    ctx.ui.theme.fg("warning", line2),
-  ]);
-
+  if (config.showWidget) {
+    ctx.ui.setWidget(WIDGET_ID, lines);
+  }
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("dim", `warm ${waitLabel} · ~${tokens}`),
+    ctx.ui.theme.fg("dim", `warm ${waitLabel} · ${ratio} · ~${formatStatusTokens(anchor.cachedTokens || anchor.promptTokens)}`),
   );
 }
 
@@ -61,30 +56,29 @@ export function renderWarmHitUi(
   plan: StrategyPlan,
   cacheRead: number,
 ): void {
-  if (!ctx.hasUI || !config.showWidget) return;
-  const tokens = formatTokens(cacheRead || anchor.cachedTokens);
-  const saved = formatSavingsLabel(anchor);
+  if (!ctx.hasUI) return;
+
+  const tokens = formatStatusTokens(cacheRead || anchor.cachedTokens);
+  const ratio = formatProbeRatio(anchor);
   const bestEffort = plan.family === "xai-best-effort";
-  const hitLabel = bestEffort ? "xAI best-effort probe hit" : "probe hit";
   const nextLabel = bestEffort
-    ? `Next best-effort probe in ${plan.waitLabel ?? "n/a"}. ` +
-      "No fixed xAI cache lifetime is promised."
-    : `Next probe in ${plan.waitLabel ?? "n/a"} (${plan.ttlLabel}).`;
-
-  ctx.ui.setWidget(WIDGET_ID, [
-    ctx.ui.theme.fg("success", `⚡ Cache warm · ${hitLabel} ~${tokens} tokens`),
+    ? `Next extension probe in ${plan.waitLabel ?? "n/a"} · xAI best-effort`
+    : `Next extension probe in ${plan.waitLabel ?? "n/a"} · ${plan.ttlLabel}`;
+  const lines = [
+    ctx.ui.theme.fg("success", `⚡ Cache warm · extension probe hit · ~${tokens}`),
     ctx.ui.theme.fg("dim", nextLabel),
-    ctx.ui.theme.fg(
-      "warning",
-      anchor.savingsKnown
-        ? `Session ${saved} across ${anchor.probeHitCount} probe hit(s).`
-        : `Session savings ${saved} · ${anchor.probeHitCount} probe hit(s).`,
-    ),
-  ]);
+    ctx.ui.theme.fg("warning", `${formatSessionSavings(anchor)} · extension probes ${ratio}`),
+  ];
 
+  if (config.showWidget) {
+    ctx.ui.setWidget(WIDGET_ID, lines);
+  }
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("success", `${hitLabel} · ~${tokens}`),
+    ctx.ui.theme.fg(
+      "success",
+      `warm ${plan.waitLabel ?? "n/a"} · ${ratio} · ~${formatStatusTokens(cacheRead || anchor.cachedTokens)}`,
+    ),
   );
 }
 
@@ -102,18 +96,39 @@ export function renderIdleUi(
 
   if (config.showWidget) {
     const lines = [
-      ctx.ui.theme.fg("dim", `⚡ Cache-warm idle · ${reason}`),
+      ctx.ui.theme.fg("dim", `⚡ Cache-warm idle · ${compactUiText(reason)}`),
     ];
     if (detail && detail.length > 0) {
-      lines.push(ctx.ui.theme.fg("dim", detail));
+      lines.push(ctx.ui.theme.fg("dim", compactUiText(detail)));
     }
-    ctx.ui.setWidget(WIDGET_ID, lines);
+    ctx.ui.setWidget(WIDGET_ID, lines.slice(0, 2));
   }
 
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("dim", `warm idle · ${reason}`),
+    ctx.ui.theme.fg("dim", `warm · idle · ${compactUiText(reason, 48)}`),
   );
+}
+
+/**
+ * Non-alarming state shown after a hard invalidation.
+ * No extension probe is allowed until the next real turn captures a new payload.
+ */
+export function renderReanchorUi(
+  ctx: ExtensionContext,
+  config: WarmCacheConfig,
+  reason: string,
+): void {
+  if (!ctx.hasUI) return;
+
+  const cause = reanchorCause(reason);
+  if (config.showWidget) {
+    ctx.ui.setWidget(WIDGET_ID, [
+      ctx.ui.theme.fg("accent", `⚡ Cache-warm paused · re-anchoring ${cause}`),
+      ctx.ui.theme.fg("dim", "Waiting for next real turn. Extension probes paused."),
+    ]);
+  }
+  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "warm · re-anchoring"));
 }
 
 /**
@@ -130,16 +145,15 @@ export function renderProbeRetryUi(
 
   const retryLine =
     typeof nextDueAt === "number" && nextDueAt > Date.now()
-      ? `Next probe in ${formatDurationShort(nextDueAt - Date.now())}.`
-      : "Retrying the probe.";
+      ? `Next extension probe in ${formatDurationShort(nextDueAt - Date.now())}.`
+      : "Retrying the extension probe.";
   if (config.showWidget) {
     ctx.ui.setWidget(WIDGET_ID, [
-      ctx.ui.theme.fg("warning", "⚡ Cache-warm retry · transient probe miss"),
-      ctx.ui.theme.fg("dim", detail),
-      ctx.ui.theme.fg("dim", retryLine),
+      ctx.ui.theme.fg("warning", "⚡ Cache-warm retry · extension probe transient miss"),
+      ctx.ui.theme.fg("dim", `${compactUiText(detail)} · ${retryLine}`),
     ]);
   }
-  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "probe retry · transient miss"));
+  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "warm · retrying probe"));
 }
 
 /**
@@ -155,28 +169,76 @@ export function renderFailureUi(
 ): void {
   if (!ctx.hasUI) return;
 
-  const when = new Date().toISOString().slice(11, 19);
   const blocked = /blocked/i.test(reason);
   const retryLine = blocked
-    ? "Auto-warm stays off until /warm resume (or /warm on)."
+    ? "Auto-warm stays off until /warm resume."
     : typeof nextDueAt === "number" && nextDueAt > Date.now()
-      ? `Next try in ${formatDurationShort(nextDueAt - Date.now())}.`
+      ? `Next extension probe in ${formatDurationShort(nextDueAt - Date.now())}.`
       : "Warming stopped until the next real turn or /warm now.";
+  const error = /error|failed|no model/i.test(reason);
+  const title = error ? "Cache-warm error" : "Cache-warm warning";
+  const statusKind = error ? "error" : "warning";
 
   if (config.showWidget) {
     const lines = [
-      ctx.ui.theme.fg("error", `⚡ Cache-warm issue · ${reason}`),
+      ctx.ui.theme.fg(statusKind, `⚡ ${title} · ${shortProblem(reason)}`),
     ];
     if (detail && detail.length > 0) {
-      lines.push(ctx.ui.theme.fg("dim", detail));
+      lines.push(ctx.ui.theme.fg("dim", compactUiText(detail)));
     }
     lines.push(ctx.ui.theme.fg("dim", retryLine));
-    lines.push(ctx.ui.theme.fg("warning", `${when} UTC · run /warm for full status`));
-    ctx.ui.setWidget(WIDGET_ID, lines);
+    ctx.ui.setWidget(WIDGET_ID, lines.slice(0, 3));
   }
 
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("error", `warm · ${reason}`),
+    ctx.ui.theme.fg(statusKind, `warm · ${error ? "error" : "warning"}: ${shortProblem(reason)}`),
   );
+}
+
+function formatSessionSavings(anchor: CacheAnchor): string {
+  return anchor.savingsKnown
+    ? `Session ${formatSavingsLabel(anchor)}`
+    : `Session savings ${formatSavingsLabel(anchor)}`;
+}
+
+function formatProbeRatio(anchor: Pick<CacheAnchor, "probeHitCount" | "probeMissCount">): string {
+  const total = anchor.probeHitCount + anchor.probeMissCount;
+  return `${anchor.probeHitCount}/${total}`;
+}
+
+function formatStatusTokens(tokens: number): string {
+  if (tokens < 1000) return `${Math.round(tokens)}`;
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`;
+  return `${(tokens / 1_000_000).toFixed(1)}m`;
+}
+
+function reanchorCause(reason: string): string {
+  const lower = reason.toLowerCase();
+  if (lower.includes("compact")) return "after compaction";
+  if (lower.includes("branch") || lower.includes("tree")) return "after branch change";
+  if (lower.includes("model") || lower.includes("thinking")) {
+    return "after model or thinking-level change";
+  }
+  if (lower.includes("payload") || lower.includes("prefix") || lower.includes("drift")) {
+    return "after prefix drift";
+  }
+  return "after session change";
+}
+
+function shortProblem(reason: string): string {
+  const lower = reason.toLowerCase();
+  if (lower.includes("too many failures")) return "too many probe failures";
+  if (lower.includes("codex") && lower.includes("blocked")) return "Codex auto-warm blocked";
+  if (lower.includes("codex") && lower.includes("output")) return "Codex probe output high";
+  if (lower.includes("payload") && lower.includes("re-anchor")) return "probe payload drift";
+  if (lower.includes("probe miss")) return "extension probe miss";
+  if (lower.includes("probe error")) return "extension probe error";
+  return compactUiText(reason, 48);
+}
+
+function compactUiText(value: string, max = 72): string {
+  const compact = value.trim().replace(/\s+/g, " ");
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, Math.max(1, max - 3)).trimEnd()}...`;
 }

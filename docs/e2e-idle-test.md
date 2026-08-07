@@ -38,7 +38,31 @@ File logging is optional. All evidence comes from:
    Expect:
 
    ```
-   enabled family=anthropic-short capability=verified capabilityReason=first-party Anthropic Messages route with cache markers provider=anthropic/claude-fable-5 api=anthropic-messages strategy=anthropic-short cadence=5m prompt-cache TTL intervalMs=240000 cacheKey=none realRead=<big> realWrite=0 probeRead=none prompt≈<big> probeHits=0 probeMisses=0 realTurn=hit (...) probe=none probeFailStreak=0/3 savings=est. $0.0000 saved savingsSummary=probeHits=0 probeMisses=0 totalEstimatedSaved=$0.0000 totalProbeCost=$0.0000 net=$0.0000 pricingSource=model pricing=model nextDue=<ISO timestamp> pfp=<8-char hash> autoWarm=on last=none
+   enabled family=anthropic-short
+   lifecycle=anchored
+   capability=verified
+   capabilityReason=first-party Anthropic Messages route with cache markers
+   provider=anthropic/claude-fable-5
+   api=anthropic-messages
+   strategy=anthropic-short
+   cadence=5m prompt-cache TTL
+   intervalMs=240000
+   nextDue=<ISO timestamp>
+   realTurn=hit (...)
+   probe=none
+   probeSource=extension-only
+   probeHits=0
+   probeMisses=0
+   probeFailStreak=0/3
+   savingsSummary=probeHits=0 probeMisses=0 totalEstimatedSaved=$0.0000 totalProbeCost=$0.0000 net=$0.0000 pricingSource=model
+   cacheKey=none
+   pfp=<8-char hash>
+   autoWarm=on
+   probes=<n>
+   savings=est. $<amount> saved
+   pricing=model
+   realRead=<big> realWrite=0 probeRead=none prompt≈<big>
+   last=none
    ```
 
    - `inactive capability=unsupported` -> this route is unsupported and the provider will not be called, abort.
@@ -62,10 +86,10 @@ File logging is optional. All evidence comes from:
 /warm now
 ```
 
-Expect `Probe hit (anthropic/claude-fable-5 api=anthropic-messages; capability=verified ...; read=<~prefix size> write=0 in=<input tokens> out=<output tokens> cost=$<cost>; pfp=<hash>; retry=0/3)`.
+Expect `Extension probe hit (anthropic/claude-fable-5 api=anthropic-messages; capability=verified ...; extensionProbe read=<~prefix size> write=0 in=<input tokens> out=<output tokens> cost=$<cost>; source=extension-only; pfp=<hash>; retry=0/3; savingsSummary=...)`.
 
 This is the highest-value check: it isolates payload replay from timing.
-If it reports `Probe miss (anthropic/claude-fable-5 api=anthropic-messages; capability=verified ...; read=0 write=<N> in=<input tokens> out=<output tokens> cost=$<cost>; pfp=<hash>; retry=<N>/3)`, the replayed payload does not
+If it reports `Extension probe miss (anthropic/claude-fable-5 api=anthropic-messages; capability=verified ...; extensionProbe read=0 write=<N> in=<input tokens> out=<output tokens> cost=$<cost>; source=extension-only; pfp=<hash>; retry=<N>/3; savingsSummary=...)`, the replayed payload does not
 byte-match the real one. That is the failure mode described in the README
 ("payload replay, not Context rebuild"), and the timer test will only reproduce
 it more slowly.
