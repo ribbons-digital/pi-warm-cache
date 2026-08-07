@@ -1,5 +1,9 @@
 # E2E: idle-past-TTL cache warming test
 
+This is the canonical real-provider verification procedure for pi-warm-cache.
+Use the [diagnostics reference](upgrade-notes.md) for `/warm` status fields, lifecycle states, savings, and JSONL fields.
+The [README manual validation section](../README.md#manual-validation) points here.
+
 Manual end-to-end procedure to verify that `pi-warm-cache` actually keeps a prompt
 cache alive across a long idle gap.
 
@@ -66,6 +70,7 @@ File logging is optional. All evidence comes from:
    ```
 
    - `inactive capability=unsupported` -> this route is unsupported and the provider will not be called, abort.
+   - `lifecycle=awaiting-reanchor` -> the old payload was dropped and no probe is allowed until a new real turn is captured.
    - `realTurn=unknown (read=0 write=0 input=0 prompt=0 ...)` after a completed turn -> `message_end` usage tracking is not landing.
 
 4. Confirm the exact route before waiting.

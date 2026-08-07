@@ -10,6 +10,21 @@ Provider prompt caches expire after a short idle period.
 When a cache expires, the next turn pays a cold read or a costly rewrite.
 This extension runs a lightweight keepalive probe before the provider cache is likely to expire.
 
+## Safety rules and scope
+
+pi-warm-cache is conservative by design.
+These four rules are non-negotiable:
+
+1. **Exact payload replay only** - never rebuild context from the live session.
+2. **Strict capability verification** - automatic warming is allowed only on routes that resolve to `state: "verified"`.
+3. **Hard invalidation on real prefix drift** - drop the anchor immediately on compaction, model switch, thinking-level change, or a non-continuing payload.
+   Issue no probe until a new real payload is captured.
+4. **No invented pricing** - savings estimates use only the model-supplied `cost` fields.
+   If pricing is missing or unusable, report `n/a`.
+
+The extension supports Pi only.
+Tau is out of scope.
+
 ## Current provider support
 
 The extension verifies the complete provider route before it enables automatic warming.
@@ -41,6 +56,25 @@ They do not receive an automatic timer or a verified savings claim.
 
 OpenRouter, OpenCode Go, and other API-compatible proxy routes do not inherit first-party support.
 Routes without an explicit registered capability are rejected before the provider is called.
+
+## When this helps / When it does not
+
+### When this helps
+
+- It helps when a verified provider route holds a large prompt prefix across a long idle gap.
+- It helps when you want the extension to replay the exact captured provider payload instead of rebuilding context.
+- It helps when you need separate diagnostics for real-turn cache usage and extension warm probes.
+- It helps when you can run the [canonical real-provider verification procedure](docs/e2e-idle-test.md) with a real provider account.
+
+### When this does not help
+
+- It does not warm a prefix below `minCachedTokens` or make a small prompt more valuable to cache.
+- It does not enable automatic warming for unsupported, proxy, or unverified routes.
+- Manual-only routes can use one safe `/warm now` probe, but they do not receive a timer or a verified savings claim.
+- xAI best-effort warming does not promise a provider TTL, a cache hit, or a fixed saving amount.
+- It does not preserve an old anchor after compaction, model or thinking-level changes, branch changes, or other prefix drift.
+- It does not invent a savings amount when the active model has no usable pricing data.
+- It does not support Tau.
 
 ## Install
 
@@ -170,6 +204,7 @@ PI_WARM_CACHE_DEBUG=1 pi
 ```
 
 When enabled, diagnostics are written to `.pi/warm-cache.jsonl`.
+The [diagnostics reference](docs/upgrade-notes.md) defines the `/warm` status fields, lifecycle states, savings summary, and JSONL schema.
 The `/warm` status and `/warm now` result include the provider route, capability state, strategy, cadence, payload fingerprint, redacted cache-key identity, observed usage, and retry state.
 
 `realTurn=unknown` is used for the first turn, invalidation boundaries, changed prefixes, and prompts below the configured minimum.
@@ -313,7 +348,8 @@ The workflow checks the tag, runs tests and type checks, validates the exact pub
 
 ## Manual validation
 
-Use the E2E procedure in [`docs/e2e-idle-test.md`](docs/e2e-idle-test.md) with a real provider account.
+The procedure in [`docs/e2e-idle-test.md`](docs/e2e-idle-test.md) is the canonical real-provider verification method.
+Use it with a real provider account.
 
 The most useful check is a large captured prefix, one manual `/warm now` probe, and at least three idle timer ticks.
 
