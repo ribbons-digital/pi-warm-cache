@@ -77,12 +77,14 @@ When a hard invalidation is waiting for a new payload, the second line is `paylo
 The old payload cannot be reused in that state.
 
 The following fields form the stable diagnostic block.
+Inactive-capability output also includes the `manualProbe` field.
 
 | Field | Meaning |
 |---|---|
 | `lifecycle` | The lifecycle state from the table above. |
 | `capability` | The exact route policy: `verified`, `unverified`, or `unsupported`. |
 | `capabilityReason` | The actionable reason for the capability decision. This is route and payload policy, not a provider promise. |
+| `manualProbe` | In inactive-capability output, `ready` means the captured payload is safe for a manual probe, `unsafe-payload` means the route is manual-capable but the captured shape is unsafe, `waiting-for-safe-payload` means no payload is captured yet, and `off` means manual probing is not permitted. This field is omitted from the verified-route status form. |
 | `provider` | The provider and model route, such as `anthropic/claude-fable-5`. |
 | `api` | The exact Pi API transport, such as `anthropic-messages` or `openai-responses`. |
 | `strategy` | The selected cache family, such as `anthropic-short`, `openai-explicit`, `openai-implicit`, or `xai-best-effort`. |
