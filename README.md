@@ -233,6 +233,12 @@ A provider error is reported as an error and does not increment `probeMisses`.
 
 The existing `interval` configuration overrides the default interval for every strategy, including xAI best-effort probes.
 
+The xAI `prompt_cache_key` must be a stable non-empty string without surrounding whitespace or control characters.
+
+A missing, invalid, or changed xAI key disables best-effort probing until a new exact real-turn payload is captured.
+
+The four-minute xAI interval is an operational heuristic and is not a provider TTL guarantee.
+
 The 1-hour Anthropic mode follows the cache retention already present in the Pi payload.
 The extension does not stamp `cache_control.ttl = "1h"` onto real turns.
 
@@ -292,8 +298,9 @@ interface WarmCacheConfig {
 8. **Small prefix** - do not warm below the configured minimum cached-token threshold.
 9. **Session resume** - wait for the first real turn instead of restoring an old payload.
 10. **Print or RPC mode** - keep warming when enabled, but skip TUI widgets when no UI exists.
-11. **Direct xAI Grok 4.5** - require the first-party Responses route and a captured `prompt_cache_key`.
-12. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
+11. **Direct xAI Grok 4.5** - require the first-party Responses route and a stable captured `prompt_cache_key`.
+12. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
+13. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 
 ## Package layout
 

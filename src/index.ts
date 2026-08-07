@@ -141,7 +141,8 @@ export default function piWarmCache(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (trimmed.toLowerCase() === "savings") {
-        ctx.ui.notify(warmer.getSavingsSummaryText(), "info");
+        const summary = warmer.getSavingsSummaryText();
+        ctx.ui.notify(warmer.isXaiRoute() ? `xAI best-effort ${summary}` : summary, "info");
         return;
       }
       if (!trimmed || trimmed === "status") {
@@ -155,6 +156,10 @@ export default function piWarmCache(pi: ExtensionAPI) {
         }
         // Manual ping is allowed even when auto-warm is sticky-blocked.
         const result = await warmer.warmNow(ctx);
+        const xaiBestEffort =
+          result.provider === "xai" ||
+          result.family === "xai-best-effort" ||
+          /xai/i.test(result.capabilityReason ?? "");
         const route = `${result.provider ?? "unknown"}/${result.modelId ?? "unknown"} api=${result.api ?? "unknown"}`;
         const capability =
           `capability=${result.capabilityState ?? "unknown"} reason=${result.capabilityReason ?? "unknown"}`;
@@ -169,7 +174,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
         const retry = `retry=${result.retryState ?? "none"}`;
         const manualOnlyWarning =
           result.capabilityState === "unverified"
-            ? "WARNING: automatic warming is disabled for this unverified route; /warm now is manual-only and savings are n/a (unverified route). "
+            ? `WARNING: ${xaiBestEffort ? "xAI best-effort " : ""}automatic warming is disabled for this unverified route; /warm now is manual-only and savings are n/a (unverified route). `
             : "";
         const savings =
           result.capabilityState === "unverified"
@@ -181,8 +186,8 @@ export default function piWarmCache(pi: ExtensionAPI) {
         if (!result.ok) {
           const failureLabel =
             result.unavailable || result.capabilityState === "unsupported"
-              ? "Probe unavailable"
-              : "Probe failed";
+              ? `${xaiBestEffort ? "xAI best-effort probe" : "Probe"} unavailable`
+              : `${xaiBestEffort ? "xAI best-effort probe" : "Probe"} failed`;
           ctx.ui.notify(
             `${manualOnlyWarning}${failureLabel}: ${result.error} (${diagnostics})`,
             result.capabilityState === "unverified" ? "warning" : "error",
@@ -191,15 +196,14 @@ export default function piWarmCache(pi: ExtensionAPI) {
         }
         if (result.capabilityState === "unverified") {
           ctx.ui.notify(
-            `${manualOnlyWarning}Unverified manual probe ${result.cacheHit ? "hit" : "miss"} (${diagnostics}). No active keepalive or verified savings claim.`,
+            `${manualOnlyWarning}${xaiBestEffort ? "xAI best-effort " : ""}unverified manual probe ${result.cacheHit ? "hit" : "miss"} (${diagnostics}). No active keepalive or verified savings claim.`,
             "warning",
           );
           return;
         }
-        const probeLabel =
-          result.family === "xai-best-effort"
-            ? "Best-effort extension probe"
-            : "Extension probe";
+        const probeLabel = xaiBestEffort
+          ? "xAI best-effort extension probe"
+          : "Extension probe";
         if (result.probeOutcome === "transient-miss") {
           ctx.ui.notify(
             `${probeLabel} miss (transient; retry scheduled) (${diagnostics})`,
@@ -230,7 +234,10 @@ export default function piWarmCache(pi: ExtensionAPI) {
       if (lower === "resume") {
         warmer.bindContext(ctx);
         warmer.clearAutoWarmBlock("user /warm resume");
-        ctx.ui.notify("pi-warm-cache sticky block cleared. Timers resume if enabled (use /warm codex-off to disable Codex auto-warm).", "info");
+        ctx.ui.notify(
+          `${warmer.isXaiRoute() ? "xAI best-effort " : "pi-warm-cache "}sticky block cleared. Timers resume if enabled (use /warm codex-off to disable Codex auto-warm).`,
+          "info",
+        );
         warmer.onAgentSettled(ctx);
         return;
       }
@@ -274,7 +281,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
 
       const block = warmer.getAutoWarmBlockReason();
       ctx.ui.notify(
-        `pi-warm-cache on (ttl=${config.anthropicTtl}, interval=${config.intervalMs ?? "auto"}, max=${config.maxConcurrentWarmSessions}, log=${config.logToFile ? "on" : "off"}${block ? `, autoWarm=blocked` : ""})`,
+        `pi-warm-cache${warmer.isXaiRoute() ? " xAI best-effort" : ""} on (ttl=${config.anthropicTtl}, interval=${config.intervalMs ?? "auto"}, max=${config.maxConcurrentWarmSessions}, log=${config.logToFile ? "on" : "off"}${block ? `, autoWarm=blocked` : ""})`,
         "info",
       );
       warmer.onAgentSettled(ctx);

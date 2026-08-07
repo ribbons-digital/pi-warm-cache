@@ -10,6 +10,7 @@ import {
   decideCodexOversizedAction,
   DEFER_BACKOFF_MS,
   getPromptCacheKey,
+  getPromptCacheKeyFingerprint,
   isPayloadContinuation,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
@@ -126,6 +127,11 @@ export class SessionWarmer {
 
   getCapability(): ProviderCapability {
     return this.currentCapability();
+  }
+
+  /** True when the active or captured route belongs to xAI. */
+  isXaiRoute(): boolean {
+    return this.anchor?.provider === "xai" || this.ctx?.model?.provider === "xai";
   }
 
   getLifecycleState(): WarmLifecycleState {
@@ -267,6 +273,13 @@ export class SessionWarmer {
     reason: string,
     preserveProbe = false,
   ): void {
+    const previousAnchor = this.anchor;
+    const previousPayload = this.lastPayload;
+    const previousCacheKeyFingerprint =
+      previousAnchor?.cacheKeyFingerprint ??
+      getPromptCacheKeyFingerprint(previousPayload, ctx.model?.api);
+    const previousPayloadFingerprint = previousAnchor?.payloadFingerprint;
+
     this.ctx = ctx;
     this.capability = resolveProviderCapability(ctx.model);
     this.lastInvalidatedProbe = preserveProbe ? (this.anchor?.latestProbe ?? null) : null;
@@ -287,6 +300,8 @@ export class SessionWarmer {
       api: ctx.model?.api,
       capabilityState: this.capability.state,
       capabilityReason: this.capability.reason,
+      cacheKeyFingerprint: previousCacheKeyFingerprint,
+      payloadFingerprint: previousPayloadFingerprint,
       reason,
     });
   }
@@ -319,6 +334,7 @@ export class SessionWarmer {
     this.logFile = warmLogPath(ctx.cwd);
     const payloadFingerprint = stableFingerprint(payload);
     const model = ctx.model;
+    const cacheKeyFingerprint = getPromptCacheKeyFingerprint(payload, model?.api);
     this.capability = resolveProviderCapability(model, payload);
 
     if (!model || this.capability.state === "unsupported") {
@@ -339,6 +355,7 @@ export class SessionWarmer {
         modelId: model?.id,
         api: model?.api,
         payloadFingerprint,
+        cacheKeyFingerprint,
         capabilityState: this.capability.state,
         capabilityReason: this.capability.reason,
         ignored: true,
@@ -349,14 +366,26 @@ export class SessionWarmer {
 
     let prev = this.anchor;
     let previousPayload = this.lastPayload;
-    const sameRoute = Boolean(
+    const sameModelRoute = Boolean(
       prev &&
         prev.provider === model.provider &&
         prev.modelId === model.id &&
-        prev.modelApi === model.api &&
+        prev.modelApi === model.api,
+    );
+    const sameRoute = Boolean(
+      sameModelRoute &&
+        prev &&
         prev.capability.state === this.capability.state &&
         prev.capability.reason === this.capability.reason,
     );
+    const xaiCacheKeyChanged = Boolean(
+      sameModelRoute &&
+        previousPayload &&
+        model.provider === "xai" &&
+        model.api === "openai-responses" &&
+        getPromptCacheKey(previousPayload, model.api) !== getPromptCacheKey(payload, model.api),
+    );
+    const previousCacheKeyFingerprint = prev?.cacheKeyFingerprint;
     // A payload-drift probe deliberately clears lastPayload. Do not treat a
     // later fingerprint match as continuity unless the old payload is still
     // available for comparison.
@@ -372,16 +401,26 @@ export class SessionWarmer {
     const comparableContinuation = payloadContinuation && previousTurnObserved;
     const continuityReason = !prev
       ? this.realTurnBoundaryReason
-      : !sameRoute
-        ? "model or provider route changed"
-        : !payloadContinuation
-          ? "prefix changed"
-          : comparableContinuation
-            ? "comparable continuation"
-            : "no comparable prior real turn";
+      : xaiCacheKeyChanged
+        ? getPromptCacheKey(payload, model.api)
+          ? "xAI best-effort prompt_cache_key changed"
+          : "xAI best-effort prompt_cache_key missing or invalid"
+        : !sameRoute
+          ? "model or provider route changed"
+          : !payloadContinuation
+            ? "prefix changed"
+            : comparableContinuation
+              ? "comparable continuation"
+              : "no comparable prior real turn";
     const prefixChanged = Boolean(prev && !payloadContinuation);
     if (prefixChanged) {
-      const driftReason = !sameRoute ? "model or provider route changed" : "prefix changed";
+      const driftReason = xaiCacheKeyChanged
+        ? getPromptCacheKey(payload, model.api)
+          ? "xAI best-effort prompt_cache_key changed"
+          : "xAI best-effort prompt_cache_key missing or invalid"
+        : !sameRoute
+          ? "model or provider route changed"
+          : "prefix changed";
       this.enterAwaitingReanchor(ctx, `${driftReason} · waiting for next turn`);
       prev = null;
       previousPayload = null;
@@ -390,10 +429,6 @@ export class SessionWarmer {
     this.lastInvalidatedProbe = null;
     this.lastPayload = structuredClone(payload);
     this.plan = resolveStrategy(model, this.config, this.lastPayload);
-    const cacheKey = getPromptCacheKey(this.lastPayload, model.api);
-    const cacheKeyFingerprint = cacheKey
-      ? stableFingerprint(cacheKey).split(":")[0]!.slice(0, 8)
-      : "none";
     const manualProbeAvailable =
       this.capability.manualProbe && isSafeReplayPayload(this.lastPayload, model.api);
 
@@ -476,6 +511,8 @@ export class SessionWarmer {
       manualProbeAvailable,
       payloadFingerprint,
       cacheKeyFingerprint,
+      previousCacheKeyFingerprint,
+      cacheKeyChanged: xaiCacheKeyChanged,
       prefixChanged,
       realTurnContinuity: comparableContinuation ? "comparable" : "unknown",
       realTurnContinuityReason: continuityReason,
@@ -518,6 +555,7 @@ export class SessionWarmer {
         api: ctx.model?.api,
         capabilityState: this.capability?.state,
         capabilityReason: this.capability?.reason,
+        cacheKeyFingerprint: getPromptCacheKeyFingerprint(this.lastPayload, ctx.model?.api),
         cacheRead,
         cacheWrite,
         input,
@@ -595,6 +633,8 @@ export class SessionWarmer {
       api: ctx.model?.api,
       capabilityState: this.capability.state,
       capabilityReason: this.capability.reason,
+      cacheKeyFingerprint:
+        this.anchor?.cacheKeyFingerprint ?? getPromptCacheKeyFingerprint(this.lastPayload, ctx.model?.api),
     });
   }
 
@@ -620,7 +660,8 @@ export class SessionWarmer {
       capabilityReason: this.anchor?.capability.reason ?? this.capability?.reason,
       hasPayload: Boolean(this.lastPayload),
       cachedTokens: this.anchor?.cachedTokens ?? 0,
-      cacheKeyFingerprint: this.anchor?.cacheKeyFingerprint,
+      cacheKeyFingerprint:
+        this.anchor?.cacheKeyFingerprint ?? getPromptCacheKeyFingerprint(this.lastPayload, ctx.model?.api),
       realTurnState: this.anchor?.latestRealTurn.state,
       realTurnReason: this.anchor?.latestRealTurn.reason,
       probeOutcome: this.anchor?.latestProbe?.outcome,
@@ -657,7 +698,9 @@ export class SessionWarmer {
         ? `${model.provider}/${model.id}`
         : "none";
     const api = anchor?.modelApi ?? model?.api ?? "none";
-    const cacheKey = anchor?.cacheKeyFingerprint ?? "none";
+    const xaiRoute = this.isXaiRoute();
+    const cacheKey =
+      anchor?.cacheKeyFingerprint ?? getPromptCacheKeyFingerprint(this.lastPayload, model?.api);
     const realTurn = anchor ? formatRealTurnStatus(anchor.latestRealTurn) : "none";
     const probe = formatProbeStatus(anchor?.latestProbe ?? this.lastInvalidatedProbe);
     const retry = anchor
@@ -683,6 +726,7 @@ export class SessionWarmer {
       `capabilityReason=${capability.reason}`,
       `provider=${route}`,
       `api=${api}`,
+      xaiRoute ? "policy=xAI-best-effort" : "",
       `strategy=${strategy}`,
       `cadence=${cadence}`,
       `intervalMs=${intervalMs ?? "none"}`,
@@ -789,6 +833,8 @@ export class SessionWarmer {
         capabilityState: capability.state,
         capabilityReason: capability.reason,
         automaticWarm: capability.automaticWarm,
+        cacheKeyFingerprint:
+          this.anchor?.cacheKeyFingerprint ?? getPromptCacheKeyFingerprint(this.lastPayload, ctx.model?.api),
         reason: "capability does not permit automatic warming",
       });
       this.clearCapabilityUi(ctx);
@@ -918,7 +964,7 @@ export class SessionWarmer {
       this.clearCapabilityUi(ctx);
       return;
     }
-    renderIdleUi(ctx, this.config, reason, detail);
+    renderIdleUi(ctx, this.config, reason, detail, this.isXaiRoute());
   }
 
   /** Non-alarming hard-invalidation state. No probe is allowed before re-anchor. */
@@ -927,7 +973,7 @@ export class SessionWarmer {
       this.clearCapabilityUi(ctx);
       return;
     }
-    renderReanchorUi(ctx, this.config, reason);
+    renderReanchorUi(ctx, this.config, reason, this.isXaiRoute());
   }
 
   /** Real failures / retries (keep panel visible with reason). */
@@ -942,6 +988,7 @@ export class SessionWarmer {
       reason,
       detail,
       this.nextDueAt > Date.now() ? this.nextDueAt : undefined,
+      this.isXaiRoute(),
     );
   }
 
@@ -1044,7 +1091,8 @@ export class SessionWarmer {
       detail,
       probeOutcome,
       family: this.anchor?.cacheFamily,
-      cacheKeyFingerprint: this.anchor?.cacheKeyFingerprint,
+      cacheKeyFingerprint:
+        this.anchor?.cacheKeyFingerprint ?? getPromptCacheKeyFingerprint(this.lastPayload, this.ctx?.model?.api),
       payloadFingerprint: this.anchor?.payloadFingerprint,
       retryState: this.anchor
         ? `${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
@@ -1091,7 +1139,10 @@ export class SessionWarmer {
       strategyLabel: result.strategyLabel ?? this.plan?.ttlLabel,
       intervalMs:
         result.intervalMs !== undefined ? result.intervalMs : (this.plan?.intervalMs ?? null),
-      cacheKeyFingerprint: result.cacheKeyFingerprint ?? anchor?.cacheKeyFingerprint,
+      cacheKeyFingerprint:
+        result.cacheKeyFingerprint ??
+        anchor?.cacheKeyFingerprint ??
+        getPromptCacheKeyFingerprint(this.lastPayload, model?.api),
       retryState:
         result.retryState ??
         (anchor ? `${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}` : "none"),
@@ -1210,7 +1261,7 @@ export class SessionWarmer {
 
     if (anchor.cacheFamily === "xai-best-effort" && !isSafeXaiReplayPayload(payload)) {
       const detail =
-        "xAI best-effort probe requires an exact Responses payload with a stable prompt_cache_key";
+        "xAI best-effort probe requires an exact Responses payload with a stable prompt_cache_key; no provider request was sent";
       this.clearTimers();
       this.recordAttempt(reason, false, detail);
       this.showIdle(ctx, "xAI probe unavailable", detail);
@@ -1399,8 +1450,10 @@ export class SessionWarmer {
 
       if (unverifiedProbe) {
         const payloadDrift = outcome === "payload-drift";
+        const unverifiedProbeLabel =
+          model.provider === "xai" ? "xAI best-effort manual probe" : "unverified probe";
         const detail =
-          `unverified probe ${payloadDrift ? "payload-drift" : result.cacheHit ? "hit" : "miss"} provider=${model.provider} api=${model.api} ` +
+          `${unverifiedProbeLabel} ${payloadDrift ? "payload-drift" : result.cacheHit ? "hit" : "miss"} provider=${model.provider} api=${model.api} ` +
           `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
           `out=${result.output} cost=${result.costUsd}`;
         this.recordAttempt(reason, result.cacheHit, detail, usageSnap, outcome);
@@ -1456,7 +1509,8 @@ export class SessionWarmer {
         this.recordAttempt(
           reason,
           true,
-          `probe hit read=${result.cacheRead} write=${result.cacheWrite} out=${result.output} in=${result.input}`,
+          `${anchor.cacheFamily === "xai-best-effort" ? "xAI best-effort probe hit" : "probe hit"} ` +
+            `read=${result.cacheRead} write=${result.cacheWrite} out=${result.output} in=${result.input}`,
           usageSnap,
           outcome,
         );
@@ -1470,19 +1524,24 @@ export class SessionWarmer {
           result.cacheRead === 0 &&
           result.cacheWrite === 0;
         const transientImplicitMiss = outcome === "transient-miss";
+        const xaiBestEffort = anchor.cacheFamily === "xai-best-effort";
         anchor.consecutiveFailures += 1;
-        const detail =
-          `probe ${outcome} read=${result.cacheRead} write=${result.cacheWrite} ` +
-          `in=${result.input} out=${result.output} cost=${result.costUsd}`;
+        const detail = xaiNoWriteReanchor
+          ? `xAI best-effort probe ${outcome} read=0 write=0; xAI may omit cache-write usage; ` +
+            `retry=${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} ` +
+            `in=${result.input} out=${result.output} cost=${result.costUsd}`
+          : `probe ${outcome} read=${result.cacheRead} write=${result.cacheWrite} ` +
+            `in=${result.input} out=${result.output} cost=${result.costUsd}`;
         this.recordAttempt(reason, false, detail, usageSnap, outcome);
 
         if (payloadDrift) {
           const reanchorDetail = xaiNoWriteReanchor
-            ? "Repeated xAI no-read/no-write probes; xAI does not expose cache-write usage, so re-anchor is required."
+            ? `xAI best-effort probes returned no cached reads or writes for ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} attempts. ` +
+              "xAI may omit cache-write usage, so the configured failure budget is exhausted and a new real-turn anchor is required."
             : `write=${result.cacheWrite} read=0. Payload likely diverged from provider cache.`;
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `pi-warm-cache: probe miss; re-anchor required (${reanchorDetail})`,
+              `pi-warm-cache: ${xaiBestEffort ? "xAI best-effort probe miss" : "probe miss"}; re-anchor required (${reanchorDetail})`,
               "warning",
             );
           }
@@ -1499,20 +1558,28 @@ export class SessionWarmer {
           renderProbeRetryUi(
             ctx,
             this.config,
-            `read=${result.cacheRead} write=${result.cacheWrite} · retry scheduled`,
+            xaiNoWriteReanchor
+              ? `xAI best-effort probe returned read=0 write=0; xAI may omit cache-write usage. ` +
+                `Retrying within the configured failure budget (${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}).`
+              : `read=${result.cacheRead} write=${result.cacheWrite} · retry scheduled`,
             this.nextDueAt > Date.now() ? this.nextDueAt : undefined,
+            xaiBestEffort,
           );
         } else {
+          const persistentMissDetail = xaiNoWriteReanchor
+            ? `xAI best-effort probe still returned no cached reads or writes. ` +
+              `xAI may omit cache-write usage; retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} remains within the configured failure budget.`
+            : `read=${result.cacheRead} write=${result.cacheWrite}`;
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `pi-warm-cache: persistent probe miss (read=${result.cacheRead} write=${result.cacheWrite}).`,
+              `pi-warm-cache: ${xaiBestEffort ? "xAI best-effort probe miss" : "persistent probe miss"} (${persistentMissDetail})`,
               "warning",
             );
           }
           this.showFailure(
             ctx,
-            `probe miss · retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`,
-            `read=${result.cacheRead} write=${result.cacheWrite}`,
+            `${xaiBestEffort ? "xAI best-effort probe miss" : "probe miss"} · retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`,
+            persistentMissDetail,
           );
         }
       }
@@ -1521,22 +1588,25 @@ export class SessionWarmer {
     } catch (err) {
       if (!unverifiedProbe) anchor.consecutiveFailures += 1;
       const message = err instanceof Error ? err.message : String(err);
+      const xaiBestEffort = model.provider === "xai";
+      const probeErrorLabel = xaiBestEffort
+        ? "xAI best-effort probe error"
+        : unverifiedProbe
+          ? "unverified probe error"
+          : "probe error";
       this.observeProbeError(anchor, model, fingerprint, message);
       this.recordAttempt(
         reason,
         false,
-        `${unverifiedProbe ? "unverified probe error" : "probe error"}: ${message}`,
+        `${probeErrorLabel}: ${message}`,
         undefined,
         "error",
       );
       if (ctx.hasUI) {
-        ctx.ui.notify(
-          `pi-warm-cache: ${unverifiedProbe ? "unverified probe error" : "probe error"} - ${message}`,
-          "error",
-        );
+        ctx.ui.notify(`pi-warm-cache: ${probeErrorLabel} - ${message}`, "error");
       }
       if (unverifiedProbe) this.clearCapabilityUi(ctx);
-      else this.showFailure(ctx, "probe error", message);
+      else this.showFailure(ctx, probeErrorLabel, message);
       return buildWarmResult({
         fingerprint,
         error: message,

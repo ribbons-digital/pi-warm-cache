@@ -15,12 +15,16 @@ import {
   classifyRealTurnObservation,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
   decideCodexOversizedAction,
+  getPromptCacheKey,
+  getPromptCacheKeyFingerprint,
+  hasXaiPromptCacheKey,
   isCodexPayload,
   isPayloadContinuation,
   minimumOutputTokensForPayload,
   modelSupportsLongCacheRetention,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
+  isStablePromptCacheKey,
   OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
   payloadHasAnthropicLongTtl,
   XAI_BEST_EFFORT_INTERVAL_MS,
@@ -344,6 +348,18 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   };
   assert(isSafeReplayPayload(xaiPayload, directXai.api), "Responses payload should be probe-safe");
   assert(isSafeXaiReplayPayload(xaiPayload), "xAI payload should include a stable prompt-cache key");
+  assert(hasXaiPromptCacheKey(xaiPayload), "xAI key detector should accept the exact Responses shape");
+  assert(getPromptCacheKey(xaiPayload, directXai.api) === "xai-session-1", "key detector should return the captured key");
+  assert(getPromptCacheKeyFingerprint(xaiPayload, directXai.api) !== "none", "key fingerprint should be redacted but present");
+  assert(isStablePromptCacheKey("session-id"), "normal session ids should be stable keys");
+  assert(!isStablePromptCacheKey(" session-id"), "leading whitespace must not qualify as stable");
+  assert(!isStablePromptCacheKey("session-id "), "trailing whitespace must not qualify as stable");
+  assert(!isStablePromptCacheKey(""), "empty key must not qualify as stable");
+  assert(!isStablePromptCacheKey(42), "non-string key must not qualify as stable");
+  assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "   " }), "blank xAI key must be rejected");
+  assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "xai\nkey" }), "control characters must be rejected");
+  assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "key\u009Bvalue" }), "C1 control characters (U+0080-U+009F) must be rejected");
+  assert(getPromptCacheKey(xaiPayload, "openai-completions") === null, "wrong API must not expose a Responses key");
   assert(!canManualProbe(directXai, xaiPayload), "verified xAI should not use the unverified probe path");
   const xaiWithoutKey = { ...xaiPayload, prompt_cache_key: undefined };
   const xaiWithoutKeyStrategy = resolveStrategy(directXai, DEFAULT_CONFIG, xaiWithoutKey);
@@ -1248,12 +1264,23 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     maxConsecutiveFailures: 3,
   });
   warmer.capturePayload(capturedPayload, ctx);
+  warmer.capturePayload({ ...capturedPayload, prompt_cache_key: "rotated-xai-session" }, ctx);
+  assert(
+    warmer.getLatestRealTurnObservation()?.reason.includes("prompt_cache_key changed"),
+    "xAI key changes should explain the hard re-anchor boundary",
+  );
+  assert(
+    !warmer.getStatusText().includes("rotated-xai-session"),
+    "xAI status must never expose the raw cache key",
+  );
+  warmer.capturePayload(capturedPayload, ctx);
   warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
 
   const first = await warmer.warmNow(ctx);
   assert(first.family === "xai-best-effort", "xAI result should identify its strategy");
   assert(first.probeOutcome === "transient-miss", "first xAI miss should retry quietly");
   assert(first.cacheKeyFingerprint !== "none", "xAI result should expose cache-key identity");
+  assert(first.cacheKeyFingerprint !== "xai-session", "xAI result must expose only a redacted key fingerprint");
   assert(warmer.getStatusText().includes("strategy=xai-best-effort"), "status should expose the xAI strategy");
   assert(warmer.getStatusText().includes("cadence=xAI best-effort probe cadence"), "status should expose the xAI cadence");
   assert(warmer.getStatusText().includes("cacheKey="), "status should expose cache-key identity");
@@ -1273,6 +1300,15 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   const third = await warmer.warmNow(ctx);
   assert(third.probeOutcome === "payload-drift", "repeated xAI misses should request re-anchor");
   assert(warmer.getLifecycleState() === "awaiting-reanchor", "xAI drift should await re-anchor");
+  assert(
+    notifications.some(
+      (entry) =>
+        entry.message.includes("xAI best-effort") &&
+        entry.message.includes("failure budget") &&
+        entry.message.includes("cache-write"),
+    ),
+    "repeated xAI no-read/no-write misses should explain the failure budget and missing write usage",
+  );
   assert(warmer.getStatusText().includes("idle (no anchor)"), "xAI repeated misses should clear the replay payload");
   assert(warmer.getStatusText().includes("payload=none"), "xAI drift status should request a re-anchor");
   const xaiCallsBeforeWaitingProbe = calls.length;
@@ -1455,6 +1491,34 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     statuses.some((status) => /warm [0-9.]+m · 2\/2 · ~128k/.test(status)),
     "healthy status should show cadence, probe ratio, and prompt size",
   );
+
+  const xaiCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  const xaiCtx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, value: unknown) => xaiCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value: unknown) => xaiCalls.push({ kind: "status", value }),
+    },
+  } as any;
+  const xaiAnchor = { ...anchor, capability: { state: "verified" } } as any;
+  const xaiPlan = {
+    ...plan,
+    family: "xai-best-effort",
+    ttlLabel: "xAI best-effort probe cadence",
+  } as any;
+  renderWaitingUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiAnchor, xaiPlan, Date.now() + 180_000);
+  renderWarmHitUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiAnchor, xaiPlan, 128_000);
+  renderReanchorUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "prompt_cache_key changed", true);
+  renderProbeRetryUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "read=0 write=0", undefined, true);
+  renderFailureUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "probe miss", "read=0 write=0", undefined, true);
+  renderIdleUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "prefix too small", undefined, true);
+  const xaiUiText = xaiCalls
+    .flatMap((call) => (Array.isArray(call.value) ? call.value : [String(call.value)]))
+    .map(String)
+    .join(" ");
+  assert(xaiUiText.includes("xAI best-effort"), "xAI UI should label the best-effort policy");
+  assert(!xaiUiText.includes("xAI best-effort cache warm · xAI best-effort extension probe hit"), "xAI hit UI should avoid redundant policy labels");
 
   const capabilityCalls: Array<{ kind: "widget" | "status" | "notify"; value: unknown; level?: string }> = [];
   const capabilityCtx = {
