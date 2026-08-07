@@ -36,8 +36,10 @@ import {
   formatSavingsSummary,
   resolveModelPricing,
 } from "./savings.ts";
+import piWarmCache from "./index.ts";
 import { SessionWarmer } from "./warmer.ts";
 import {
+  renderCapabilityNotice,
   renderFailureUi,
   renderIdleUi,
   renderProbeRetryUi,
@@ -193,6 +195,14 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     provider: "anthropic",
     api: "anthropic-messages",
   } as any;
+  const assertReasoned = (capability: any, label: string): void => {
+    assert(typeof capability.reason === "string" && capability.reason.length > 0, `${label} needs a reason`);
+  };
+  const noModelCapability = resolveProviderCapability(undefined);
+  assert(noModelCapability.state === "unsupported", "no model should be unsupported");
+  assertReasoned(noModelCapability, "no model capability");
+  assert(!noModelCapability.automaticWarm && !noModelCapability.manualProbe, "no model must not probe");
+  assertReasoned(resolveProviderCapability(anthropic), "first-party Anthropic capability");
 
   const short = resolveStrategy(anthropic, { ...DEFAULT_CONFIG, anthropicTtl: "5m" });
   const shortInterval = short.intervalMs;
@@ -225,12 +235,47 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   } as any;
   assert(modelSupportsLongCacheRetention(noLong) === false, "explicit false disables long");
 
+  const wrongAnthropicEndpoint = {
+    ...anthropic,
+    baseUrl: "https://anthropic-proxy.example/v1",
+  } as any;
+  const wrongAnthropicCapability = resolveProviderCapability(wrongAnthropicEndpoint);
+  assert(wrongAnthropicCapability.state === "unsupported", "wrong Anthropic endpoint must fail closed");
+  assert(
+    wrongAnthropicCapability.reason.includes("baseUrl is not api.anthropic.com"),
+    "Anthropic endpoint rejection must identify the incorrect baseUrl",
+  );
+
   const openaiExplicit = {
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     compat: { supportsExplicitPromptCacheMode: true },
   } as any;
+  const oaiCapability = resolveProviderCapability(openaiExplicit);
+  assert(oaiCapability.state === "verified", "first-party OpenAI should be verified");
+  assertReasoned(oaiCapability, "first-party OpenAI capability");
+  const anthropicCompat = {
+    id: "claude-compatible",
+    provider: "proxy-anthropic",
+    api: "anthropic-messages",
+    compat: { cacheControlFormat: "anthropic" },
+  } as any;
+  const anthropicCompatCapability = resolveProviderCapability(anthropicCompat);
+  assert(anthropicCompatCapability.state === "verified", "registered Anthropic-compatible route should be verified");
+  assertReasoned(anthropicCompatCapability, "Anthropic-compatible capability");
+  const azure = {
+    id: "azure-gpt",
+    provider: "azure-openai-responses",
+    api: "azure-openai-responses",
+  } as any;
+  assert(resolveProviderCapability(azure).state === "verified", "registered Azure route should be verified");
+  const codex = {
+    id: "gpt-5.6",
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+  } as any;
+  assert(resolveProviderCapability(codex).state === "verified", "registered Codex route should be verified");
   const oai = resolveStrategy(openaiExplicit, DEFAULT_CONFIG);
   assert(oai.family === "openai-explicit", "compat flag selects explicit 30m family");
   const openAiInterval = oai.intervalMs;
@@ -244,6 +289,16 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   } as any;
   const old = resolveStrategy(openaiOld, DEFAULT_CONFIG);
   assert(old.family === "openai-implicit", "without compat flag, OpenAI stays implicit");
+  const wrongOpenAi = {
+    ...openaiOld,
+    baseUrl: "https://openai-proxy.example/v1",
+  } as any;
+  const wrongOpenAiCapability = resolveProviderCapability(wrongOpenAi);
+  assert(wrongOpenAiCapability.state === "unsupported", "wrong OpenAI endpoint must fail closed");
+  assert(
+    wrongOpenAiCapability.reason.includes("baseUrl is not api.openai.com"),
+    "OpenAI endpoint rejection must identify the incorrect baseUrl",
+  );
 
   const directXai = {
     id: "grok-4.5",
@@ -257,9 +312,11 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(xaiCapability.automaticWarm, "verified xAI should allow automatic warming");
   assert(!xaiCapability.manualProbe, "verified xAI does not need an unverified probe escape hatch");
   const insecureXai = { ...directXai, baseUrl: "http://api.x.ai/v1" } as any;
+  const insecureCapability = resolveProviderCapability(insecureXai);
+  assert(insecureCapability.state === "unsupported", "HTTP xAI routes must not receive first-party capability");
   assert(
-    resolveProviderCapability(insecureXai).state === "unsupported",
-    "HTTP xAI routes must not receive first-party capability",
+    insecureCapability.reason.includes("baseUrl is not api.x.ai"),
+    "xAI endpoint rejection must identify the incorrect baseUrl",
   );
   const missingBaseUrl = { ...directXai, baseUrl: undefined } as any;
   assert(
@@ -295,6 +352,19 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     xaiWithoutKeyStrategy.ttlLabel.includes("stable prompt-cache key"),
     "missing xAI cache key should explain why warming is inactive",
   );
+  const missingKeyCapability = resolveProviderCapability(directXai, xaiWithoutKey);
+  assert(missingKeyCapability.state === "unverified", "missing xAI cache key should be unverified");
+  assert(!missingKeyCapability.automaticWarm, "missing xAI cache key must disable automatic warming");
+  assert(!missingKeyCapability.manualProbe, "missing xAI cache key must not permit an unsafe manual probe");
+  assert(
+    missingKeyCapability.reason.includes("prompt_cache_key") &&
+      missingKeyCapability.reason.includes("automatic warming is disabled"),
+    "missing xAI cache key reason must be actionable",
+  );
+  assert(
+    resolveStrategy(directXai, DEFAULT_CONFIG, xaiWithoutKey).family === "unverified",
+    "missing xAI cache key must not receive a verified cache family",
+  );
   const xaiOverride = resolveStrategy(
     directXai,
     { ...DEFAULT_CONFIG, intervalMs: 75_000 },
@@ -304,7 +374,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   const otherXai = { ...directXai, id: "grok-4.3" } as any;
   const otherXaiCapability = resolveProviderCapability(otherXai);
   assert(otherXaiCapability.state === "unverified", "other xAI models remain unverified");
+  assert(!otherXaiCapability.automaticWarm, "unverified xAI routes must not auto-warm");
   assert(otherXaiCapability.manualProbe, "other xAI models retain manual probe access");
+  assert(
+    otherXaiCapability.reason.includes("automatic warming is disabled") &&
+      otherXaiCapability.reason.includes("/warm now"),
+    "manual-only xAI reason must explain the explicit probe path",
+  );
   assert(
     canManualProbe(otherXai, xaiPayload),
     "safe payload should allow a manual probe for an unverified xAI model",
@@ -322,6 +398,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   } as any;
   const openRouterCapability = resolveProviderCapability(openRouterXai);
   assert(openRouterCapability.state === "unsupported", "OpenRouter must not inherit xAI support");
+  assert(
+    openRouterCapability.reason.includes("OpenRouter routes do not inherit first-party cache strategies"),
+    "OpenRouter rejection must explain that first-party support is not inherited",
+  );
   assert(!openRouterCapability.manualProbe, "unsupported OpenRouter route must not probe");
   assert(!canManualProbe(openRouterXai, xaiPayload), "OpenRouter must reject manual probes");
   const openRouterStrategy = resolveStrategy(openRouterXai, DEFAULT_CONFIG);
@@ -345,9 +425,11 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     provider: "my-proxy",
     api: "openai-responses",
   } as any;
+  const unknownCapability = resolveProviderCapability(unknownResponses);
+  assert(unknownCapability.state === "unsupported", "unknown OpenAI-compatible routes must be unsupported");
   assert(
-    resolveProviderCapability(unknownResponses).state === "unsupported",
-    "unknown OpenAI-compatible routes must be unsupported",
+    unknownCapability.reason.includes("automatic and manual warming are disabled"),
+    "unknown route rejection must explain both disabled paths",
   );
   assert(!canManualProbe(unknownResponses, xaiPayload), "unknown routes must reject manual probes");
 
@@ -391,6 +473,18 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       capability: otherXaiCapability,
     }) === "n/a (unverified route)",
     "unverified route must not use the no-pricing message for savings",
+  );
+  assert(
+    formatSavingsSummary({
+      probeHitCount: 1,
+      probeMissCount: 0,
+      totalEstimatedSavedUsd: 10,
+      totalProbeCostUsd: 1,
+      savingsKnown: true,
+      pricingSource: "model",
+      capability: otherXaiCapability,
+    }) === "n/a (unverified route)",
+    "unverified route savings summary must stay n/a even with model pricing",
   );
 }
 
@@ -1189,7 +1283,121 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   warmer.dispose();
 }
 
-// 12) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
+// 12) Unverified routes remain manual-only: no timer, no verified savings, one safe probe.
+{
+  let calls = 0;
+  const notifications: Array<{ message: string; level: string }> = [];
+  const model = {
+    id: "grok-4.3",
+    provider: "xai",
+    api: "openai-responses",
+    baseUrl: "https://api.x.ai/v1",
+    cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
+  } as any;
+  const payload = {
+    model: model.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: "manual only" }] }],
+  };
+  const completeStub = async (_model: any, _context: any, options: any): Promise<any> => {
+    calls += 1;
+    options.onPayload?.(structuredClone(payload), model);
+    return {
+      stopReason: "stop",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 100,
+        cacheWrite: 0,
+        cost: { total: 0.01 },
+      },
+    };
+  };
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model,
+    hasUI: true,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "manual-only-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "xai-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
+  warmer.capturePayload(payload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  warmer.onAgentSettled(ctx);
+
+  const status = warmer.getStatusText();
+  assert(status.includes("capability=unverified"), "manual-only status should expose unverified capability");
+  assert(status.includes("autoWarm=off"), "manual-only status should show automatic warming off");
+  assert(status.includes("manualProbe=ready"), "safe manual-only payload should be ready");
+  assert(status.includes("nextDue=none"), "manual-only route must not arm a timer");
+
+  const result = await warmer.warmNow(ctx);
+  assert(result.ok && result.cacheHit, "manual-only route should allow an explicit safe probe");
+  assert(result.capabilityState === "unverified", "manual probe result should remain unverified");
+  assert(result.estimatedSavedUsd === 0, "manual-only probe must not claim savings");
+  assert(warmer.getSavingsSummaryText() === "n/a (unverified route)", "manual-only savings must stay n/a");
+  assert(calls === 1, "manual-only route should call the provider only for /warm now");
+  assert(
+    notifications.length === 0,
+    "SessionWarmer must leave the manual-only warning to the /warm now command",
+  );
+  warmer.dispose();
+}
+
+// 13) /warm now owns one manual-only warning and does not duplicate it.
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  let warmHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+  const pi = {
+    registerFlag: () => undefined,
+    getFlag: () => "true",
+    on: () => undefined,
+    registerCommand: (_name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => {
+      warmHandler = command.handler;
+    },
+  } as any;
+  piWarmCache(pi);
+  assert(warmHandler !== undefined, "warm command should be registered");
+  const ctx = {
+    model: {
+      id: "grok-4.3",
+      provider: "xai",
+      api: "openai-responses",
+      baseUrl: "https://api.x.ai/v1",
+    },
+    hasUI: true,
+    isIdle: () => true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+  } as any;
+  await warmHandler!("now", ctx);
+  assert(notifications.length === 1, "manual-only /warm now should emit exactly one warning");
+  assert(notifications[0]!.level === "warning", "manual-only /warm now notice should be warning-level");
+  assert(
+    notifications[0]!.message.includes("automatic warming is disabled") &&
+      notifications[0]!.message.includes("manual-only") &&
+      notifications[0]!.message.includes("n/a (unverified route)"),
+    "manual-only /warm now warning should include the complete UX guidance",
+  );
+}
+
+// 14) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
 {
   const calls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
   const ui = {
@@ -1247,6 +1455,41 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     statuses.some((status) => /warm [0-9.]+m · 2\/2 · ~128k/.test(status)),
     "healthy status should show cadence, probe ratio, and prompt size",
   );
+
+  const capabilityCalls: Array<{ kind: "widget" | "status" | "notify"; value: unknown; level?: string }> = [];
+  const capabilityCtx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, value: unknown) => capabilityCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value: unknown) => capabilityCalls.push({ kind: "status", value }),
+      notify: (value: string, level: string) => capabilityCalls.push({ kind: "notify", value, level }),
+    },
+  } as any;
+  renderCapabilityNotice(capabilityCtx, {
+    state: "unverified",
+    reason: "direct xAI route has no verified automatic keepalive strategy",
+    automaticWarm: false,
+    manualProbe: true,
+  });
+  const manualNotice = capabilityCalls.find((call) => call.kind === "notify");
+  assert(String(manualNotice?.value).includes("manual-only route"), "manual-only notice should name its mode");
+  assert(String(manualNotice?.value).includes("Automatic warming is disabled"), "manual-only notice should disable timers");
+  assert(String(manualNotice?.value).includes("n/a (unverified route)"), "manual-only notice should disable savings claims");
+  assert(manualNotice?.level === "warning", "manual-only notice should be warning-level");
+  assert(
+    capabilityCalls.filter((call) => call.kind === "widget").at(-1)?.value === undefined &&
+      capabilityCalls.filter((call) => call.kind === "status").at(-1)?.value === undefined,
+    "capability rejection should clear active UI",
+  );
+  renderCapabilityNotice(capabilityCtx, {
+    state: "unsupported",
+    reason: "OpenRouter routes do not inherit first-party cache strategies",
+    automaticWarm: false,
+    manualProbe: false,
+  });
+  const unsupportedNotice = capabilityCalls.filter((call) => call.kind === "notify").at(-1);
+  assert(unsupportedNotice?.level === "info", "unsupported route notice should not be warning-level noise");
 
   const hiddenCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
   const hiddenCtx = {

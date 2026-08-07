@@ -176,7 +176,7 @@ export function resolveCacheFamily(
   anthropicTtl: AnthropicTtlMode,
   payload?: unknown,
 ): CacheFamily {
-  const capability = resolveProviderCapability(model);
+  const capability = resolveProviderCapability(model, payload);
   if (capability.state === "unverified") return "unverified";
   if (capability.state === "unsupported" || !model) return "unsupported";
   return resolveVerifiedCacheFamily(model, anthropicTtl, payload);
@@ -203,7 +203,7 @@ export function resolveStrategy(
   config: WarmCacheConfig,
   payload?: unknown,
 ): StrategyResolution {
-  const capability = resolveProviderCapability(model);
+  const capability = resolveProviderCapability(model, payload);
   const family = resolveCacheFamily(model, config.anthropicTtl, payload);
   const cacheRetention = resolveCacheRetention(family);
 
@@ -215,7 +215,7 @@ export function resolveStrategy(
       intervalMs: null,
       ttlLabel:
         capability.state === "unverified"
-          ? "unverified route (manual probe only)"
+          ? capability.reason
           : "unsupported route",
       waitLabel: null,
       automaticWarm: false,

@@ -15,11 +15,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseConfigArgs } from "./config.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 import { SessionWarmer } from "./warmer.ts";
-import { clearWarmUi } from "./ui.ts";
+import { clearWarmUi, renderCapabilityNotice } from "./ui.ts";
 
 export default function piWarmCache(pi: ExtensionAPI) {
   const warmer = new SessionWarmer(pi);
   let config = { ...DEFAULT_CONFIG };
+  let lastCapabilityNoticeKey: string | null = null;
 
   // Optional CLI: pi --warm-cache / pi --warm-cache=off
   pi.registerFlag("warm-cache", {
@@ -53,19 +54,28 @@ export default function piWarmCache(pi: ExtensionAPI) {
     // Payload anchors are never restored across resume (turn-specific).
     // Stats persistence can be added later via appendEntry.
 
-    if (event.reason === "startup" && config.enabled && ctx.hasUI) {
-      if (warmer.getCapability().state === "verified") {
-        ctx.ui.setStatus(
-          "pi-warm-cache",
-          ctx.ui.theme.fg("dim", "warm ready · waiting for first cached turn"),
-        );
+    if (config.enabled && ctx.hasUI) {
+      const capability = warmer.getCapability();
+      if (capability.state === "verified") {
+        lastCapabilityNoticeKey = null;
+        if (event.reason === "startup") {
+          ctx.ui.setStatus(
+            "pi-warm-cache",
+            ctx.ui.theme.fg("dim", "warm ready · waiting for first cached turn"),
+          );
+        }
       } else {
-        clearWarmUi(ctx);
+        const noticeKey = `${capability.state}:${capability.reason}:${capability.manualProbe}`;
+        if (noticeKey !== lastCapabilityNoticeKey) {
+          renderCapabilityNotice(ctx, capability);
+          lastCapabilityNoticeKey = noticeKey;
+        }
       }
     }
   });
 
   pi.on("session_shutdown", async () => {
+    lastCapabilityNoticeKey = null;
     warmer.dispose();
   });
 
@@ -157,6 +167,10 @@ export default function piWarmCache(pi: ExtensionAPI) {
           `intervalMs=${result.intervalMs ?? "none"}`;
         const cacheKey = `cacheKey=${result.cacheKeyFingerprint ?? "none"}`;
         const retry = `retry=${result.retryState ?? "none"}`;
+        const manualOnlyWarning =
+          result.capabilityState === "unverified"
+            ? "WARNING: automatic warming is disabled for this unverified route; /warm now is manual-only and savings are n/a (unverified route). "
+            : "";
         const savings =
           result.capabilityState === "unverified"
             ? "savingsSummary=n/a (unverified route)"
@@ -169,13 +183,16 @@ export default function piWarmCache(pi: ExtensionAPI) {
             result.unavailable || result.capabilityState === "unsupported"
               ? "Probe unavailable"
               : "Probe failed";
-          ctx.ui.notify(`${failureLabel}: ${result.error} (${diagnostics})`, "error");
+          ctx.ui.notify(
+            `${manualOnlyWarning}${failureLabel}: ${result.error} (${diagnostics})`,
+            result.capabilityState === "unverified" ? "warning" : "error",
+          );
           return;
         }
         if (result.capabilityState === "unverified") {
           ctx.ui.notify(
-            `Unverified extension probe ${result.cacheHit ? "hit" : "miss"} (${diagnostics}). No active keepalive or verified savings claim.`,
-            result.cacheHit ? "info" : "warning",
+            `${manualOnlyWarning}Unverified manual probe ${result.cacheHit ? "hit" : "miss"} (${diagnostics}). No active keepalive or verified savings claim.`,
+            "warning",
           );
           return;
         }
