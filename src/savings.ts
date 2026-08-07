@@ -87,6 +87,42 @@ export function formatSavingsLabel(
   return `est. ${amount} saved`;
 }
 
+export type SavingsSummaryInput = Pick<
+  CacheAnchor,
+  | "probeHitCount"
+  | "probeMissCount"
+  | "totalEstimatedSavedUsd"
+  | "totalProbeCostUsd"
+  | "savingsKnown"
+  | "pricingSource"
+>;
+
+/**
+ * Stable cumulative savings text for the /warm status and command output.
+ * Monetary values stay n/a when the active model has no usable pricing.
+ */
+export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
+  const amount = (value: number): string =>
+    anchor.savingsKnown ? formatUsd(value) : "n/a";
+  const net = anchor.totalEstimatedSavedUsd - anchor.totalProbeCostUsd;
+
+  return [
+    `probeHits=${anchor.probeHitCount}`,
+    `probeMisses=${anchor.probeMissCount}`,
+    `totalEstimatedSaved=${amount(anchor.totalEstimatedSavedUsd)}`,
+    `totalProbeCost=${amount(anchor.totalProbeCostUsd)}`,
+    `net=${anchor.savingsKnown ? formatUsd(net) : "n/a"}`,
+    `pricingSource=${anchor.pricingSource}`,
+  ].join(" ");
+}
+
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value)) return "n/a";
+  const absolute = Math.abs(value);
+  const digits = absolute < 0.01 ? 4 : 2;
+  return `${value < 0 ? "-" : ""}$${absolute.toFixed(digits)}`;
+}
+
 export function buildWarmResult(args: {
   fingerprint: string;
   usage?: {
@@ -136,6 +172,7 @@ export function buildWarmResult(args: {
     output,
     costUsd,
     estimatedSavedUsd:
+      cacheHit &&
       args.anchor.savingsKnown &&
       (args.anchor.capability === undefined || args.anchor.capability.state === "verified")
         ? estimateSavedUsd(cacheRead, args.anchor.inputPricePerMTok, args.anchor.cacheReadPricePerMTok)

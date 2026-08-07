@@ -127,9 +127,13 @@ export default function piWarmCache(pi: ExtensionAPI) {
 
   pi.registerCommand("warm", {
     description:
-      "Control prompt-cache warming. Usage: /warm [on|off|status|now|resume|codex-on|codex-off|5m|1h|auto|log|nolog|interval=4m|max=3]",
+      "Control prompt-cache warming. Usage: /warm [on|off|status|savings|now|resume|codex-on|codex-off|5m|1h|auto|log|nolog|interval=4m|max=3]",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
+      if (trimmed.toLowerCase() === "savings") {
+        ctx.ui.notify(warmer.getSavingsSummaryText(), "info");
+        return;
+      }
       if (!trimmed || trimmed === "status") {
         ctx.ui.notify(warmer.getStatusText(), "info");
         return;
