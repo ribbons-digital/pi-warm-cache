@@ -292,6 +292,7 @@ function reanchorCause(reason: string): string {
   if (lower.includes("model") || lower.includes("thinking")) {
     return "after model or thinking-level change";
   }
+  if (lower.includes("prompt_cache_key")) return "after cache-key change";
   if (lower.includes("payload") || lower.includes("prefix") || lower.includes("drift")) {
     return "after prefix drift";
   }

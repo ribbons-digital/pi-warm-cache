@@ -358,6 +358,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(!isStablePromptCacheKey(42), "non-string key must not qualify as stable");
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "   " }), "blank xAI key must be rejected");
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "xai\nkey" }), "control characters must be rejected");
+  assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "key\u009Bvalue" }), "C1 control characters (U+0080-U+009F) must be rejected");
   assert(getPromptCacheKey(xaiPayload, "openai-completions") === null, "wrong API must not expose a Responses key");
   assert(!canManualProbe(directXai, xaiPayload), "verified xAI should not use the unverified probe path");
   const xaiWithoutKey = { ...xaiPayload, prompt_cache_key: undefined };

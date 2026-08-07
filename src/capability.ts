@@ -73,7 +73,7 @@ export function isStablePromptCacheKey(value: unknown): value is string {
     typeof value === "string" &&
     value.length > 0 &&
     value === value.trim() &&
-    !/[\u0000-\u001f\u007f]/.test(value)
+    !/[\u0000-\u001f\u007f-\u009f]/.test(value)
   );
 }
 
