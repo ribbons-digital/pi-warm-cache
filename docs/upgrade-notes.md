@@ -72,7 +72,9 @@ The first line describes the broad state and may be one of the following forms:
 - `inactive capability=<state>` means the route is unsupported or unverified.
 - `idle (no anchor)` means the extension is waiting for a real payload or a new anchor.
 - `disabled` means the master switch is off.
-- `payload=none (needs re-anchor)` means a hard invalidation occurred and no old payload can be reused.
+
+When a hard invalidation is waiting for a new payload, the second line is `payload=none (needs re-anchor)`.
+The old payload cannot be reused in that state.
 
 The following fields form the stable diagnostic block.
 
