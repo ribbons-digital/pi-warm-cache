@@ -73,6 +73,13 @@ const globalGate = new WarmConcurrencyGate();
 
 type CompleteRequest = typeof complete;
 
+type PendingReanchor = {
+  reason: string;
+  oldPayloadFingerprint: string | null;
+  oldCacheKeyFingerprint: string;
+  invalidatedAt: number;
+};
+
 export type RescheduleOptions = {
   /** Explicit delay. When set, skips TTL-from-lastActivity math. */
   delayMs?: number;
@@ -92,6 +99,10 @@ export class SessionWarmer {
   private nextDueAt = 0;
   private anchor: CacheAnchor | null = null;
   private lifecycleState: WarmLifecycleState = "idle";
+  /** Links the next fresh real-turn capture to the invalidation that dropped the old anchor. */
+  private pendingReanchor: PendingReanchor | null = null;
+  /** Capture time used to avoid adding settlement latency after a hard re-anchor. */
+  private reanchorCaptureAt: number | null = null;
   /** Lifecycle state captured before entering "disabled", for restore on re-enable. */
   private stateBeforeDisabled: WarmLifecycleState | null = null;
   /** Retained probe diagnostics after a drift invalidation, never used for replay. */
@@ -280,6 +291,8 @@ export class SessionWarmer {
     this.anchor = null;
     this.lastInvalidatedProbe = null;
     this.lastPayload = null;
+    this.pendingReanchor = null;
+    this.reanchorCaptureAt = null;
     this.deferredProbe = null;
     this.capability = null;
     this.realTurnBoundaryReason = "session ended";
@@ -298,13 +311,30 @@ export class SessionWarmer {
     const previousCacheKeyFingerprint =
       previousAnchor?.cacheKeyFingerprint ??
       getPromptCacheKeyFingerprint(previousPayload, ctx.model?.api);
-    const previousPayloadFingerprint = previousAnchor?.payloadFingerprint;
+    const previousPayloadFingerprint =
+      previousAnchor?.payloadFingerprint ??
+      (previousPayload ? stableFingerprint(previousPayload) : null);
+    const priorPendingReanchor = this.pendingReanchor;
+    const invalidatedAt = Date.now();
+    const oldCacheKeyFingerprint =
+      previousCacheKeyFingerprint !== "none"
+        ? previousCacheKeyFingerprint
+        : (priorPendingReanchor?.oldCacheKeyFingerprint ?? "none");
+    const pendingReanchor: PendingReanchor = {
+      reason,
+      oldPayloadFingerprint:
+        previousPayloadFingerprint ?? priorPendingReanchor?.oldPayloadFingerprint ?? null,
+      oldCacheKeyFingerprint,
+      invalidatedAt,
+    };
 
     this.ctx = ctx;
     this.capability = resolveProviderCapability(ctx.model);
     this.lastInvalidatedProbe = preserveProbe ? (this.anchor?.latestProbe ?? null) : null;
     this.anchor = null;
     this.lastPayload = null;
+    this.pendingReanchor = pendingReanchor;
+    this.reanchorCaptureAt = null;
     this.deferredProbe = null;
     this.realTurnBoundaryReason = reason;
     this.realTurnContinuity = false;
@@ -321,9 +351,12 @@ export class SessionWarmer {
       api: ctx.model?.api,
       capabilityState: this.capability.state,
       capabilityReason: this.capability.reason,
-      cacheKeyFingerprint: previousCacheKeyFingerprint,
-      payloadFingerprint: previousPayloadFingerprint,
+      cacheKeyFingerprint: oldCacheKeyFingerprint,
+      payloadFingerprint: pendingReanchor.oldPayloadFingerprint,
+      oldCacheKeyFingerprint,
+      oldPayloadFingerprint: pendingReanchor.oldPayloadFingerprint,
       reason,
+      invalidatedAt,
     });
   }
 
@@ -354,6 +387,8 @@ export class SessionWarmer {
     this.ctx = ctx;
     this.logFile = warmLogPath(ctx.cwd);
     this.deferredProbe = null;
+    const reanchorWasPending =
+      this.lifecycleState === "awaiting-reanchor" || this.pendingReanchor !== null;
     const payloadFingerprint = stableFingerprint(payload);
     const model = ctx.model;
     const cacheKeyFingerprint = getPromptCacheKeyFingerprint(payload, model?.api);
@@ -363,6 +398,8 @@ export class SessionWarmer {
       this.anchor = null;
       this.lastInvalidatedProbe = null;
       this.lastPayload = null;
+      this.pendingReanchor = null;
+      this.reanchorCaptureAt = null;
       this.lifecycleState = this.config.enabled ? "blocked" : "disabled";
       this.realTurnBoundaryReason = this.capability.reason;
       this.realTurnContinuity = false;
@@ -451,6 +488,8 @@ export class SessionWarmer {
     this.lastInvalidatedProbe = null;
     this.lastPayload = structuredClone(payload);
     this.plan = resolveStrategy(model, this.config, this.lastPayload);
+    const reanchorTransition = this.pendingReanchor;
+    const capturedAt = Date.now();
     const manualProbeAvailable =
       this.capability.manualProbe && isSafeReplayPayload(this.lastPayload, model.api);
 
@@ -493,7 +532,7 @@ export class SessionWarmer {
       inputPricePerMTok: pricing.inputPricePerMTok,
       savingsKnown,
       pricingSource: pricing.source,
-      lastActivityAt: Date.now(),
+      lastActivityAt: capturedAt,
       // Keep the latest probe alongside a continuing real-turn observation so
       // /warm can show whether that probe preceded the next real turn. A
       // changed prefix starts a new anchor and must not inherit old evidence.
@@ -515,6 +554,9 @@ export class SessionWarmer {
       : this.autoWarmBlockReason
         ? "blocked"
         : "anchored";
+    if (reanchorWasPending || reanchorTransition || prefixChanged) {
+      this.reanchorCaptureAt = capturedAt;
+    }
     this.realTurnBoundaryReason = "awaiting real-turn usage";
     this.realTurnContinuity = comparableContinuation;
 
@@ -536,6 +578,11 @@ export class SessionWarmer {
       previousCacheKeyFingerprint,
       cacheKeyChanged: xaiCacheKeyChanged,
       prefixChanged,
+      reanchor: Boolean(reanchorTransition),
+      oldPayloadFingerprint: reanchorTransition?.oldPayloadFingerprint,
+      newPayloadFingerprint: reanchorTransition ? payloadFingerprint : undefined,
+      oldCacheKeyFingerprint: reanchorTransition?.oldCacheKeyFingerprint,
+      newCacheKeyFingerprint: reanchorTransition ? cacheKeyFingerprint : undefined,
       realTurnContinuity: comparableContinuation ? "comparable" : "unknown",
       realTurnContinuityReason: continuityReason,
       modelCost: model.cost ?? null,
@@ -544,6 +591,31 @@ export class SessionWarmer {
       inputPricePerMTok: pricing.inputPricePerMTok,
       cacheReadPricePerMTok: pricing.cacheReadPricePerMTok,
     });
+
+    if (reanchorTransition) {
+      this.log({
+        event: "anchor_reanchored",
+        source: "real_turn",
+        sessionId,
+        provider: model.provider,
+        modelId: model.id,
+        api: model.api,
+        family: this.plan.family,
+        capabilityState: this.capability.state,
+        capabilityReason: this.capability.reason,
+        reason: reanchorTransition.reason,
+        invalidatedAt: new Date(reanchorTransition.invalidatedAt).toISOString(),
+        reanchoredAt: new Date(capturedAt).toISOString(),
+        reanchorDelayMs: Math.max(0, capturedAt - reanchorTransition.invalidatedAt),
+        oldPayloadFingerprint: reanchorTransition.oldPayloadFingerprint,
+        newPayloadFingerprint: payloadFingerprint,
+        oldCacheKeyFingerprint: reanchorTransition.oldCacheKeyFingerprint,
+        newCacheKeyFingerprint: cacheKeyFingerprint,
+        automaticWarm: this.capability.automaticWarm,
+        manualProbe: this.capability.manualProbe,
+      });
+      this.pendingReanchor = null;
+    }
 
     if (this.capability.state !== "verified") {
       this.clearTimers();
@@ -668,7 +740,8 @@ export class SessionWarmer {
       this.showIdle(ctx, "disabled");
       return;
     }
-    if (this.anchor) {
+    const preservingReanchorCaptureTime = this.reanchorCaptureAt !== null;
+    if (this.anchor && !preservingReanchorCaptureTime) {
       this.anchor.lastActivityAt = Date.now();
     }
     this.log({
@@ -692,8 +765,10 @@ export class SessionWarmer {
       retryState: this.anchor
         ? `${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
         : undefined,
+      scheduleFromCapture: preservingReanchorCaptureTime,
     });
-    this.reschedule();
+    this.reschedule({ reason: preservingReanchorCaptureTime ? "fresh re-anchor" : undefined });
+    this.reanchorCaptureAt = null;
   }
 
   onModelChange(ctx: ExtensionContext): void {
@@ -968,6 +1043,7 @@ export class SessionWarmer {
     if (this.uiTimer) clearInterval(this.uiTimer);
     this.timer = null;
     this.uiTimer = null;
+    this.nextDueAt = 0;
   }
 
   private stop(reason: string): void {
