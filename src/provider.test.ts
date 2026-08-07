@@ -45,6 +45,7 @@ import { SessionWarmer } from "./warmer.ts";
 import {
   renderCapabilityNotice,
   renderFailureUi,
+  renderManualOnlyUi,
   renderIdleUi,
   renderProbeRetryUi,
   renderReanchorUi,
@@ -411,30 +412,94 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     provider: "openrouter",
     api: "openai-responses",
     baseUrl: "https://openrouter.ai/api/v1",
+    compat: { sessionAffinityFormat: "openrouter" },
   } as any;
   const openRouterCapability = resolveProviderCapability(openRouterXai);
-  assert(openRouterCapability.state === "unsupported", "OpenRouter must not inherit xAI support");
+  assert(openRouterCapability.state === "unverified", "OpenRouter should use the manual-only tier");
+  assert(!openRouterCapability.automaticWarm, "OpenRouter manual-only routes must never auto-warm");
+  assert(openRouterCapability.manualProbe, "registered OpenRouter routes should permit manual probes");
   assert(
-    openRouterCapability.reason.includes("OpenRouter routes do not inherit first-party cache strategies"),
-    "OpenRouter rejection must explain that first-party support is not inherited",
+    openRouterCapability.reason.includes("manual-only") &&
+      openRouterCapability.reason.includes("savings are n/a"),
+    "OpenRouter manual-only reason must explain the safety and savings limits",
   );
-  assert(!openRouterCapability.manualProbe, "unsupported OpenRouter route must not probe");
-  assert(!canManualProbe(openRouterXai, xaiPayload), "OpenRouter must reject manual probes");
-  const openRouterStrategy = resolveStrategy(openRouterXai, DEFAULT_CONFIG);
-  assert(!openRouterStrategy.automaticWarm, "unsupported OpenRouter route must not auto-warm");
-  assert(openRouterStrategy.intervalMs === null, "unsupported route must not receive a timer");
+  assert(canManualProbe(openRouterXai, xaiPayload), "safe OpenRouter payload should permit a manual probe");
+  const openRouterStrategy = resolveStrategy(openRouterXai, DEFAULT_CONFIG, xaiPayload);
+  assert(openRouterStrategy.family === "unverified", "OpenRouter must not inherit an xAI or OpenAI family");
+  assert(!openRouterStrategy.automaticWarm, "manual-only OpenRouter route must not auto-warm");
+  assert(openRouterStrategy.intervalMs === null, "manual-only OpenRouter route must not receive a timer");
+
+  const openRouterWrongEndpoint = {
+    ...openRouterXai,
+    baseUrl: "https://openrouter-proxy.example/v1",
+  } as any;
+  assert(
+    resolveProviderCapability(openRouterWrongEndpoint).state === "unsupported",
+    "OpenRouter routes with a different endpoint must fail closed",
+  );
+  const openRouterWrongRouting = {
+    ...openRouterXai,
+    compat: { sessionAffinityFormat: "openai" },
+  } as any;
+  assert(
+    resolveProviderCapability(openRouterWrongRouting).state === "unsupported",
+    "OpenRouter routes with non-OpenRouter routing metadata must fail closed",
+  );
+
+  const openRouterMissingMetadata = {
+    id: "x-ai/grok-4.5",
+    provider: "openrouter",
+    api: "openai-responses",
+    baseUrl: "https://openrouter.ai/api/v1",
+  } as any;
+  assert(
+    resolveProviderCapability(openRouterMissingMetadata).state === "unsupported",
+    "OpenRouter routes with missing session-affinity metadata must fail closed",
+  );
+  assert(
+    !resolveProviderCapability(openRouterMissingMetadata).manualProbe,
+    "OpenRouter routes with missing metadata must not enable manualProbe",
+  );
 
   const openCodeGrok = {
     id: "grok-4.5",
     provider: "opencode-go",
     api: "openai-responses",
     baseUrl: "https://opencode.ai/zen/go/v1",
+    compat: { sessionAffinityFormat: "openai" },
+  } as any;
+  const openCodeCapability = resolveProviderCapability(openCodeGrok);
+  assert(openCodeCapability.state === "unverified", "OpenCode Go should use the manual-only tier");
+  assert(!openCodeCapability.automaticWarm, "OpenCode Go manual-only routes must never auto-warm");
+  assert(openCodeCapability.manualProbe, "registered OpenCode Go routes should permit manual probes");
+  assert(canManualProbe(openCodeGrok, xaiPayload), "safe OpenCode Go payload should permit a manual probe");
+  const openCodeStrategy = resolveStrategy(openCodeGrok, DEFAULT_CONFIG, xaiPayload);
+  assert(openCodeStrategy.family === "unverified", "OpenCode Go must not inherit an OpenAI family");
+  assert(openCodeStrategy.intervalMs === null, "manual-only OpenCode Go route must not receive a timer");
+
+  const openCodeWrongRouting = {
+    ...openCodeGrok,
+    compat: { sessionAffinityFormat: "openrouter" },
   } as any;
   assert(
-    resolveProviderCapability(openCodeGrok).state === "unsupported",
-    "OpenCode Go must not inherit OpenAI support",
+    resolveProviderCapability(openCodeWrongRouting).state === "unsupported",
+    "OpenCode Go routes with OpenRouter routing metadata must fail closed",
   );
-  assert(!canManualProbe(openCodeGrok, xaiPayload), "OpenCode Go must reject manual probes");
+
+  const openCodeMissingMetadata = {
+    id: "grok-4.5",
+    provider: "opencode-go",
+    api: "openai-responses",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  assert(
+    resolveProviderCapability(openCodeMissingMetadata).state === "unsupported",
+    "OpenCode Go routes with missing session-affinity metadata must fail closed",
+  );
+  assert(
+    !resolveProviderCapability(openCodeMissingMetadata).manualProbe,
+    "OpenCode Go routes with missing metadata must not enable manualProbe",
+  );
 
   const unknownResponses = {
     id: "gpt-compatible",
@@ -1348,11 +1413,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       },
     };
   };
+  const manualUiCalls: Array<{ kind: "status" | "widget"; value: unknown }> = [];
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
     notify: (message: string, level: string) => notifications.push({ message, level }),
-    setStatus: () => undefined,
-    setWidget: () => undefined,
+    setStatus: (_id: string, value: unknown) => manualUiCalls.push({ kind: "status", value }),
+    setWidget: (_id: string, value: unknown) => manualUiCalls.push({ kind: "widget", value }),
   };
   const ctx = {
     cwd: process.cwd(),
@@ -1388,6 +1454,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(
     notifications.length === 0,
     "SessionWarmer must leave the manual-only warning to the /warm now command",
+  );
+
+  warmer.setConfig({ ...warmer.getConfig(), enabled: false });
+  assert(
+    manualUiCalls.at(-1)?.kind === "status" && manualUiCalls.at(-1)?.value === undefined &&
+      manualUiCalls.at(-2)?.kind === "widget" && manualUiCalls.at(-2)?.value === undefined,
+    "disabling a manual-only route must clear its widget and status",
   );
   warmer.dispose();
 }
@@ -1541,10 +1614,33 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(String(manualNotice?.value).includes("Automatic warming is disabled"), "manual-only notice should disable timers");
   assert(String(manualNotice?.value).includes("n/a (unverified route)"), "manual-only notice should disable savings claims");
   assert(manualNotice?.level === "warning", "manual-only notice should be warning-level");
+  const manualWidget = capabilityCalls.filter((call) => call.kind === "widget").at(-1)?.value;
+  const manualStatus = capabilityCalls.filter((call) => call.kind === "status").at(-1)?.value;
   assert(
-    capabilityCalls.filter((call) => call.kind === "widget").at(-1)?.value === undefined &&
-      capabilityCalls.filter((call) => call.kind === "status").at(-1)?.value === undefined,
-    "capability rejection should clear active UI",
+    Array.isArray(manualWidget) &&
+      manualWidget.some((line) => String(line).includes("MANUAL ONLY")),
+    "manual-only capability should show a warning widget badge",
+  );
+  assert(
+    String(manualStatus).includes("manual only"),
+    "manual-only capability should show a warning status badge",
+  );
+  renderManualOnlyUi(
+    capabilityCtx,
+    { ...DEFAULT_CONFIG, showWidget: true },
+    {
+      state: "unverified",
+      reason: "OpenRouter route is explicitly registered for manual-only probing",
+      automaticWarm: false,
+      manualProbe: true,
+    },
+    true,
+  );
+  assert(
+    String(capabilityCalls.filter((call) => call.kind === "status").at(-1)?.value).includes(
+      "/warm now ready",
+    ),
+    "manual-only status should identify a ready one-shot probe",
   );
   renderCapabilityNotice(capabilityCtx, {
     state: "unsupported",

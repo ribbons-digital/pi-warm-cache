@@ -17,16 +17,61 @@ export function clearWarmUi(ctx: ExtensionContext): void {
   ctx.ui.setStatus(STATUS_ID, undefined);
 }
 
-/** Explain a rejected route without leaving the active warming surface visible. */
+/** Keep a manual-only route visible without implying that a timer is active. */
+export function renderManualOnlyUi(
+  ctx: ExtensionContext,
+  config: Pick<WarmCacheConfig, "showWidget">,
+  capability: ProviderCapability,
+  probeReady = false,
+): void {
+  if (!ctx.hasUI) return;
+
+  const xai = /xai/i.test(capability.reason);
+  const routeLabel = xai
+    ? "xAI best-effort"
+    : capability.reason.startsWith("OpenRouter")
+      ? "OpenRouter"
+      : capability.reason.startsWith("OpenCode Go")
+        ? "OpenCode Go"
+        : "Cache-warm";
+  const probeLine = probeReady
+    ? "Safe /warm now probe ready · savings n/a (unverified route)"
+    : "Waiting for a safe captured payload · savings n/a (unverified route)";
+  const lines = [
+    ctx.ui.theme.fg("warning", `⚠ ${routeLabel} · MANUAL ONLY`),
+    ctx.ui.theme.fg("dim", "Automatic warming disabled · no timer will start"),
+    ctx.ui.theme.fg("dim", probeLine),
+  ];
+
+  if (config.showWidget) {
+    ctx.ui.setWidget(WIDGET_ID, lines);
+  } else {
+    ctx.ui.setWidget(WIDGET_ID, undefined);
+  }
+  ctx.ui.setStatus(
+    STATUS_ID,
+    ctx.ui.theme.fg(
+      "warning",
+      `${xai ? "xAI best-effort " : ""}warm · manual only${probeReady ? " · /warm now ready" : " · waiting for payload"}`,
+    ),
+  );
+}
+
+/** Explain a rejected route and keep an eligible manual-only route visible. */
 export function renderCapabilityNotice(
   ctx: ExtensionContext,
   capability: ProviderCapability,
+  config: Pick<WarmCacheConfig, "showWidget"> = { showWidget: true },
 ): void {
   if (!ctx.hasUI) return;
-  clearWarmUi(ctx);
   const xai = /xai/i.test(capability.reason);
   const routeLabel = xai ? "xAI best-effort" : "pi-warm-cache";
   if (capability.state === "unverified") {
+    if (capability.manualProbe) {
+      renderManualOnlyUi(ctx, config, capability);
+    } else {
+      clearWarmUi(ctx);
+    }
     const mode = capability.manualProbe ? "manual-only route" : "unverified route";
     const probe = capability.manualProbe
       ? "Use /warm now for one safe captured-payload probe."
@@ -37,6 +82,7 @@ export function renderCapabilityNotice(
     );
     return;
   }
+  clearWarmUi(ctx);
   ctx.ui.notify(
     `${xai ? "xAI best-effort inactive" : "pi-warm-cache inactive"} (unsupported route): ${capability.reason}. Automatic and manual warming are disabled.`,
     "info",
