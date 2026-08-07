@@ -42,6 +42,8 @@ export function renderWaitingUi(
 
   if (config.showWidget) {
     ctx.ui.setWidget(WIDGET_ID, lines);
+  } else {
+    ctx.ui.setWidget(WIDGET_ID, undefined);
   }
   ctx.ui.setStatus(
     STATUS_ID,
@@ -72,6 +74,8 @@ export function renderWarmHitUi(
 
   if (config.showWidget) {
     ctx.ui.setWidget(WIDGET_ID, lines);
+  } else {
+    ctx.ui.setWidget(WIDGET_ID, undefined);
   }
   ctx.ui.setStatus(
     STATUS_ID,
@@ -102,6 +106,8 @@ export function renderIdleUi(
       lines.push(ctx.ui.theme.fg("dim", compactUiText(detail)));
     }
     ctx.ui.setWidget(WIDGET_ID, lines.slice(0, 2));
+  } else {
+    ctx.ui.setWidget(WIDGET_ID, undefined);
   }
 
   ctx.ui.setStatus(
@@ -127,6 +133,8 @@ export function renderReanchorUi(
       ctx.ui.theme.fg("accent", `⚡ Cache-warm paused · re-anchoring ${cause}`),
       ctx.ui.theme.fg("dim", "Waiting for next real turn. Extension probes paused."),
     ]);
+  } else {
+    ctx.ui.setWidget(WIDGET_ID, undefined);
   }
   ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "warm · re-anchoring"));
 }
@@ -152,6 +160,8 @@ export function renderProbeRetryUi(
       ctx.ui.theme.fg("warning", "⚡ Cache-warm retry · extension probe transient miss"),
       ctx.ui.theme.fg("dim", `${compactUiText(detail)} · ${retryLine}`),
     ]);
+  } else {
+    ctx.ui.setWidget(WIDGET_ID, undefined);
   }
   ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "warm · retrying probe"));
 }
@@ -188,6 +198,8 @@ export function renderFailureUi(
     }
     lines.push(ctx.ui.theme.fg("dim", retryLine));
     ctx.ui.setWidget(WIDGET_ID, lines.slice(0, 3));
+  } else {
+    ctx.ui.setWidget(WIDGET_ID, undefined);
   }
 
   ctx.ui.setStatus(

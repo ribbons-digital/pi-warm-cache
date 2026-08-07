@@ -1264,9 +1264,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   renderProbeRetryUi(hiddenCtx, hiddenConfig, "read=0 write=0");
   renderFailureUi(hiddenCtx, hiddenConfig, "probe miss");
   renderIdleUi(hiddenCtx, hiddenConfig, "disabled");
+  const hiddenWidgets = hiddenCalls.filter((call) => call.kind === "widget");
   assert(
-    hiddenCalls.every((call) => call.kind !== "widget"),
-    "showWidget=false must not emit widget output for any UI state",
+    hiddenWidgets.length === 6 && hiddenWidgets.every((call) => call.value === undefined),
+    "showWidget=false must clear widget output for every UI state",
   );
   assert(
     hiddenCalls.filter((call) => call.kind === "status").length === 6,
