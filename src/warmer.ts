@@ -29,6 +29,7 @@ import {
   renderFailureUi,
   renderIdleUi,
   renderProbeRetryUi,
+  renderReanchorUi,
   renderWaitingUi,
   renderWarmHitUi,
 } from "./ui.ts";
@@ -305,7 +306,7 @@ export class SessionWarmer {
       return;
     }
     // Compaction / branch / model change are expected idle states, not errors.
-    this.showIdle(ctx, reason);
+    this.showReanchoring(ctx, reason);
   }
 
   /** Capture the exact provider payload from a real agent turn. Read-only. */
@@ -579,7 +580,7 @@ export class SessionWarmer {
       this.lifecycleState = "blocked";
     }
     this.clearTimers();
-    if (this.capability.state === "verified" && ctx.hasUI && this.config.showWidget) {
+    if (this.capability.state === "verified" && ctx.hasUI) {
       ctx.ui.setStatus("pi-warm-cache", ctx.ui.theme.fg("dim", "warm paused · agent active"));
     } else if (this.capability.state !== "verified") {
       this.clearCapabilityUi(ctx);
@@ -644,36 +645,80 @@ export class SessionWarmer {
   }
 
   getStatusText(): string {
-    if (!this.config.enabled) return `disabled savingsSummary=${this.getSavingsSummaryText()}`;
     const log =
-      this.config.logToFile && this.getLogFile() ? ` log=${this.getLogFile()}` : "";
+      this.config.logToFile && this.getLogFile() ? `log=${this.getLogFile()}` : "";
     const capability = this.currentCapability(this.ctx);
     const model = this.ctx?.model;
-    const route = this.anchor
-      ? `${this.anchor.provider}/${this.anchor.modelId}`
+    const anchor = this.anchor;
+    const route = anchor
+      ? `${anchor.provider}/${anchor.modelId}`
       : model
         ? `${model.provider}/${model.id}`
         : "none";
-    const api = this.anchor?.modelApi ?? model?.api ?? "none";
-    const cacheKey = this.anchor?.cacheKeyFingerprint ?? "none";
-    const realTurn = this.anchor ? formatRealTurnStatus(this.anchor.latestRealTurn) : "none";
-    const probe = formatProbeStatus(this.anchor?.latestProbe ?? this.lastInvalidatedProbe);
-    const retry = this.anchor
-      ? `probeFailStreak=${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
+    const api = anchor?.modelApi ?? model?.api ?? "none";
+    const cacheKey = anchor?.cacheKeyFingerprint ?? "none";
+    const realTurn = anchor ? formatRealTurnStatus(anchor.latestRealTurn) : "none";
+    const probe = formatProbeStatus(anchor?.latestProbe ?? this.lastInvalidatedProbe);
+    const retry = anchor
+      ? `probeFailStreak=${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
       : "probeFailStreak=none";
     const last = this.lastAttempt
       ? `last=${this.lastAttempt.detail} at=${new Date(this.lastAttempt.at).toISOString()}`
       : "last=none";
-    const blocked = this.autoWarmBlockReason
+    const autoWarm = this.autoWarmBlockReason
       ? "autoWarm=blocked"
       : capability.automaticWarm
         ? "autoWarm=on"
         : "autoWarm=off";
-    const savingsSummary = this.getSavingsSummaryText();
+    const strategy = anchor?.cacheFamily ?? this.plan?.family ?? "none";
+    const cadence = this.plan?.ttlLabel ?? "none";
+    const intervalMs = this.plan?.intervalMs ?? null;
+    const nextDue = this.nextDueAt ? new Date(this.nextDueAt).toISOString() : "none";
+    const probeHits = anchor?.probeHitCount ?? 0;
+    const probeMisses = anchor?.probeMissCount ?? 0;
+    const stableBlock = [
+      `lifecycle=${this.lifecycleState}`,
+      `capability=${capability.state}`,
+      `capabilityReason=${capability.reason}`,
+      `provider=${route}`,
+      `api=${api}`,
+      `strategy=${strategy}`,
+      `cadence=${cadence}`,
+      `intervalMs=${intervalMs ?? "none"}`,
+      `nextDue=${nextDue}`,
+      `realTurn=${realTurn}`,
+      `probe=${probe}`,
+      "probeSource=extension-only",
+      `probeHits=${probeHits}`,
+      `probeMisses=${probeMisses}`,
+      retry,
+      `savingsSummary=${this.getSavingsSummaryText()}`,
+      `cacheKey=${cacheKey}`,
+      anchor ? `pfp=${anchor.payloadFingerprint.slice(0, 8)}` : "pfp=none",
+      autoWarm,
+      anchor?.modelApi === "openai-codex-responses" && this.config.allowCodexAutoWarm
+        ? "codexAuto=on"
+        : "",
+      this.autoWarmBlockReason ? `blockReason=${this.autoWarmBlockReason}` : "",
+      anchor ? `probes=${anchor.probeCount}` : "probes=0",
+      anchor ? `savings=${formatSavingsLabel(anchor)}` : "",
+      anchor ? `pricing=${anchor.pricingSource}` : "",
+      anchor
+        ? `realRead=${anchor.latestRealTurn.cacheRead} realWrite=${anchor.latestRealTurn.cacheWrite} probeRead=${anchor.latestProbe?.cacheRead ?? "none"} prompt≈${getKnownPromptTokens(anchor)}`
+        : "",
+      last,
+      log,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    if (!this.config.enabled) {
+      return ["disabled", stableBlock].join("\n");
+    }
 
     if (capability.state !== "verified") {
-      const manualProbe = this.anchor
-        ? this.anchor.manualProbeAvailable
+      const manualProbe = anchor
+        ? anchor.manualProbeAvailable
           ? "ready"
           : "unsafe-payload"
         : capability.manualProbe
@@ -681,152 +726,39 @@ export class SessionWarmer {
           : "off";
       return [
         `inactive capability=${capability.state}`,
-        `provider=${route}`,
-        `api=${api}`,
         `reason=${capability.reason}`,
         `manualProbe=${manualProbe}`,
-        this.anchor
-          ? `probes=${this.anchor.probeCount} probeHits=${this.anchor.probeHitCount} probeMisses=${this.anchor.probeMissCount}`
-          : "probes=0 probeHits=0 probeMisses=0",
-        `realTurn=${realTurn}`,
-        `probe=${probe}`,
-        retry,
-        `cacheKey=${cacheKey}`,
-        this.anchor ? `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}` : "pfp=none",
-        `savingsSummary=${savingsSummary}`,
-        last,
-        log.trim(),
-      ]
-        .filter(Boolean)
-        .join(" ");
+        stableBlock,
+      ].join("\n");
     }
 
-    if (!this.anchor) {
-      if (this.lifecycleState === "awaiting-reanchor" && this.lastInvalidatedProbe) {
-        return [
-          "idle (no anchor)",
-          "payload=none (needs re-anchor)",
-          "capability=verified",
-          `provider=${route}`,
-          `api=${api}`,
-          "strategy=none",
-          "realTurn=none",
-          `probe=${probe}`,
-          retry,
-          "cacheKey=none",
-          blocked,
-          `savingsSummary=${savingsSummary}`,
-          last,
-          log.trim(),
-        ]
-          .filter(Boolean)
-          .join(" ");
-      }
+    if (!anchor) {
       return [
         "idle (no anchor)",
-        "capability=verified",
-        `provider=${route}`,
-        `api=${api}`,
-        "strategy=none",
-        "realTurn=none",
-        "probe=none",
-        retry,
-        "cacheKey=none",
-        blocked,
-        `savingsSummary=${savingsSummary}`,
-        last,
-        log.trim(),
-      ]
-        .filter(Boolean)
-        .join(" ");
-    }
-    if (!this.lastPayload) {
-      return [
-        `enabled family=${this.anchor.cacheFamily}`,
-        "payload=none (needs re-anchor)",
-        "capability=verified",
-        `capabilityReason=${this.anchor.capability.reason}`,
-        `provider=${route}`,
-        `api=${api}`,
-        `probeHits=${this.anchor.probeHitCount}`,
-        `probeMisses=${this.anchor.probeMissCount}`,
-        `realTurn=${realTurn}`,
-        `probe=${probe}`,
-        retry,
-        `strategy=${this.anchor.cacheFamily}`,
-        `cacheKey=${cacheKey}`,
-        `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
-        `savingsSummary=${savingsSummary}`,
-        last,
-        log.trim(),
-      ]
-        .filter(Boolean)
-        .join(" ");
-    }
-    if (!this.plan || !this.plan.automaticWarm || this.plan.intervalMs === null) {
-      const strategyReason = this.plan?.ttlLabel ?? "no automatic strategy";
-      return [
-        "inactive capability=verified",
-        `provider=${route}`,
-        `api=${api}`,
-        `capabilityReason=${this.anchor.capability.reason}`,
-        `reason=${strategyReason}`,
-        `strategy=${this.anchor.cacheFamily}`,
-        `realTurn=${realTurn}`,
-        `probe=${probe}`,
-        retry,
-        `cacheKey=${cacheKey}`,
-        `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
-        `savingsSummary=${savingsSummary}`,
-        last,
-        log.trim(),
-      ]
-        .filter(Boolean)
-        .join(" ");
+        this.lifecycleState === "awaiting-reanchor"
+          ? "payload=none (needs re-anchor)"
+          : "payload=none (waiting for first real turn)",
+        stableBlock,
+      ].join("\n");
     }
 
-    const due = this.nextDueAt ? new Date(this.nextDueAt).toISOString() : "n/a";
-    const promptTokens = Math.max(
-      this.anchor.latestRealTurn.promptTokens,
-      this.anchor.latestProbe?.input ?? 0,
-      this.anchor.latestProbe
-        ? this.anchor.latestProbe.cacheRead + this.anchor.latestProbe.cacheWrite
-        : 0,
-    );
-    return [
-      `enabled family=${this.anchor.cacheFamily}`,
-      "capability=verified",
-      `capabilityReason=${this.anchor.capability.reason}`,
-      `provider=${route}`,
-      `api=${api}`,
-      `strategy=${this.anchor.cacheFamily}`,
-      `cadence=${this.plan.ttlLabel}`,
-      `intervalMs=${this.plan.intervalMs}`,
-      `cacheKey=${cacheKey}`,
-      `realRead=${this.anchor.latestRealTurn.cacheRead}`,
-      `realWrite=${this.anchor.latestRealTurn.cacheWrite}`,
-      `probeRead=${this.anchor.latestProbe?.cacheRead ?? "none"}`,
-      `prompt≈${promptTokens}`,
-      `probeHits=${this.anchor.probeHitCount}`,
-      `probeMisses=${this.anchor.probeMissCount}`,
-      `realTurn=${realTurn}`,
-      `probe=${probe}`,
-      retry,
-      `savings=${formatSavingsLabel(this.anchor)}`,
-      `savingsSummary=${savingsSummary}`,
-      `pricing=${this.anchor.pricingSource}`,
-      `nextDue=${due}`,
-      `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
-      blocked,
-      this.anchor.modelApi === "openai-codex-responses" && this.config.allowCodexAutoWarm
-        ? "codexAuto=on"
-        : "",
-      this.autoWarmBlockReason ? `blockReason=${this.autoWarmBlockReason}` : "",
-      last,
-      log.trim(),
-    ]
-      .filter(Boolean)
-      .join(" ");
+    if (!this.lastPayload) {
+      return [
+        `enabled family=${anchor.cacheFamily}`,
+        "payload=none (needs re-anchor)",
+        stableBlock,
+      ].join("\n");
+    }
+
+    if (!this.plan || !this.plan.automaticWarm || this.plan.intervalMs === null) {
+      return [
+        "inactive capability=verified",
+        `reason=${this.plan?.ttlLabel ?? "no automatic strategy"}`,
+        stableBlock,
+      ].join("\n");
+    }
+
+    return [`enabled family=${anchor.cacheFamily}`, stableBlock].join("\n");
   }
 
   /**
@@ -986,6 +918,15 @@ export class SessionWarmer {
       return;
     }
     renderIdleUi(ctx, this.config, reason, detail);
+  }
+
+  /** Non-alarming hard-invalidation state. No probe is allowed before re-anchor. */
+  private showReanchoring(ctx: ExtensionContext, reason: string): void {
+    if (this.currentCapability(ctx).state !== "verified") {
+      this.clearCapabilityUi(ctx);
+      return;
+    }
+    renderReanchorUi(ctx, this.config, reason);
   }
 
   /** Real failures / retries (keep panel visible with reason). */
@@ -1548,9 +1489,10 @@ export class SessionWarmer {
               "warning",
             );
           }
-          this.enterAwaitingReanchor(ctx, `probe payload drift · ${reanchorDetail}`, true);
+          const reanchorReason = `probe payload drift · ${reanchorDetail}`;
+          this.enterAwaitingReanchor(ctx, reanchorReason, true);
           shouldRescheduleAfter = false;
-          this.showFailure(ctx, "probe miss · re-anchor needed", reanchorDetail);
+          this.showReanchoring(ctx, reanchorReason);
           return result;
         }
 

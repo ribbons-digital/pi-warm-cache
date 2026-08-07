@@ -37,6 +37,14 @@ import {
   resolveModelPricing,
 } from "./savings.ts";
 import { SessionWarmer } from "./warmer.ts";
+import {
+  renderFailureUi,
+  renderIdleUi,
+  renderProbeRetryUi,
+  renderReanchorUi,
+  renderWaitingUi,
+  renderWarmHitUi,
+} from "./ui.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -791,8 +799,30 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       "probeHits=1 probeMisses=1 totalEstimatedSaved=$0.0002 totalProbeCost=$0.02 net=-$0.02 pricingSource=model",
     `warmer savings summary is not cumulative: ${warmer.getSavingsSummaryText()}`,
   );
+  const stableStatus = warmer.getStatusText();
   assert(
-    warmer.getStatusText().includes("savingsSummary=probeHits=1 probeMisses=1"),
+    stableStatus.includes("lifecycle=anchored"),
+    "status should expose the lifecycle state",
+  );
+  assert(
+    stableStatus.includes("capability=verified") && stableStatus.includes("capabilityReason="),
+    "status should expose capability state and reason",
+  );
+  assert(
+    stableStatus.includes("strategy=openai-implicit") &&
+      stableStatus.includes("cadence=~8m idle cache window") &&
+      stableStatus.includes("nextDue="),
+    "status should expose strategy, cadence, and next due time",
+  );
+  assert(
+    stableStatus.includes("realTurn=unknown") &&
+      stableStatus.includes("probe=hit") &&
+      stableStatus.includes("probeSource=extension-only"),
+    "status should separate real-turn and extension-probe observations",
+  );
+  assert(stableStatus.includes("cacheKey=") && stableStatus.includes("pfp="), "status should expose cache identity");
+  assert(
+    stableStatus.includes("savingsSummary=probeHits=1 probeMisses=1"),
     "status should expose the stable savings summary",
   );
 
@@ -1157,6 +1187,92 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(calls.length === xaiCallsBeforeWaitingProbe, "xAI awaiting re-anchor must not call the provider");
   assert(notifications.some((entry) => entry.level === "warning"), "xAI re-anchor should be visible");
   warmer.dispose();
+}
+
+// 12) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
+{
+  const calls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    setWidget: (_id: string, value: unknown) => calls.push({ kind: "widget", value }),
+    setStatus: (_id: string, value: unknown) => calls.push({ kind: "status", value }),
+  };
+  const ctx = { hasUI: true, ui } as any;
+  const anchor = {
+    cachedTokens: 128_000,
+    promptTokens: 128_000,
+    probeHitCount: 2,
+    probeMissCount: 0,
+    savingsKnown: true,
+    estimatedSavingsUsd: 0.12,
+    capability: { state: "verified" },
+  } as any;
+  const plan = {
+    family: "openai-implicit",
+    intervalMs: 240_000,
+    ttlLabel: "~8m idle cache window",
+    waitLabel: "4m",
+    automaticWarm: true,
+    manualProbe: false,
+    cacheRetention: "short",
+  } as any;
+
+  renderWaitingUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, anchor, plan, Date.now() + 180_000);
+  renderWarmHitUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, anchor, plan, 128_000);
+  renderReanchorUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, "compacted · waiting for next turn");
+  renderProbeRetryUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, "read=0 write=0");
+  renderFailureUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, "probe miss · retry 1/3", "read=0 write=0");
+  renderIdleUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, "waiting for first turn");
+
+  const widgets = calls.filter((call) => call.kind === "widget");
+  assert(widgets.length === 6, `visible UI should render six widget states, got ${widgets.length}`);
+  assert(
+    widgets.every((call) => Array.isArray(call.value) && call.value.length <= 3),
+    "every widget state must stay within three lines",
+  );
+  assert(
+    widgets.some((call) =>
+      (call.value as string[]).some((line) => line.includes("re-anchoring after compaction")),
+    ),
+    "re-anchoring needs a distinct non-alarming widget message",
+  );
+  const statuses = calls
+    .filter((call) => call.kind === "status")
+    .map((call) => String(call.value));
+  assert(
+    statuses.some((status) => status === "warm · re-anchoring"),
+    "re-anchoring status should be concise",
+  );
+  assert(
+    statuses.some((status) => /warm [0-9.]+m · 2\/2 · ~128k/.test(status)),
+    "healthy status should show cadence, probe ratio, and prompt size",
+  );
+
+  const hiddenCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  const hiddenCtx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, value: unknown) => hiddenCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value: unknown) => hiddenCalls.push({ kind: "status", value }),
+    },
+  } as any;
+  const hiddenConfig = { ...DEFAULT_CONFIG, showWidget: false };
+  renderWaitingUi(hiddenCtx, hiddenConfig, anchor, plan, Date.now() + 180_000);
+  renderWarmHitUi(hiddenCtx, hiddenConfig, anchor, plan, 128_000);
+  renderReanchorUi(hiddenCtx, hiddenConfig, "compacted");
+  renderProbeRetryUi(hiddenCtx, hiddenConfig, "read=0 write=0");
+  renderFailureUi(hiddenCtx, hiddenConfig, "probe miss");
+  renderIdleUi(hiddenCtx, hiddenConfig, "disabled");
+  const hiddenWidgets = hiddenCalls.filter((call) => call.kind === "widget");
+  assert(
+    hiddenWidgets.length === 6 && hiddenWidgets.every((call) => call.value === undefined),
+    "showWidget=false must clear widget output for every UI state",
+  );
+  assert(
+    hiddenCalls.filter((call) => call.kind === "status").length === 6,
+    "the compact status line should remain available when only the widget is hidden",
+  );
 }
 
 console.log("provider.test.ts: all assertions passed");

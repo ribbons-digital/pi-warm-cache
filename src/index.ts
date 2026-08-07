@@ -149,7 +149,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
         const capability =
           `capability=${result.capabilityState ?? "unknown"} reason=${result.capabilityReason ?? "unknown"}`;
         const usage =
-          `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
+          `extensionProbe read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
           `out=${result.output} cost=$${result.costUsd.toFixed(4)}`;
         const fingerprint = `pfp=${result.fingerprint ? result.fingerprint.slice(0, 8) : "none"}`;
         const strategy =
@@ -157,7 +157,13 @@ export default function piWarmCache(pi: ExtensionAPI) {
           `intervalMs=${result.intervalMs ?? "none"}`;
         const cacheKey = `cacheKey=${result.cacheKeyFingerprint ?? "none"}`;
         const retry = `retry=${result.retryState ?? "none"}`;
-        const diagnostics = `${route}; ${capability}; ${strategy}; ${cacheKey}; ${usage}; ${fingerprint}; ${retry}`;
+        const savings =
+          result.capabilityState === "unverified"
+            ? "savingsSummary=n/a (unverified route)"
+            : `savingsSummary=${warmer.getSavingsSummaryText()}`;
+        const diagnostics =
+          `${route}; ${capability}; ${strategy}; ${cacheKey}; ${usage}; ` +
+          `source=extension-only; ${fingerprint}; ${retry}; ${savings}`;
         if (!result.ok) {
           const failureLabel =
             result.unavailable || result.capabilityState === "unsupported"
@@ -168,13 +174,15 @@ export default function piWarmCache(pi: ExtensionAPI) {
         }
         if (result.capabilityState === "unverified") {
           ctx.ui.notify(
-            `Unverified probe ${result.cacheHit ? "hit" : "miss"} (${diagnostics}). No active keepalive or verified savings claim.`,
+            `Unverified extension probe ${result.cacheHit ? "hit" : "miss"} (${diagnostics}). No active keepalive or verified savings claim.`,
             result.cacheHit ? "info" : "warning",
           );
           return;
         }
         const probeLabel =
-          result.family === "xai-best-effort" ? "Best-effort probe" : "Probe";
+          result.family === "xai-best-effort"
+            ? "Best-effort extension probe"
+            : "Extension probe";
         if (result.probeOutcome === "transient-miss") {
           ctx.ui.notify(
             `${probeLabel} miss (transient; retry scheduled) (${diagnostics})`,
