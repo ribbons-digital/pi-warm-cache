@@ -84,7 +84,7 @@ Inactive-capability output also includes the `manualProbe` field.
 | `lifecycle` | The lifecycle state from the table above. |
 | `capability` | The exact route policy: `verified`, `unverified`, or `unsupported`. |
 | `capabilityReason` | The actionable reason for the capability decision. This is route and payload policy, not a provider promise. |
-| `manualProbe` | In inactive-capability output, `ready` means the captured payload is safe for a manual probe, `unsafe-payload` means the route is manual-capable but the captured shape is unsafe, `waiting-for-safe-payload` means no payload is captured yet, and `off` means manual probing is not permitted. This field is omitted from the verified-route status form. |
+| `manualProbe` | In inactive-capability output, `ready` means the route permits manual probing and the captured payload is safe. `unsafe-payload` means an anchor exists but the payload is not eligible for a manual probe because the shape is unsafe or the route does not permit manual probing. `waiting-for-safe-payload` means the route permits manual probing but no payload is captured yet. `off` means manual probing is not permitted. This field is omitted from the verified-route status form. |
 | `provider` | The provider and model route, such as `anthropic/claude-fable-5`. |
 | `api` | The exact Pi API transport, such as `anthropic-messages` or `openai-responses`. |
 | `strategy` | The selected cache family, such as `anthropic-short`, `openai-explicit`, `openai-implicit`, or `xai-best-effort`. |
