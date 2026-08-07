@@ -3,6 +3,13 @@ import type { CacheRetention, Model, ThinkingLevel } from "@earendil-works/pi-ai
 /** Capability state for the exact provider route, not only the model name. */
 export type ProviderCapabilityState = "verified" | "unverified" | "unsupported";
 
+export type WarmLifecycleState =
+  | "idle"
+  | "anchored"
+  | "awaiting-reanchor"
+  | "disabled"
+  | "blocked";
+
 export interface ProviderCapability {
   state: ProviderCapabilityState;
   /** Why this route received its capability state. */
@@ -155,6 +162,10 @@ export interface CacheAnchor {
   lastProbeAt: number | null;
   /** Estimated USD saved by warm-probe hits this session (vs cold input re-read). */
   estimatedSavingsUsd: number;
+  /** Cumulative estimated savings before probe costs are subtracted. */
+  totalEstimatedSavedUsd: number;
+  /** Cumulative provider cost for warm probes. */
+  totalProbeCostUsd: number;
   /** Number of provider responses returned by the warm-probe path. */
   probeCount: number;
   probeHitCount: number;

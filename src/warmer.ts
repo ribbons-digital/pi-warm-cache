@@ -35,6 +35,7 @@ import type {
   ProviderCapability,
   RealTurnObservation,
   WarmCacheConfig,
+  WarmLifecycleState,
   WarmResult,
 } from "./types.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
@@ -74,6 +75,11 @@ export class SessionWarmer {
   private disposed = false;
   private nextDueAt = 0;
   private anchor: CacheAnchor | null = null;
+  private lifecycleState: WarmLifecycleState = "idle";
+  /** Lifecycle state captured before entering "disabled", for restore on re-enable. */
+  private stateBeforeDisabled: WarmLifecycleState | null = null;
+  /** Retained probe diagnostics after a drift invalidation, never used for replay. */
+  private lastInvalidatedProbe: ProbeObservation | null = null;
   private lastPayload: unknown | null = null;
   private capability: ProviderCapability | null = null;
   private ctx: ExtensionContext | null = null;
@@ -116,12 +122,29 @@ export class SessionWarmer {
     return this.currentCapability();
   }
 
+  getLifecycleState(): WarmLifecycleState {
+    return this.lifecycleState;
+  }
+
+  getSessionWarmStats(): Pick<
+    CacheAnchor,
+    "totalEstimatedSavedUsd" | "totalProbeCostUsd" | "probeHitCount" | "probeMissCount" | "lastProbeAt"
+  > {
+    return {
+      totalEstimatedSavedUsd: this.anchor?.totalEstimatedSavedUsd ?? 0,
+      totalProbeCostUsd: this.anchor?.totalProbeCostUsd ?? 0,
+      probeHitCount: this.anchor?.probeHitCount ?? 0,
+      probeMissCount: this.anchor?.probeMissCount ?? 0,
+      lastProbeAt: this.anchor?.lastProbeAt ?? null,
+    };
+  }
+
   getLatestRealTurnObservation(): RealTurnObservation | null {
     return this.anchor?.latestRealTurn ?? null;
   }
 
   getLatestProbeObservation(): ProbeObservation | null {
-    return this.anchor?.latestProbe ?? null;
+    return this.anchor?.latestProbe ?? this.lastInvalidatedProbe;
   }
 
   private currentCapability(ctx?: ExtensionContext | null): ProviderCapability {
@@ -138,6 +161,22 @@ export class SessionWarmer {
     if (!this.config.enabled) {
       this.stop("disabled");
       return;
+    }
+    if (this.lifecycleState === "disabled") {
+      // Restore the lifecycle state captured before entering "disabled"
+      if (this.stateBeforeDisabled === "awaiting-reanchor") {
+        this.lifecycleState = "awaiting-reanchor";
+      } else if (this.stateBeforeDisabled === "blocked" && this.autoWarmBlockReason) {
+        // Only restore "blocked" if the block reason is still active
+        this.lifecycleState = "blocked";
+      } else if (this.stateBeforeDisabled === "blocked" && !this.autoWarmBlockReason) {
+        // Block was cleared while disabled, restore to anchored/idle instead
+        this.lifecycleState = this.anchor && this.lastPayload ? "anchored" : "idle";
+      } else {
+        // Default restoration based on anchor/payload for other states
+        this.lifecycleState = this.anchor && this.lastPayload ? "anchored" : "idle";
+      }
+      this.stateBeforeDisabled = null;
     }
     if (this.ctx?.model && this.lastPayload) {
       this.plan = resolveStrategy(this.ctx.model, this.config, this.lastPayload);
@@ -157,6 +196,9 @@ export class SessionWarmer {
       reason,
     });
     this.autoWarmBlockReason = null;
+    if (this.lifecycleState === "blocked") {
+      this.lifecycleState = this.anchor && this.lastPayload ? "anchored" : "idle";
+    }
   }
 
   getAutoWarmBlockReason(): string | null {
@@ -165,6 +207,7 @@ export class SessionWarmer {
 
   private blockAutoWarm(reason: string): void {
     this.autoWarmBlockReason = reason;
+    this.lifecycleState = "blocked";
     this.clearTimers();
     this.log({
       event: "auto_warm_blocked",
@@ -176,15 +219,21 @@ export class SessionWarmer {
   bindContext(ctx: ExtensionContext): void {
     this.ctx = ctx;
     this.capability = resolveProviderCapability(ctx.model);
+    if (!this.config.enabled) {
+      this.stateBeforeDisabled = this.lifecycleState;
+      this.lifecycleState = "disabled";
+    }
     this.logFile = warmLogPath(ctx.cwd);
   }
 
   dispose(): void {
     this.disposed = true;
+    this.lifecycleState = "disabled";
     this.clearTimers();
     this.abort?.abort();
     this.abort = null;
     this.anchor = null;
+    this.lastInvalidatedProbe = null;
     this.lastPayload = null;
     this.capability = null;
     this.realTurnBoundaryReason = "session ended";
@@ -193,25 +242,23 @@ export class SessionWarmer {
     this.ctx = null;
   }
 
-  /**
-   * Drop the cache anchor after events that make the previous provider prefix unusable:
-   * model/effort change, compaction, or tree navigation.
-   *
-   * Idle custom_message / advisor injections do not invalidate the provider cache
-   * from the last real turn. Those must not call this method.
-   */
-  invalidateAnchor(ctx: ExtensionContext, reason: string): void {
+  private enterAwaitingReanchor(
+    ctx: ExtensionContext,
+    reason: string,
+    preserveProbe = false,
+  ): void {
     this.ctx = ctx;
     this.capability = resolveProviderCapability(ctx.model);
+    this.lastInvalidatedProbe = preserveProbe ? (this.anchor?.latestProbe ?? null) : null;
     this.anchor = null;
     this.lastPayload = null;
     this.realTurnBoundaryReason = reason;
     this.realTurnContinuity = false;
     this.plan = null;
+    this.lifecycleState = this.config.enabled ? "awaiting-reanchor" : "disabled";
     this.clearTimers();
     this.abort?.abort();
     this.abort = null;
-    this.recordAttempt("system", false, `invalidated: ${reason}`);
     this.log({
       event: "anchor_invalidated",
       source: "system",
@@ -222,7 +269,20 @@ export class SessionWarmer {
       capabilityReason: this.capability.reason,
       reason,
     });
-    if (this.capability.state !== "verified") {
+  }
+
+  /**
+   * Drop the cache anchor after events that make the previous provider prefix unusable:
+   * model/effort change, compaction, tree navigation, or probe-detected payload drift.
+   *
+   * Idle custom_message / advisor injections do not invalidate the provider cache
+   * from the last real turn. Those must not call this method.
+   */
+  invalidateAnchor(ctx: ExtensionContext, reason: string): void {
+    this.enterAwaitingReanchor(ctx, reason);
+    this.recordAttempt("system", false, `invalidated: ${reason}`);
+    const capability = this.capability;
+    if (!capability || capability.state !== "verified") {
       this.clearCapabilityUi(ctx);
       return;
     }
@@ -243,7 +303,9 @@ export class SessionWarmer {
 
     if (!model || this.capability.state === "unsupported") {
       this.anchor = null;
+      this.lastInvalidatedProbe = null;
       this.lastPayload = null;
+      this.lifecycleState = this.config.enabled ? "blocked" : "disabled";
       this.realTurnBoundaryReason = this.capability.reason;
       this.realTurnContinuity = false;
       this.plan = null;
@@ -265,8 +327,8 @@ export class SessionWarmer {
       return;
     }
 
-    const prev = this.anchor;
-    const previousPayload = this.lastPayload;
+    let prev = this.anchor;
+    let previousPayload = this.lastPayload;
     const sameRoute = Boolean(
       prev &&
         prev.provider === model.provider &&
@@ -298,7 +360,14 @@ export class SessionWarmer {
             ? "comparable continuation"
             : "no comparable prior real turn";
     const prefixChanged = Boolean(prev && !payloadContinuation);
+    if (prefixChanged) {
+      const driftReason = !sameRoute ? "model or provider route changed" : "prefix changed";
+      this.enterAwaitingReanchor(ctx, `${driftReason} · waiting for next turn`);
+      prev = null;
+      previousPayload = null;
+    }
 
+    this.lastInvalidatedProbe = null;
     this.lastPayload = structuredClone(payload);
     this.plan = resolveStrategy(model, this.config, this.lastPayload);
     const cacheKey = getPromptCacheKey(this.lastPayload, model.api);
@@ -354,6 +423,9 @@ export class SessionWarmer {
       lastProbeAt: preserveSessionStats ? (prev?.lastProbeAt ?? null) : null,
       estimatedSavingsUsd:
         savingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
+      totalEstimatedSavedUsd:
+        savingsKnown && preserveSessionStats ? (prev?.totalEstimatedSavedUsd ?? 0) : 0,
+      totalProbeCostUsd: preserveSessionStats ? (prev?.totalProbeCostUsd ?? 0) : 0,
       probeCount: preserveSessionStats ? (prev?.probeCount ?? 0) : 0,
       probeHitCount: preserveSessionStats ? (prev?.probeHitCount ?? 0) : 0,
       probeMissCount: preserveSessionStats ? (prev?.probeMissCount ?? 0) : 0,
@@ -361,6 +433,11 @@ export class SessionWarmer {
       latestRealTurn: realTurn,
       latestProbe: preserveSessionStats ? (prev?.latestProbe ?? null) : null,
     };
+    this.lifecycleState = !this.config.enabled
+      ? "disabled"
+      : this.autoWarmBlockReason
+        ? "blocked"
+        : "anchored";
     this.realTurnBoundaryReason = "awaiting real-turn usage";
     this.realTurnContinuity = comparableContinuation;
 
@@ -477,6 +554,12 @@ export class SessionWarmer {
   onAgentStart(ctx: ExtensionContext): void {
     this.ctx = ctx;
     this.capability = resolveProviderCapability(ctx.model);
+    if (!this.config.enabled) {
+      this.stateBeforeDisabled = this.lifecycleState;
+      this.lifecycleState = "disabled";
+    } else if (this.autoWarmBlockReason) {
+      this.lifecycleState = "blocked";
+    }
     this.clearTimers();
     if (this.capability.state === "verified" && ctx.hasUI && this.config.showWidget) {
       ctx.ui.setStatus("pi-warm-cache", ctx.ui.theme.fg("dim", "warm paused · agent active"));
@@ -498,6 +581,8 @@ export class SessionWarmer {
   onAgentSettled(ctx: ExtensionContext): void {
     this.ctx = ctx;
     if (!this.config.enabled) {
+      this.stateBeforeDisabled = this.lifecycleState;
+      this.lifecycleState = "disabled";
       this.showIdle(ctx, "disabled");
       return;
     }
@@ -554,7 +639,7 @@ export class SessionWarmer {
     const api = this.anchor?.modelApi ?? model?.api ?? "none";
     const cacheKey = this.anchor?.cacheKeyFingerprint ?? "none";
     const realTurn = this.anchor ? formatRealTurnStatus(this.anchor.latestRealTurn) : "none";
-    const probe = this.anchor ? formatProbeStatus(this.anchor.latestProbe) : "none";
+    const probe = formatProbeStatus(this.anchor?.latestProbe ?? this.lastInvalidatedProbe);
     const retry = this.anchor
       ? `probeFailStreak=${this.anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`
       : "probeFailStreak=none";
@@ -597,6 +682,25 @@ export class SessionWarmer {
     }
 
     if (!this.anchor) {
+      if (this.lifecycleState === "awaiting-reanchor" && this.lastInvalidatedProbe) {
+        return [
+          "idle (no anchor)",
+          "payload=none (needs re-anchor)",
+          "capability=verified",
+          `provider=${route}`,
+          `api=${api}`,
+          "strategy=none",
+          "realTurn=none",
+          `probe=${probe}`,
+          retry,
+          "cacheKey=none",
+          blocked,
+          last,
+          log.trim(),
+        ]
+          .filter(Boolean)
+          .join(" ");
+      }
       return [
         "idle (no anchor)",
         "capability=verified",
@@ -709,6 +813,10 @@ export class SessionWarmer {
     if (this.disposed || !this.config.enabled) return;
     const ctx = this.ctx;
     if (!ctx) return;
+    if (this.lifecycleState === "awaiting-reanchor") {
+      this.clearTimers();
+      return;
+    }
     const capability = this.currentCapability(ctx);
     this.capability = capability;
     if (capability.state !== "verified" || !capability.automaticWarm) {
@@ -826,6 +934,11 @@ export class SessionWarmer {
   }
 
   private stop(reason: string): void {
+    if (reason === "disabled") {
+      // Capture the current lifecycle state before entering "disabled"
+      this.stateBeforeDisabled = this.lifecycleState;
+      this.lifecycleState = "disabled";
+    }
     this.clearTimers();
     this.abort?.abort();
     this.abort = null;
@@ -1054,6 +1167,27 @@ export class SessionWarmer {
         error: "automatic warming is disabled for an unverified route",
         unavailable: true,
         fingerprint: anchor?.payloadFingerprint ?? "",
+      };
+    }
+
+    if (this.lifecycleState === "awaiting-reanchor") {
+      const detail = "awaiting a new real-turn payload";
+      this.clearTimers();
+      this.recordAttempt(reason, false, detail);
+      if (ctx) this.clearCapabilityUi(ctx);
+      return {
+        ok: false,
+        cacheHit: false,
+        probeOutcome: "unavailable",
+        cacheRead: 0,
+        cacheWrite: 0,
+        input: 0,
+        output: 0,
+        costUsd: 0,
+        estimatedSavedUsd: 0,
+        error: detail,
+        unavailable: true,
+        fingerprint: "",
       };
     }
 
@@ -1300,7 +1434,13 @@ export class SessionWarmer {
           `read=${result.cacheRead} write=${result.cacheWrite} in=${result.input} ` +
           `out=${result.output} cost=${result.costUsd}`;
         this.recordAttempt(reason, result.cacheHit, detail, usageSnap, outcome);
-        if (payloadDrift) this.lastPayload = null;
+        if (payloadDrift) {
+          this.enterAwaitingReanchor(
+            ctx,
+            "unverified probe payload drift · waiting for next turn",
+            true,
+          );
+        }
         if (ctx.hasUI) {
           ctx.ui.notify(
             `pi-warm-cache: ${detail}. No active keepalive or verified savings claim.`,
@@ -1383,10 +1523,8 @@ export class SessionWarmer {
               "warning",
             );
           }
-          this.lastPayload = null;
+          this.enterAwaitingReanchor(ctx, `probe payload drift · ${reanchorDetail}`, true);
           shouldRescheduleAfter = false;
-          if (this.uiTimer) clearInterval(this.uiTimer);
-          this.uiTimer = null;
           this.showFailure(ctx, "probe miss · re-anchor needed", reanchorDetail);
           return result;
         }
