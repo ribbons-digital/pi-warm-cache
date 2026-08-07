@@ -154,11 +154,7 @@ export class SessionWarmer {
   }
 
   getDeferredProbe(): WarmDeferralState | null {
-    if (!this.deferredProbe) return null;
-    return {
-      ...this.deferredProbe,
-      activeWarmSessions: globalGate.getActive(),
-    };
+    return this.deferredProbe;
   }
 
   getSessionWarmStats(): Pick<
