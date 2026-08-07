@@ -95,13 +95,17 @@ export type SavingsSummaryInput = Pick<
   | "totalProbeCostUsd"
   | "savingsKnown"
   | "pricingSource"
->;
+> &
+  Partial<Pick<CacheAnchor, "capability">>;
 
 /**
  * Stable cumulative savings text for the /warm status and command output.
  * Monetary values stay n/a when the active model has no usable pricing.
  */
 export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
+  if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
+  if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
+
   const amount = (value: number): string =>
     anchor.savingsKnown ? formatUsd(value) : "n/a";
   const net = anchor.totalEstimatedSavedUsd - anchor.totalProbeCostUsd;

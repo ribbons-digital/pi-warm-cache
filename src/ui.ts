@@ -1,7 +1,12 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { formatDurationShort } from "./config.ts";
 import { formatSavingsLabel } from "./savings.ts";
-import type { CacheAnchor, StrategyPlan, WarmCacheConfig } from "./types.ts";
+import type {
+  CacheAnchor,
+  ProviderCapability,
+  StrategyPlan,
+  WarmCacheConfig,
+} from "./types.ts";
 
 const WIDGET_ID = "pi-warm-cache";
 const STATUS_ID = "pi-warm-cache";
@@ -10,6 +15,30 @@ export function clearWarmUi(ctx: ExtensionContext): void {
   if (!ctx.hasUI) return;
   ctx.ui.setWidget(WIDGET_ID, undefined);
   ctx.ui.setStatus(STATUS_ID, undefined);
+}
+
+/** Explain a rejected route without leaving the active warming surface visible. */
+export function renderCapabilityNotice(
+  ctx: ExtensionContext,
+  capability: ProviderCapability,
+): void {
+  if (!ctx.hasUI) return;
+  clearWarmUi(ctx);
+  if (capability.state === "unverified") {
+    const mode = capability.manualProbe ? "manual-only route" : "unverified route";
+    const probe = capability.manualProbe
+      ? "Use /warm now for one safe captured-payload probe."
+      : "No safe manual probe is available for this captured route.";
+    ctx.ui.notify(
+      `pi-warm-cache ${mode}: ${capability.reason}. Automatic warming is disabled. ${probe} Savings are n/a (unverified route).`,
+      "warning",
+    );
+    return;
+  }
+  ctx.ui.notify(
+    `pi-warm-cache inactive (unsupported route): ${capability.reason}. Automatic and manual warming are disabled.`,
+    "info",
+  );
 }
 
 export function renderWaitingUi(

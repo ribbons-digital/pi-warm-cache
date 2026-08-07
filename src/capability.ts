@@ -95,12 +95,25 @@ function capability(
   reason: string,
   manualProbe = false,
 ): ProviderCapability {
+  const normalizedReason = reason.trim();
   return {
     state,
-    reason,
+    reason: normalizedReason || "capability decision has no reason",
     automaticWarm: state === "verified",
-    manualProbe,
+    // Manual probes are an explicit unverified-route escape hatch. Keep the
+    // flags consistent even if a future branch passes an incorrect value.
+    manualProbe: state === "unverified" && manualProbe,
   };
+}
+
+function directXaiPayloadRejectionReason(payload: unknown): string | null {
+  if (!getPromptCacheKey(payload, "openai-responses")) {
+    return "direct xAI Grok 4.5 route is missing a stable prompt-cache key (prompt_cache_key) in the captured payload; automatic warming is disabled";
+  }
+  if (!isSafeReplayPayload(payload, "openai-responses")) {
+    return "direct xAI Grok 4.5 captured payload is not a safe OpenAI Responses replay shape; automatic warming is disabled";
+  }
+  return null;
 }
 
 /**
@@ -108,12 +121,15 @@ function capability(
  *
  * API-compatible transports do not inherit a first-party provider strategy.
  * New routes must be added here with an explicit capability decision.
+ * When a captured payload is supplied, payload-dependent cache identity is
+ * verified at the same gate as the provider route.
  */
 export function resolveProviderCapability(
   model: Model<any> | undefined,
+  payload?: unknown,
 ): ProviderCapability {
   if (!model) {
-    return capability("unsupported", "no active model route");
+    return capability("unsupported", "no active model route; select a model before warming");
   }
 
   const route = routeLabel(model);
@@ -131,6 +147,17 @@ export function resolveProviderCapability(
   if (model.api === "anthropic-messages" && compat?.cacheControlFormat === "anthropic") {
     return capability("verified", "route metadata explicitly enables Anthropic cache markers");
   }
+  if (
+    model.provider === "anthropic" &&
+    model.api === "anthropic-messages" &&
+    Boolean(model.baseUrl) &&
+    !hasFirstPartyBaseUrl(model, ANTHROPIC_FIRST_PARTY_HOSTS)
+  ) {
+    return capability(
+      "unsupported",
+      "Anthropic Messages route baseUrl is not api.anthropic.com; automatic warming requires the first-party endpoint or explicit Anthropic cache-marker metadata",
+    );
+  }
 
   // Direct OpenAI and Azure routes keep their existing strategies. The API
   // transport and provider identity must agree; an API shape alone is not enough.
@@ -140,6 +167,17 @@ export function resolveProviderCapability(
     hasFirstPartyBaseUrl(model, OPENAI_FIRST_PARTY_HOSTS)
   ) {
     return capability("verified", "first-party OpenAI route with a registered OpenAI transport");
+  }
+  if (
+    model.provider === "openai" &&
+    OPENAI_COMPAT_APIS.has(model.api) &&
+    Boolean(model.baseUrl) &&
+    !hasFirstPartyBaseUrl(model, OPENAI_FIRST_PARTY_HOSTS)
+  ) {
+    return capability(
+      "unsupported",
+      "OpenAI route baseUrl is not api.openai.com; API-compatible routes do not inherit first-party cache strategies",
+    );
   }
   if (model.provider === "azure-openai-responses" && model.api === "azure-openai-responses") {
     return capability("verified", "registered Azure OpenAI Responses route");
@@ -157,17 +195,27 @@ export function resolveProviderCapability(
     model.api === "openai-responses" &&
     model.id === "grok-4.5"
   ) {
-    if (!hasExplicitFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)) {
+    if (!model.baseUrl) {
       return capability(
         "unsupported",
-        "direct xAI Grok 4.5 requires an explicit https://api.x.ai first-party endpoint",
+        "direct xAI Grok 4.5 requires an explicit baseUrl on api.x.ai; automatic warming is disabled without a first-party endpoint",
+      );
+    }
+    if (!hasFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)) {
+      return capability(
+        "unsupported",
+        "direct xAI Grok 4.5 route baseUrl is not api.x.ai; use the direct first-party xAI endpoint",
       );
     }
     if (!hasXaiCacheRoutingMetadata(model)) {
       return capability(
         "unsupported",
-        "direct xAI Grok 4.5 route has unsupported cache-routing metadata",
+        "direct xAI Grok 4.5 route has unsupported cache-routing metadata; use the registered direct xAI routing format",
       );
+    }
+    if (payload !== undefined) {
+      const payloadReason = directXaiPayloadRejectionReason(payload);
+      if (payloadReason) return capability("unverified", payloadReason);
     }
     return capability(
       "verified",
@@ -177,26 +225,51 @@ export function resolveProviderCapability(
 
   // Other direct xAI routes remain observable through a clearly labelled
   // manual probe until each route receives its own validated strategy.
-  if (
-    model.provider === "xai" &&
-    XAI_PROBE_APIS.has(model.api) &&
-    hasExplicitFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)
-  ) {
+  if (model.provider === "xai" && XAI_PROBE_APIS.has(model.api)) {
+    if (!model.baseUrl) {
+      return capability(
+        "unsupported",
+        "direct xAI manual probes require an explicit baseUrl on api.x.ai; automatic and manual warming are disabled without a first-party endpoint",
+      );
+    }
+    if (!hasFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)) {
+      return capability(
+        "unsupported",
+        "direct xAI route baseUrl is not api.x.ai; automatic and manual warming are disabled for this route",
+      );
+    }
     return capability(
       "unverified",
-      "direct xAI route has no verified automatic keepalive strategy",
+      "direct xAI route has no verified automatic keepalive strategy; automatic warming is disabled, but a safe captured payload may be probed once with /warm now",
       true,
+    );
+  }
+
+  if (model.provider === "openrouter") {
+    return capability(
+      "unsupported",
+      "OpenRouter routes do not inherit first-party cache strategies; automatic and manual warming are disabled for this route",
+    );
+  }
+
+  if (model.provider === "opencode-go") {
+    return capability(
+      "unsupported",
+      "OpenCode Go routes do not inherit first-party cache strategies; automatic and manual warming are disabled for this route",
     );
   }
 
   if (model.api === "anthropic-messages" || OPENAI_COMPAT_APIS.has(model.api)) {
     return capability(
       "unsupported",
-      `provider route ${route} is not explicitly registered; API-compatible routes do not inherit a cache strategy`,
+      `provider route ${route} is not explicitly registered; API-compatible routes do not inherit first-party cache strategies, so automatic and manual warming are disabled`,
     );
   }
 
-  return capability("unsupported", `provider route ${route} has no registered cache strategy`);
+  return capability(
+    "unsupported",
+    `provider route ${route} has no registered cache strategy; automatic and manual warming are disabled`,
+  );
 }
 
 /**

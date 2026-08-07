@@ -154,6 +154,7 @@ export class SessionWarmer {
         totalProbeCostUsd: 0,
         savingsKnown: false,
         pricingSource: "unknown",
+        capability: this.ctx ? this.currentCapability(this.ctx) : undefined,
       },
     );
   }
@@ -318,7 +319,7 @@ export class SessionWarmer {
     this.logFile = warmLogPath(ctx.cwd);
     const payloadFingerprint = stableFingerprint(payload);
     const model = ctx.model;
-    this.capability = resolveProviderCapability(model);
+    this.capability = resolveProviderCapability(model, payload);
 
     if (!model || this.capability.state === "unsupported") {
       this.anchor = null;
@@ -1412,8 +1413,8 @@ export class SessionWarmer {
         }
         if (ctx.hasUI) {
           ctx.ui.notify(
-            `pi-warm-cache: ${detail}. No active keepalive or verified savings claim.`,
-            result.cacheHit ? "info" : "warning",
+            `pi-warm-cache WARNING: automatic warming is disabled for this unverified route; ${detail}. No active keepalive or verified savings claim. Savings are n/a (unverified route).`,
+            "warning",
           );
         }
         this.clearCapabilityUi(ctx);
