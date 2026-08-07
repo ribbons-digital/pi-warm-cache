@@ -703,6 +703,17 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     intervalMs: 60_000,
     maxConsecutiveFailures: 3,
   });
+  assert(warmer.getLifecycleState() === "idle", "new warmer should start idle");
+  const initialStats = warmer.getSessionWarmStats();
+  assert(initialStats.totalEstimatedSavedUsd === 0, "savings stats should start at zero");
+  assert(initialStats.totalProbeCostUsd === 0, "probe cost stats should start at zero");
+  assert(initialStats.probeHitCount === 0, "probe hit stats should start at zero");
+  assert(initialStats.probeMissCount === 0, "probe miss stats should start at zero");
+  assert(initialStats.lastProbeAt === null, "last probe time should start empty");
+  warmer.invalidateAnchor(ctx, "compacted · waiting for next turn");
+  assert(warmer.getLifecycleState() === "awaiting-reanchor", "invalidation should await re-anchor");
+  const waiting = await warmer.warmNow(ctx);
+  assert(waiting.unavailable === true, "awaiting re-anchor must not probe");
   warmer.capturePayload(
     {
       model: model.id,
@@ -711,6 +722,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     },
     ctx,
   );
+  assert(warmer.getLifecycleState() === "anchored", "real-turn capture should create an anchor");
+  const anchorStats = warmer.getSessionWarmStats();
+  assert(anchorStats.totalEstimatedSavedUsd === 0, "new anchor savings should start at zero");
+  assert(anchorStats.totalProbeCostUsd === 0, "new anchor probe cost should start at zero");
+  assert(anchorStats.probeHitCount === 0, "new anchor probe hits should start at zero");
+  assert(anchorStats.probeMissCount === 0, "new anchor probe misses should start at zero");
+  assert(anchorStats.lastProbeAt === null, "new anchor last probe time should be empty");
   warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
 
   const transient = await warmer.warmNow(ctx);
@@ -752,8 +770,17 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
   const drift = await warmer.warmNow(ctx);
   assert(drift.probeOutcome === "payload-drift", "write without read should require re-anchor");
-  assert(warmer.getLatestProbeObservation()?.outcome === "payload-drift", "status should retain payload drift");
-  assert(warmer.getStatusText().includes("payload=none"), "payload drift should clear the replay payload");
+  assert(
+    warmer.getLatestProbeObservation()?.outcome === "payload-drift",
+    "payload drift should retain the invalidated probe diagnostic",
+  );
+  assert(warmer.getLifecycleState() === "awaiting-reanchor", "payload drift should await re-anchor");
+  assert(warmer.getStatusText().includes("idle (no anchor)"), "payload drift should clear the replay payload");
+  assert(warmer.getStatusText().includes("payload=none"), "payload drift status should request a re-anchor");
+  const callsBeforeWaitingProbe = responses.length;
+  const waitingAfterDrift = await warmer.warmNow(ctx);
+  assert(waitingAfterDrift.unavailable === true, "payload drift must keep probes disabled");
+  assert(responses.length === callsBeforeWaitingProbe, "awaiting re-anchor must not call the provider");
   assert(notifications.some((entry) => entry.level === "warning"), "payload drift should warn immediately");
 
   // Recapturing the same payload after drift must create a fresh anchor. The
@@ -768,9 +795,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     ctx,
   );
   const reanchoredStatus = warmer.getStatusText();
+  assert(warmer.getLifecycleState() === "anchored", "new real-turn capture should finish re-anchor");
   assert(warmer.getLatestProbeObservation() === null, "re-anchor should clear the prior probe observation");
   assert(
-    warmer.getLatestRealTurnObservation()?.reason === "prefix changed",
+    warmer.getLatestRealTurnObservation()?.reason.includes("payload drift"),
     "re-anchor should mark the continuity boundary",
   );
   assert(reanchoredStatus.includes("probeHits=0"), "re-anchor should reset probe hits");
@@ -779,6 +807,8 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     reanchoredStatus.includes("savings=est. $0.0000 saved"),
     "re-anchor should reset probe savings",
   );
+  warmer.setConfig({ ...warmer.getConfig(), enabled: false });
+  assert(warmer.getLifecycleState() === "disabled", "disabled config should enter disabled state");
   warmer.dispose();
 }
 
@@ -869,7 +899,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(second.probeOutcome === "miss", "second xAI miss should remain retryable");
   const third = await warmer.warmNow(ctx);
   assert(third.probeOutcome === "payload-drift", "repeated xAI misses should request re-anchor");
-  assert(warmer.getStatusText().includes("payload=none"), "xAI repeated misses should clear the replay payload");
+  assert(warmer.getLifecycleState() === "awaiting-reanchor", "xAI drift should await re-anchor");
+  assert(warmer.getStatusText().includes("idle (no anchor)"), "xAI repeated misses should clear the replay payload");
+  assert(warmer.getStatusText().includes("payload=none"), "xAI drift status should request a re-anchor");
+  const xaiCallsBeforeWaitingProbe = calls.length;
+  const xaiWaiting = await warmer.warmNow(ctx);
+  assert(xaiWaiting.unavailable === true, "xAI drift must not probe before re-anchor");
+  assert(calls.length === xaiCallsBeforeWaitingProbe, "xAI awaiting re-anchor must not call the provider");
   assert(notifications.some((entry) => entry.level === "warning"), "xAI re-anchor should be visible");
   warmer.dispose();
 }
