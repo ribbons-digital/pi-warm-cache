@@ -1052,6 +1052,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     },
     ctx,
   );
+  const reanchorCapturedAt = Date.now();
   const reanchoredStatus = warmer.getStatusText();
   assert(warmer.getLifecycleState() === "anchored", "new real-turn capture should finish re-anchor");
   assert(warmer.getLatestProbeObservation() === null, "re-anchor should clear the prior probe observation");
@@ -1065,12 +1066,108 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     reanchoredStatus.includes("savings=est. $0.0000 saved"),
     "re-anchor should reset probe savings",
   );
+  assert(reanchoredStatus.includes("nextDue=none"), "re-anchor must not retain the dropped timer");
+
+  // The fresh anchor uses the real-turn capture time, not an extra full interval
+  // counted from agent_settled after a long turn has finished.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  warmer.onAgentSettled(ctx);
+  const reanchoredDueAt = (warmer as any).nextDueAt as number;
+  assert(reanchoredDueAt > Date.now(), "re-anchor should arm the normal strategy timer");
+  assert(
+    reanchoredDueAt <= reanchorCapturedAt + 60_010,
+    "re-anchor timer should not add settlement time to the normal interval",
+  );
   warmer.setConfig({ ...warmer.getConfig(), enabled: false });
   assert(warmer.getLifecycleState() === "disabled", "disabled config should enter disabled state");
   warmer.dispose();
 }
 
-// 11) Disable/re-enable preserves "awaiting-reanchor" and "blocked" states
+// 11) Hard re-anchor logs the invalidation reason and both payload/cache identities.
+{
+  const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-reanchor-"));
+  const model = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: () => undefined,
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd,
+    model,
+    hasUI: false,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "reanchor-log-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any);
+  const config = {
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    logToFile: true,
+  };
+  const oldPayload = {
+    model: model.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: "old prefix" }] }],
+    prompt_cache_key: "reanchor-old-key",
+  };
+  const newPayload = {
+    model: model.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: "new prefix" }] }],
+    prompt_cache_key: "reanchor-new-key",
+  };
+
+  warmer.bindContext(ctx);
+  warmer.setConfig(config);
+  warmer.capturePayload(oldPayload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  warmer.onAgentSettled(ctx);
+  const oldPayloadFingerprint = stableFingerprint(oldPayload);
+  warmer.invalidateAnchor(ctx, "compacted · waiting for next turn");
+  warmer.capturePayload(newPayload, ctx);
+
+  const events = readFileSync(join(cwd, ".pi", "warm-cache.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  const transition = events.find((event) => event.event === "anchor_reanchored");
+  assert(transition !== undefined, "fresh capture should log an anchor_reanchored transition");
+  assert(transition?.reason === "compacted · waiting for next turn", "transition should preserve the reason");
+  assert(
+    transition?.oldPayloadFingerprint === oldPayloadFingerprint,
+    "transition should log the dropped payload fingerprint",
+  );
+  assert(
+    transition?.newPayloadFingerprint === stableFingerprint(newPayload),
+    "transition should log the fresh payload fingerprint",
+  );
+  assert(
+    typeof transition?.oldCacheKeyFingerprint === "string" &&
+      transition.oldCacheKeyFingerprint !== "reanchor-old-key" &&
+      typeof transition?.newCacheKeyFingerprint === "string" &&
+      transition.newCacheKeyFingerprint !== "reanchor-new-key",
+    "transition should log only redacted old and new cache-key fingerprints",
+  );
+  assert(warmer.getStatusText().includes("nextDue=none"), "re-anchor log capture must not retain the old timer");
+  warmer.dispose();
+  rmSync(cwd, { recursive: true, force: true });
+}
+
+// 12) Disable/re-enable preserves "awaiting-reanchor" and "blocked" states
 {
   const notifications: Array<{ message: string; level: string }> = [];
   const responses: Array<unknown> = [
