@@ -1070,6 +1070,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
   // The fresh anchor uses the real-turn capture time, not an extra full interval
   // counted from agent_settled after a long turn has finished.
+  await new Promise((resolve) => setTimeout(resolve, 20));
   warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
   await new Promise((resolve) => setTimeout(resolve, 20));
   warmer.onAgentSettled(ctx);

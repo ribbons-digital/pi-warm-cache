@@ -744,6 +744,9 @@ export class SessionWarmer {
     if (this.anchor && !preservingReanchorCaptureTime) {
       this.anchor.lastActivityAt = Date.now();
     }
+    if (this.anchor && preservingReanchorCaptureTime) {
+      this.anchor.lastActivityAt = this.reanchorCaptureAt!;
+    }
     this.log({
       event: "agent_settled",
       source: "system",
