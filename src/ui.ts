@@ -6,6 +6,7 @@ import type {
   ProviderCapability,
   StrategyPlan,
   WarmCacheConfig,
+  WarmDeferralState,
 } from "./types.ts";
 
 const WIDGET_ID = "pi-warm-cache";
@@ -95,6 +96,7 @@ export function renderWaitingUi(
   anchor: CacheAnchor,
   plan: StrategyPlan,
   nextDueAt: number,
+  deferral?: WarmDeferralState | null,
 ): void {
   if (!ctx.hasUI) return;
 
@@ -104,6 +106,11 @@ export function renderWaitingUi(
   const ratio = formatProbeRatio(anchor);
   const bestEffort = plan.family === "xai-best-effort";
   const savings = formatSessionSavings(anchor, bestEffort);
+  const waitDetail = deferral
+    ? deferral.reason === "concurrency limit"
+      ? `deferred - ${deferral.activeWarmSessions}/${deferral.maxConcurrentWarmSessions} slots used`
+      : `deferred - ${formatDeferralStatus(deferral)}`
+    : `${savings} · extension probes ${ratio}`;
   // showWidget controls the editor widget only. The status line remains available
   // as the compact extension surface when the widget is hidden.
   const lines = [
@@ -119,7 +126,7 @@ export function renderWaitingUi(
         ? `xAI best-effort cadence · ~${tokens} prefix`
         : `Inside ${plan.ttlLabel} · ~${tokens} prefix`,
     ),
-    ctx.ui.theme.fg("warning", `${savings} · extension probes ${ratio}`),
+    ctx.ui.theme.fg("warning", waitDetail),
   ];
 
   if (config.showWidget) {
@@ -131,9 +138,18 @@ export function renderWaitingUi(
     STATUS_ID,
     ctx.ui.theme.fg(
       "dim",
-      `${bestEffort ? "xAI best-effort " : ""}warm ${waitLabel} · ${ratio} · ~${formatStatusTokens(anchor.cachedTokens || anchor.promptTokens)}`,
+      `${bestEffort ? "xAI best-effort " : ""}warm ${waitLabel} · ${
+        deferral ? `deferred · ${formatDeferralStatus(deferral)}` : ratio
+      } · ~${formatStatusTokens(anchor.cachedTokens || anchor.promptTokens)}`,
     ),
   );
+}
+
+export function formatDeferralStatus(deferral: WarmDeferralState): string {
+  if (deferral.reason === "concurrency limit") {
+    return `${deferral.reason} (${deferral.activeWarmSessions}/${deferral.maxConcurrentWarmSessions} slots used)`;
+  }
+  return deferral.reason;
 }
 
 export function renderWarmHitUi(

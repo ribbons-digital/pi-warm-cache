@@ -210,7 +210,10 @@ PI_WARM_CACHE_DEBUG=1 pi
 
 When enabled, diagnostics are written to `.pi/warm-cache.jsonl`.
 The [diagnostics reference](docs/upgrade-notes.md) defines the `/warm` status fields, lifecycle states, savings summary, and JSONL schema.
-The `/warm` status and `/warm now` result include the provider route, capability state, strategy, cadence, payload fingerprint, redacted cache-key identity, observed usage, and retry state.
+The `/warm` status and `/warm now` result include the provider route, capability state, strategy, cadence, payload fingerprint, redacted cache-key identity, observed usage, retry state, and active warm-session count.
+
+When a timer probe is deferred, `/warm` reports the deferral reason and the occupied concurrency slots.
+The `/warm now` output reports the same information when its request is deferred.
 
 `realTurn=unknown` is used for the first turn, invalidation boundaries, changed prefixes, and prompts below the configured minimum.
 
@@ -297,8 +300,10 @@ interface WarmCacheConfig {
 2. **Implicit-cache probe miss** - retry the first no-read/no-write result quietly, then expose repeated misses.
 3. **Model or thinking-level change** - drop the anchor immediately.
 4. **Compaction or branch navigation** - replace the old anchor on the next real turn.
-5. **Agent busy at a tick** - skip the tick and reschedule without steering the live turn.
+5. **Agent busy at a tick** - skip the tick, report `deferred=agent busy`, and reschedule without steering the live turn.
 6. **Concurrency** - a process-wide gate limits simultaneous warm requests across sessions.
+   A full gate reports `activeWarmSessions=<active>/<max>` and `deferred=concurrency limit (<active>/<max> slots used)`.
+   When file logging is enabled, the deferred tick emits a `warm_deferred` JSONL event without sending a provider request.
 7. **Unsupported provider** - clear the active widget and status without calling the provider.
 8. **Small prefix** - do not warm below the configured minimum cached-token threshold.
 9. **Session resume** - wait for the first real turn instead of restoring an old payload.

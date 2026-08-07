@@ -91,6 +91,8 @@ Inactive-capability output also includes the `manualProbe` field.
 | `cadence` | The human label for the selected cache window or probe cadence. xAI is labelled best effort and has no fixed TTL claim. |
 | `intervalMs` | The configured delay before the next automatic probe in milliseconds, or `none` when no timer is available. |
 | `nextDue` | The next scheduled probe time as an ISO timestamp, or `none`. |
+| `activeWarmSessions` | The current process-wide number of in-flight warm requests and the configured limit for this session, such as `1/3`. |
+| `deferred` | `none`, `agent busy`, or `concurrency limit (<active>/<max> slots used)` when the current session's scheduled probe was postponed. |
 | `realTurn` | The latest cache observation from a real assistant turn. It includes `hit`, `miss`, or `unknown` plus raw read, write, input, prompt, and reason values. |
 | `probe` | The latest response from an extension probe. It includes the outcome, raw read, write, input, output, cost, and short payload fingerprint. |
 | `probeSource` | Always `extension-only` for these counters. It prevents extension probes from being confused with Pi's native cache notices. |
@@ -194,6 +196,7 @@ Fields in the event-specific column are present only when that event has the cor
 | `agent_settled` | `hasPayload` records whether an exact payload is available. `cachedTokens` is the scheduler's prompt-size hint. `realTurnState` and `realTurnReason` identify the latest real-turn observation. `probeOutcome`, `probeHits`, and `probeMisses` identify the latest probe state and counters. `retryState` records the failure streak and configured limit. |
 | `schedule` | `delayMs` is the scheduled delay. `nextDueAt` is the next due time as an ISO timestamp. `reason` identifies the schedule cause, such as `ttl`, `agent busy`, or `concurrency limit`. |
 | `schedule_skipped` | `automaticWarm` and `reason` explain why no timer was armed, such as an unverified capability, unsupported route, or unavailable automatic strategy. |
+| `warm_deferred` | `reason` is `agent busy` or `concurrency limit`. `attemptReason` is `timer` or `manual`. `activeWarmSessions` and `maxConcurrentWarmSessions` record the observed gate state. `providerRequest=false` confirms that the deferred attempt did not call the provider. |
 | `warm_start` | `reason` is `timer` or `manual`. This event marks the start of an extension provider request. |
 | `attempt` | `reason` is `timer`, `manual`, or `system`. `ok` records whether the attempt completed successfully. `detail` contains the short result or error description. `probeOutcome` can be `hit`, `transient-miss`, `miss`, `payload-drift`, `error`, or `unavailable`. `retryState` records the failure streak. `usage` contains the raw `input`, `output`, `cacheRead`, `cacheWrite`, and model-supplied `costTotal` values when a provider response exists. |
 | `anchor_invalidated` | `reason` explains the hard invalidation. The event is `source=system` and can include the route that was invalidated. No old payload is retained for a later probe. |

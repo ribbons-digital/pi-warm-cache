@@ -172,6 +172,10 @@ export default function piWarmCache(pi: ExtensionAPI) {
           `intervalMs=${result.intervalMs ?? "none"}`;
         const cacheKey = `cacheKey=${result.cacheKeyFingerprint ?? "none"}`;
         const retry = `retry=${result.retryState ?? "none"}`;
+        const activeWarmSessions = result.deferred
+          ? `${result.deferred.activeWarmSessions}/${result.deferred.maxConcurrentWarmSessions}`
+          : `${warmer.getActiveWarmSessions()}/${warmer.getConfig().maxConcurrentWarmSessions}`;
+        const activeWarm = `activeWarmSessions=${activeWarmSessions}`;
         const manualOnly =
           result.capabilityState === "unverified" && warmer.getCapability().manualProbe;
         const manualOnlyWarning =
@@ -184,9 +188,16 @@ export default function piWarmCache(pi: ExtensionAPI) {
           result.capabilityState === "unverified"
             ? "savingsSummary=n/a (unverified route)"
             : `savingsSummary=${warmer.getSavingsSummaryText()}`;
+        const deferral = result.deferred
+          ? `deferred=${result.deferred.reason} (${result.deferred.activeWarmSessions}/${result.deferred.maxConcurrentWarmSessions} slots used); `
+          : "";
         const diagnostics =
           `${route}; ${capability}; ${strategy}; ${cacheKey}; ${usage}; ` +
-          `source=extension-only; ${fingerprint}; ${retry}; ${savings}`;
+          `source=extension-only; ${fingerprint}; ${retry}; ${activeWarm}; ${deferral}${savings}`;
+        if (result.deferred) {
+          ctx.ui.notify(`Probe deferred - ${result.deferred.reason} (${diagnostics})`, "warning");
+          return;
+        }
         if (!result.ok) {
           const failureLabel =
             result.unavailable || result.capabilityState === "unsupported"
