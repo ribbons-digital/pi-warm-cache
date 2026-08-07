@@ -1411,12 +1411,8 @@ export class SessionWarmer {
             true,
           );
         }
-        if (ctx.hasUI) {
-          ctx.ui.notify(
-            `pi-warm-cache WARNING: automatic warming is disabled for this unverified route; ${detail}. No active keepalive or verified savings claim. Savings are n/a (unverified route).`,
-            "warning",
-          );
-        }
+        // The /warm now command owns the user-facing warning and full
+        // diagnostics. Keep this lifecycle layer silent to avoid duplicate toasts.
         this.clearCapabilityUi(ctx);
         return result;
       }

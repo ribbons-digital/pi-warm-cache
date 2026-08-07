@@ -36,6 +36,7 @@ import {
   formatSavingsSummary,
   resolveModelPricing,
 } from "./savings.ts";
+import piWarmCache from "./index.ts";
 import { SessionWarmer } from "./warmer.ts";
 import {
   renderCapabilityNotice,
@@ -1349,15 +1350,54 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(warmer.getSavingsSummaryText() === "n/a (unverified route)", "manual-only savings must stay n/a");
   assert(calls === 1, "manual-only route should call the provider only for /warm now");
   assert(
-    notifications.some(
-      (entry) => entry.level === "warning" && entry.message.includes("automatic warming is disabled"),
-    ),
-    "manual probe should warn that automatic warming remains disabled",
+    notifications.length === 0,
+    "SessionWarmer must leave the manual-only warning to the /warm now command",
   );
   warmer.dispose();
 }
 
-// 13) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
+// 13) /warm now owns one manual-only warning and does not duplicate it.
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  let warmHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+  const pi = {
+    registerFlag: () => undefined,
+    getFlag: () => "true",
+    on: () => undefined,
+    registerCommand: (_name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => {
+      warmHandler = command.handler;
+    },
+  } as any;
+  piWarmCache(pi);
+  assert(warmHandler !== undefined, "warm command should be registered");
+  const ctx = {
+    model: {
+      id: "grok-4.3",
+      provider: "xai",
+      api: "openai-responses",
+      baseUrl: "https://api.x.ai/v1",
+    },
+    hasUI: true,
+    isIdle: () => true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+  } as any;
+  await warmHandler!("now", ctx);
+  assert(notifications.length === 1, "manual-only /warm now should emit exactly one warning");
+  assert(notifications[0]!.level === "warning", "manual-only /warm now notice should be warning-level");
+  assert(
+    notifications[0]!.message.includes("automatic warming is disabled") &&
+      notifications[0]!.message.includes("manual-only") &&
+      notifications[0]!.message.includes("n/a (unverified route)"),
+    "manual-only /warm now warning should include the complete UX guidance",
+  );
+}
+
+// 14) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
 {
   const calls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
   const ui = {
