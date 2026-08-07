@@ -27,6 +27,7 @@ import {
 } from "./savings.ts";
 import {
   clearWarmUi,
+  formatDeferralStatus,
   renderFailureUi,
   renderIdleUi,
   renderManualOnlyUi,
@@ -43,6 +44,8 @@ import type {
   ProviderCapability,
   RealTurnObservation,
   WarmCacheConfig,
+  WarmDeferralReason,
+  WarmDeferralState,
   WarmLifecycleState,
   WarmResult,
 } from "./types.ts";
@@ -51,6 +54,11 @@ import { DEFAULT_CONFIG } from "./types.ts";
 /** Process-wide gate so many sessions do not warm at once. */
 class WarmConcurrencyGate {
   private active = 0;
+
+  getActive(): number {
+    return this.active;
+  }
+
   tryEnter(max: number): boolean {
     if (this.active >= max) return false;
     this.active += 1;
@@ -105,6 +113,8 @@ export class SessionWarmer {
   private autoWarmBlockReason: string | null = null;
   /** Consecutive Codex warm ticks with out >= CODEX_WARM_OUTPUT_ABORT_TOKENS. */
   private consecutiveCodexOversized = 0;
+  /** Last scheduled probe deferral, retained until a probe gets a slot. */
+  private deferredProbe: WarmDeferralState | null = null;
   /** Last warm attempt error/result summary for /warm status. */
   private lastAttempt: {
     at: number;
@@ -137,6 +147,18 @@ export class SessionWarmer {
 
   getLifecycleState(): WarmLifecycleState {
     return this.lifecycleState;
+  }
+
+  getActiveWarmSessions(): number {
+    return globalGate.getActive();
+  }
+
+  getDeferredProbe(): WarmDeferralState | null {
+    if (!this.deferredProbe) return null;
+    return {
+      ...this.deferredProbe,
+      activeWarmSessions: globalGate.getActive(),
+    };
   }
 
   getSessionWarmStats(): Pick<
@@ -262,6 +284,7 @@ export class SessionWarmer {
     this.anchor = null;
     this.lastInvalidatedProbe = null;
     this.lastPayload = null;
+    this.deferredProbe = null;
     this.capability = null;
     this.realTurnBoundaryReason = "session ended";
     this.realTurnContinuity = false;
@@ -286,6 +309,7 @@ export class SessionWarmer {
     this.lastInvalidatedProbe = preserveProbe ? (this.anchor?.latestProbe ?? null) : null;
     this.anchor = null;
     this.lastPayload = null;
+    this.deferredProbe = null;
     this.realTurnBoundaryReason = reason;
     this.realTurnContinuity = false;
     this.plan = null;
@@ -333,6 +357,7 @@ export class SessionWarmer {
 
     this.ctx = ctx;
     this.logFile = warmLogPath(ctx.cwd);
+    this.deferredProbe = null;
     const payloadFingerprint = stableFingerprint(payload);
     const model = ctx.model;
     const cacheKeyFingerprint = getPromptCacheKeyFingerprint(payload, model?.api);
@@ -719,6 +744,8 @@ export class SessionWarmer {
     const cadence = this.plan?.ttlLabel ?? "none";
     const intervalMs = this.plan?.intervalMs ?? null;
     const nextDue = this.nextDueAt ? new Date(this.nextDueAt).toISOString() : "none";
+    const activeWarmSessions = globalGate.getActive();
+    const deferredProbe = this.getDeferredProbe();
     const probeHits = anchor?.probeHitCount ?? 0;
     const probeMisses = anchor?.probeMissCount ?? 0;
     const stableBlock = [
@@ -732,6 +759,8 @@ export class SessionWarmer {
       `cadence=${cadence}`,
       `intervalMs=${intervalMs ?? "none"}`,
       `nextDue=${nextDue}`,
+      `activeWarmSessions=${activeWarmSessions}/${this.config.maxConcurrentWarmSessions}`,
+      `deferred=${deferredProbe ? formatDeferralStatus(deferredProbe) : "none"}`,
       `realTurn=${realTurn}`,
       `probe=${probe}`,
       "probeSource=extension-only",
@@ -900,7 +929,7 @@ export class SessionWarmer {
     }
     this.nextDueAt = Date.now() + delay;
 
-    renderWaitingUi(ctx, this.config, anchor, plan, this.nextDueAt);
+    renderWaitingUi(ctx, this.config, anchor, plan, this.nextDueAt, this.getDeferredProbe());
     this.log({
       event: "schedule",
       source: "system",
@@ -926,7 +955,14 @@ export class SessionWarmer {
 
     this.uiTimer = setInterval(() => {
       if (!this.ctx || !this.anchor || !this.plan || this.plan.intervalMs === null) return;
-      renderWaitingUi(this.ctx, this.config, this.anchor, this.plan, this.nextDueAt);
+      renderWaitingUi(
+        this.ctx,
+        this.config,
+        this.anchor,
+        this.plan,
+        this.nextDueAt,
+        this.getDeferredProbe(),
+      );
     }, 15_000);
     unrefTimer(this.uiTimer);
   }
@@ -947,6 +983,7 @@ export class SessionWarmer {
     this.clearTimers();
     this.abort?.abort();
     this.abort = null;
+    if (reason === "disabled") this.deferredProbe = null;
     if (!this.ctx) return;
     if (this.currentCapability(this.ctx).state === "verified") {
       this.showIdle(this.ctx, reason);
@@ -1164,6 +1201,56 @@ export class SessionWarmer {
     };
   }
 
+  private deferProbe(
+    reason: WarmDeferralReason,
+    attemptReason: "timer" | "manual",
+  ): WarmDeferralState {
+    const deferral: WarmDeferralState = {
+      reason,
+      activeWarmSessions: globalGate.getActive(),
+      maxConcurrentWarmSessions: this.config.maxConcurrentWarmSessions,
+      deferredAt: Date.now(),
+    };
+    this.deferredProbe = deferral;
+    const detail = `warm ${attemptReason} deferred - ${formatDeferralStatus(deferral)}`;
+    const capability = this.currentCapability(this.ctx);
+    this.log({
+      event: "warm_deferred",
+      source: "warm_probe",
+      sessionId: this.anchor?.sessionId,
+      provider: this.anchor?.provider ?? this.ctx?.model?.provider,
+      modelId: this.anchor?.modelId ?? this.ctx?.model?.id,
+      api: this.anchor?.modelApi ?? this.ctx?.model?.api,
+      capabilityState: capability.state,
+      capabilityReason: capability.reason,
+      automaticWarm: capability.automaticWarm,
+      manualProbe: capability.manualProbe,
+      family: this.anchor?.cacheFamily,
+      cacheKeyFingerprint:
+        this.anchor?.cacheKeyFingerprint ?? getPromptCacheKeyFingerprint(this.lastPayload, this.ctx?.model?.api),
+      payloadFingerprint: this.anchor?.payloadFingerprint,
+      reason,
+      attemptReason,
+      detail,
+      deferred: true,
+      activeWarmSessions: deferral.activeWarmSessions,
+      maxConcurrentWarmSessions: deferral.maxConcurrentWarmSessions,
+      providerRequest: false,
+    });
+    return deferral;
+  }
+
+  private buildDeferredWarmResult(anchor: CacheAnchor, deferral: WarmDeferralState): WarmResult {
+    return {
+      ...buildWarmResult({
+        fingerprint: anchor.payloadFingerprint,
+        error: deferral.reason,
+        anchor,
+      }),
+      deferred: deferral,
+    };
+  }
+
   private async runWarm(reason: "timer" | "manual"): Promise<WarmResult> {
     const ctx = this.ctx;
     const anchor = this.anchor;
@@ -1301,13 +1388,10 @@ export class SessionWarmer {
     }
 
     if (!ctx.isIdle() && reason === "timer") {
-      this.recordAttempt(reason, false, "agent busy");
+      const deferral = this.deferProbe("agent busy", reason);
+      this.recordAttempt(reason, false, `agent busy - ${formatDeferralStatus(deferral)}`);
       this.reschedule({ delayMs: DEFER_BACKOFF_MS, reason: "agent busy" });
-      return buildWarmResult({
-        fingerprint: anchor.payloadFingerprint,
-        error: "agent busy",
-        anchor,
-      });
+      return this.buildDeferredWarmResult(anchor, deferral);
     }
 
     if (this.warming) {
@@ -1348,15 +1432,13 @@ export class SessionWarmer {
     }
 
     if (!globalGate.tryEnter(this.config.maxConcurrentWarmSessions)) {
-      this.recordAttempt(reason, false, "concurrency limit");
+      const deferral = this.deferProbe("concurrency limit", reason);
+      this.recordAttempt(reason, false, formatDeferralStatus(deferral));
       this.reschedule({ delayMs: DEFER_BACKOFF_MS, reason: "concurrency limit" });
-      return buildWarmResult({
-        fingerprint: anchor.payloadFingerprint,
-        error: "concurrency limit",
-        anchor,
-      });
+      return this.buildDeferredWarmResult(anchor, deferral);
     }
 
+    this.deferredProbe = null;
     this.warming = true;
     this.abort = new AbortController();
     const fingerprint = anchor.payloadFingerprint;

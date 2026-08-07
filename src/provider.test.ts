@@ -6,6 +6,9 @@
  * Do not launch this in the same parallel batch as an edit of this file.
  */
 
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
@@ -1506,7 +1509,190 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   );
 }
 
-// 14) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
+// 14) Process-wide concurrency observability defers without sending an extra probe.
+{
+  const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-concurrency-"));
+  const model = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+    cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
+  } as any;
+  let calls = 0;
+  let releaseFirst: ((value: any) => void) | null = null;
+  let signalFirstStarted: (() => void) | null = null;
+  const firstStarted = new Promise<void>((resolve) => {
+    signalFirstStarted = resolve;
+  });
+  const completeStub = async (): Promise<any> => {
+    calls += 1;
+    if (calls === 1) {
+      signalFirstStarted?.();
+      return new Promise((resolve) => {
+        releaseFirst = resolve;
+      });
+    }
+    return {
+      stopReason: "stop",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 100,
+        cacheWrite: 0,
+        cost: { total: 0.01 },
+      },
+    };
+  };
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: () => undefined,
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const makeContext = (sessionId: string) =>
+    ({
+      cwd,
+      model,
+      hasUI: false,
+      ui,
+      thinkingLevel: "off",
+      isIdle: () => true,
+      sessionManager: { getSessionId: () => sessionId },
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+      },
+    }) as any;
+  const payload = (sessionId: string) => ({
+    model: model.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: "concurrency" }] }],
+    prompt_cache_key: sessionId,
+  });
+  const warmerA = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  const warmerB = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  const ctxA = makeContext("concurrency-a");
+  const ctxB = makeContext("concurrency-b");
+
+  warmerA.bindContext(ctxA);
+  warmerB.bindContext(ctxB);
+  const config = {
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConcurrentWarmSessions: 1,
+    logToFile: true,
+  };
+  warmerA.setConfig(config);
+  warmerB.setConfig(config);
+  warmerA.capturePayload(payload("concurrency-a"), ctxA);
+  warmerB.capturePayload(payload("concurrency-b"), ctxB);
+  warmerA.noteAssistantUsage(ctxA, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  warmerB.noteAssistantUsage(ctxB, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+
+  const firstPromise = warmerA.warmNow(ctxA);
+  await firstStarted;
+  assert(warmerA.getActiveWarmSessions() === 1, "first warmer should occupy the process-wide slot");
+  assert(
+    warmerA.getStatusText().includes("activeWarmSessions=1/1"),
+    "status should expose the active process-wide warm session count",
+  );
+
+  const deferred = await warmerB.warmNow(ctxB);
+  assert(deferred.deferred?.reason === "concurrency limit", "full gate should mark the probe deferred");
+  assert(deferred.deferred?.activeWarmSessions === 1, "deferral should record the occupied slot count");
+  assert(calls === 1, "a full concurrency gate must not call the provider");
+  assert(warmerB.getDeferredProbe()?.reason === "concurrency limit", "status state should retain the deferral");
+  const deferredStatus = warmerB.getStatusText();
+  assert(
+    deferredStatus.includes("activeWarmSessions=1/1") &&
+      deferredStatus.includes("deferred=concurrency limit (1/1 slots used)"),
+    "status should explain the full concurrency gate",
+  );
+
+  const events = readFileSync(join(cwd, ".pi", "warm-cache.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  const gateEvent = events.find((event) => event.event === "warm_deferred" && event.reason === "concurrency limit");
+  assert(gateEvent !== undefined, "concurrency deferral should emit a JSONL event");
+  assert(gateEvent?.activeWarmSessions === 1, "JSONL deferral should record active warm sessions");
+  assert(gateEvent?.maxConcurrentWarmSessions === 1, "JSONL deferral should record the configured limit");
+  assert(gateEvent?.providerRequest === false, "deferred JSONL event must state that no provider request was sent");
+
+  const release = releaseFirst as unknown as (value: any) => void;
+  release({
+    stopReason: "stop",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 100,
+      cacheWrite: 0,
+      cost: { total: 0.01 },
+    },
+  });
+  const firstResult = await firstPromise;
+  assert(firstResult.ok, "the first warmer should complete after its slot is released");
+  assert(warmerA.getActiveWarmSessions() === 0, "the gate should release the slot after completion");
+
+  const retry = await warmerB.warmNow(ctxB);
+  assert(retry.ok && retry.deferred === undefined, "a deferred warmer should retry once a slot is free");
+  assert(warmerB.getDeferredProbe() === null, "a probe that gets a slot should clear its deferral state");
+  assert(Number(calls) === 2, "the retry should be the only provider call after the deferred tick");
+
+  warmerA.dispose();
+  warmerB.dispose();
+  rmSync(cwd, { recursive: true, force: true });
+}
+
+// 15) Agent-busy timer ticks retain an explicit deferral reason.
+{
+  const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-busy-"));
+  const model = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+  } as any;
+  let calls = 0;
+  const completeStub = async (): Promise<any> => {
+    calls += 1;
+    return { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0 } };
+  };
+  const ctx = {
+    cwd,
+    model,
+    hasUI: false,
+    ui: { theme: { fg: (_color: string, text: string) => text }, setStatus: () => undefined, setWidget: () => undefined },
+    thinkingLevel: "off",
+    isIdle: () => false,
+    sessionManager: { getSessionId: () => "busy-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000, logToFile: true });
+  warmer.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "busy" }] }],
+      prompt_cache_key: "busy-test",
+    },
+    ctx,
+  );
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+
+  const result = await (warmer as any).runWarm("timer");
+  assert(result.deferred?.reason === "agent busy", "a busy timer tick should be marked deferred");
+  assert(calls === 0, "a busy timer tick must not call the provider");
+  assert(warmer.getStatusText().includes("deferred=agent busy"), "status should expose the busy deferral reason");
+  warmer.dispose();
+  rmSync(cwd, { recursive: true, force: true });
+}
+
+// 16) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
 {
   const calls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
   const ui = {
@@ -1563,6 +1749,31 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(
     statuses.some((status) => /warm [0-9.]+m · 2\/2 · ~128k/.test(status)),
     "healthy status should show cadence, probe ratio, and prompt size",
+  );
+
+  renderWaitingUi(
+    ctx,
+    { ...DEFAULT_CONFIG, showWidget: true },
+    anchor,
+    plan,
+    Date.now() + 180_000,
+    {
+      reason: "concurrency limit",
+      activeWarmSessions: 2,
+      maxConcurrentWarmSessions: 3,
+      deferredAt: Date.now(),
+    },
+  );
+  const deferredWidget = calls.filter((call) => call.kind === "widget").at(-1)?.value;
+  const deferredStatus = String(calls.filter((call) => call.kind === "status").at(-1)?.value);
+  assert(
+    Array.isArray(deferredWidget) &&
+      deferredWidget.some((line) => String(line).includes("deferred - 2/3 slots used")),
+    "waiting widget should show the gate deferral and occupied slots",
+  );
+  assert(
+    deferredStatus.includes("deferred · concurrency limit (2/3 slots used)"),
+    "waiting status should show the gate deferral and occupied slots",
   );
 
   const xaiCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];

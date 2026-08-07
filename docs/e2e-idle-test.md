@@ -152,6 +152,15 @@ pricing in `savings.ts`, not billed data. It debits actual warm spend on every
 tick, so a negative number means warming costs more than it saves. For a real
 cost claim, cross-check the Anthropic console usage for the test window.
 
+## Light concurrency check
+
+1. Open two Pi sessions that share one extension process and capture a large verified anchor in each session.
+2. Set `max=1` with `/warm interval=45s max=1` in both sessions.
+3. Let one session enter a warm probe, then allow the other session's timer to tick while the first request is still in flight.
+4. In the deferred session, `/warm` should show `activeWarmSessions=1/1` and `deferred=concurrency limit (1/1 slots used)`.
+5. With `PI_WARM_CACHE_DEBUG=1`, confirm a `warm_deferred` event with `providerRequest=false` and confirm that the deferred tick did not call the provider.
+6. After the first probe completes, the deferred session should retry and clear its deferral state.
+
 ## Things that will make the test lie to you
 
 - **Anthropic 5m TTL is sliding.** Any background activity refreshes it for

@@ -46,6 +46,17 @@ export type ProbeOutcome =
   | "error"
   | "unavailable";
 
+export type WarmDeferralReason = "agent busy" | "concurrency limit";
+
+/** A scheduled warm probe that was postponed before a provider request. */
+export interface WarmDeferralState {
+  reason: WarmDeferralReason;
+  /** Number of in-flight warm requests when the deferral was recorded. */
+  activeWarmSessions: number;
+  maxConcurrentWarmSessions: number;
+  deferredAt: number;
+}
+
 /** One provider response from the extension's warm probe path. */
 export interface ProbeObservation {
   outcome: ProbeOutcome;
@@ -196,6 +207,8 @@ export interface WarmResult {
   cacheKeyFingerprint?: string;
   /** True when a probe was rejected before any provider request. */
   unavailable?: boolean;
+  /** Set when the attempt was postponed before any provider request. */
+  deferred?: WarmDeferralState;
   provider?: string;
   modelId?: string;
   api?: string;
