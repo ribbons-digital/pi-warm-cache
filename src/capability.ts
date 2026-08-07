@@ -108,10 +108,13 @@ function resolveManualOnlyProxyCapability(model: Model<any>): ProviderCapability
   }
 
   const sessionAffinityFormat = getCompat(model)?.sessionAffinityFormat;
-  if (
-    sessionAffinityFormat !== undefined &&
-    !registration.sessionAffinityFormats.has(sessionAffinityFormat)
-  ) {
+  if (sessionAffinityFormat === undefined) {
+    return capability(
+      "unsupported",
+      `${registration.label} manual-only route requires cache-routing metadata; automatic and manual warming are disabled without a registered sessionAffinityFormat`,
+    );
+  }
+  if (!registration.sessionAffinityFormats.has(sessionAffinityFormat)) {
     return capability(
       "unsupported",
       `${registration.label} manual-only route has unsupported cache-routing metadata; automatic and manual warming are disabled for this route`,

@@ -412,6 +412,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     provider: "openrouter",
     api: "openai-responses",
     baseUrl: "https://openrouter.ai/api/v1",
+    compat: { sessionAffinityFormat: "openrouter" },
   } as any;
   const openRouterCapability = resolveProviderCapability(openRouterXai);
   assert(openRouterCapability.state === "unverified", "OpenRouter should use the manual-only tier");
@@ -445,11 +446,27 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "OpenRouter routes with non-OpenRouter routing metadata must fail closed",
   );
 
+  const openRouterMissingMetadata = {
+    id: "x-ai/grok-4.5",
+    provider: "openrouter",
+    api: "openai-responses",
+    baseUrl: "https://openrouter.ai/api/v1",
+  } as any;
+  assert(
+    resolveProviderCapability(openRouterMissingMetadata).state === "unsupported",
+    "OpenRouter routes with missing session-affinity metadata must fail closed",
+  );
+  assert(
+    !resolveProviderCapability(openRouterMissingMetadata).manualProbe,
+    "OpenRouter routes with missing metadata must not enable manualProbe",
+  );
+
   const openCodeGrok = {
     id: "grok-4.5",
     provider: "opencode-go",
     api: "openai-responses",
     baseUrl: "https://opencode.ai/zen/go/v1",
+    compat: { sessionAffinityFormat: "openai" },
   } as any;
   const openCodeCapability = resolveProviderCapability(openCodeGrok);
   assert(openCodeCapability.state === "unverified", "OpenCode Go should use the manual-only tier");
@@ -467,6 +484,21 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(
     resolveProviderCapability(openCodeWrongRouting).state === "unsupported",
     "OpenCode Go routes with OpenRouter routing metadata must fail closed",
+  );
+
+  const openCodeMissingMetadata = {
+    id: "grok-4.5",
+    provider: "opencode-go",
+    api: "openai-responses",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  assert(
+    resolveProviderCapability(openCodeMissingMetadata).state === "unsupported",
+    "OpenCode Go routes with missing session-affinity metadata must fail closed",
+  );
+  assert(
+    !resolveProviderCapability(openCodeMissingMetadata).manualProbe,
+    "OpenCode Go routes with missing metadata must not enable manualProbe",
   );
 
   const unknownResponses = {
