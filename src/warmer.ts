@@ -29,6 +29,7 @@ import {
   clearWarmUi,
   renderFailureUi,
   renderIdleUi,
+  renderManualOnlyUi,
   renderProbeRetryUi,
   renderReanchorUi,
   renderWaitingUi,
@@ -955,6 +956,20 @@ export class SessionWarmer {
   }
 
   private clearCapabilityUi(ctx: ExtensionContext): void {
+    const capability = this.currentCapability(ctx);
+    if (
+      this.config.enabled &&
+      capability.state === "unverified" &&
+      capability.manualProbe
+    ) {
+      renderManualOnlyUi(
+        ctx,
+        this.config,
+        capability,
+        Boolean(this.anchor?.manualProbeAvailable),
+      );
+      return;
+    }
     clearWarmUi(ctx);
   }
 

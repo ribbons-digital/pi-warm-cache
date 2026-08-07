@@ -13,6 +13,38 @@ const ANTHROPIC_FIRST_PARTY_HOSTS = new Set(["api.anthropic.com"]);
 const OPENAI_FIRST_PARTY_HOSTS = new Set(["api.openai.com"]);
 const XAI_FIRST_PARTY_HOSTS = new Set(["api.x.ai"]);
 
+type ManualOnlyRouteRegistration = {
+  provider: string;
+  label: string;
+  apis: ReadonlySet<string>;
+  hosts: ReadonlySet<string>;
+  sessionAffinityFormats: ReadonlySet<NonNullable<RouteCompat["sessionAffinityFormat"]>>;
+};
+
+/**
+ * Routes in this list are deliberately manual-only.
+ *
+ * Provider identity, API transport, first-party proxy endpoint, and the
+ * adapter's routing format must all match before a captured payload can be
+ * probed. This list is not an OpenAI/Anthropic compatibility fallback.
+ */
+const MANUAL_ONLY_PROXY_ROUTES: readonly ManualOnlyRouteRegistration[] = [
+  {
+    provider: "openrouter",
+    label: "OpenRouter",
+    apis: new Set(["openai-responses", "openai-completions"]),
+    hosts: new Set(["openrouter.ai"]),
+    sessionAffinityFormats: new Set(["openrouter"]),
+  },
+  {
+    provider: "opencode-go",
+    label: "OpenCode Go",
+    apis: new Set(["openai-responses", "openai-completions"]),
+    hosts: new Set(["opencode.ai"]),
+    sessionAffinityFormats: new Set(["openai", "openai-nosession"]),
+  },
+];
+
 function getCompat(model: Model<any>): RouteCompat | undefined {
   return (model as { compat?: RouteCompat }).compat;
 }
@@ -47,6 +79,50 @@ function hasXaiCacheRoutingMetadata(model: Model<any>): boolean {
 
 function routeLabel(model: Model<any>): string {
   return `${model.provider || "unknown"}/${model.api || "unknown"}`;
+}
+
+function resolveManualOnlyProxyCapability(model: Model<any>): ProviderCapability | null {
+  const registration = MANUAL_ONLY_PROXY_ROUTES.find(
+    (route) => route.provider === model.provider,
+  );
+  if (!registration) return null;
+
+  if (!registration.apis.has(model.api)) {
+    return capability(
+      "unsupported",
+      `${registration.label} route API ${model.api || "unknown"} is not registered for manual-only probing; automatic and manual warming are disabled`,
+    );
+  }
+
+  if (!model.baseUrl) {
+    return capability(
+      "unsupported",
+      `${registration.label} manual-only route requires an explicit baseUrl on ${[...registration.hosts][0]}; automatic and manual warming are disabled without the registered proxy endpoint`,
+    );
+  }
+  if (!hasFirstPartyBaseUrl(model, new Set(registration.hosts))) {
+    return capability(
+      "unsupported",
+      `${registration.label} manual-only route baseUrl is not the registered ${[...registration.hosts][0]} endpoint; automatic and manual warming are disabled for this route`,
+    );
+  }
+
+  const sessionAffinityFormat = getCompat(model)?.sessionAffinityFormat;
+  if (
+    sessionAffinityFormat !== undefined &&
+    !registration.sessionAffinityFormats.has(sessionAffinityFormat)
+  ) {
+    return capability(
+      "unsupported",
+      `${registration.label} manual-only route has unsupported cache-routing metadata; automatic and manual warming are disabled for this route`,
+    );
+  }
+
+  return capability(
+    "unverified",
+    `${registration.label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)`,
+    true,
+  );
 }
 
 /**
@@ -150,6 +226,12 @@ export function resolveProviderCapability(
 
   const route = routeLabel(model);
   const compat = getCompat(model);
+
+  // Selected proxy routes have their own explicit manual-only registration.
+  // Resolve them before generic Anthropic/OpenAI compatibility checks so a
+  // proxy cannot become verified merely by copying first-party metadata.
+  const manualOnlyProxy = resolveManualOnlyProxyCapability(model);
+  if (manualOnlyProxy) return manualOnlyProxy;
 
   // Anthropic-compatible routes are verified only when the route metadata says
   // that Anthropic cache markers are emitted, or when the provider is first-party.
@@ -258,20 +340,6 @@ export function resolveProviderCapability(
       "unverified",
       "direct xAI best-effort route has no verified automatic keepalive strategy; automatic warming is disabled, but a safe captured payload may be probed once with /warm now",
       true,
-    );
-  }
-
-  if (model.provider === "openrouter") {
-    return capability(
-      "unsupported",
-      "OpenRouter routes do not inherit first-party cache strategies; automatic and manual warming are disabled for this route",
-    );
-  }
-
-  if (model.provider === "opencode-go") {
-    return capability(
-      "unsupported",
-      "OpenCode Go routes do not inherit first-party cache strategies; automatic and manual warming are disabled for this route",
     );
   }
 

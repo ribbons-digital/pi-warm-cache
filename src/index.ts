@@ -67,7 +67,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
       } else {
         const noticeKey = `${capability.state}:${capability.reason}:${capability.manualProbe}`;
         if (noticeKey !== lastCapabilityNoticeKey) {
-          renderCapabilityNotice(ctx, capability);
+          renderCapabilityNotice(ctx, capability, config);
           lastCapabilityNoticeKey = noticeKey;
         }
       }
@@ -172,9 +172,13 @@ export default function piWarmCache(pi: ExtensionAPI) {
           `intervalMs=${result.intervalMs ?? "none"}`;
         const cacheKey = `cacheKey=${result.cacheKeyFingerprint ?? "none"}`;
         const retry = `retry=${result.retryState ?? "none"}`;
+        const manualOnly =
+          result.capabilityState === "unverified" && warmer.getCapability().manualProbe;
         const manualOnlyWarning =
           result.capabilityState === "unverified"
-            ? `WARNING: ${xaiBestEffort ? "xAI best-effort " : ""}automatic warming is disabled for this unverified route; /warm now is manual-only and savings are n/a (unverified route). `
+            ? manualOnly
+              ? `WARNING: ${xaiBestEffort ? "xAI best-effort " : ""}manual-only route; automatic warming is disabled, /warm now is the only probe path, and savings are n/a (unverified route). `
+              : "WARNING: automatic warming is disabled for this unverified route; no safe manual probe is available. "
             : "";
         const savings =
           result.capabilityState === "unverified"

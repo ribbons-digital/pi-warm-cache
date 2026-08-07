@@ -52,9 +52,13 @@ Repeated no-read/no-write probes stop warming and request a new real-turn anchor
 Other direct xAI models on the first-party xAI endpoint can use one clearly labelled manual probe when their captured payload is safe to replay.
 They do not receive an automatic timer or a verified savings claim.
 
+Selected OpenRouter and OpenCode Go routes are also manual-only.
+They must use the registered first-party proxy endpoint, an explicitly supported API transport, and compatible session-affinity metadata.
+They never inherit a first-party OpenAI or Anthropic strategy.
+
 ### Unsupported routes
 
-OpenRouter, OpenCode Go, and other API-compatible proxy routes do not inherit first-party support.
+Unregistered proxy routes, proxy routes with a different endpoint or routing format, and other API-compatible routes do not receive support.
 Routes without an explicit registered capability are rejected before the provider is called.
 
 ## When this helps / When it does not
@@ -71,6 +75,7 @@ Routes without an explicit registered capability are rejected before the provide
 - It does not warm a prefix below `minCachedTokens` or make a small prompt more valuable to cache.
 - It does not enable automatic warming for unsupported, proxy, or unverified routes.
 - Manual-only routes can use one safe `/warm now` probe, but they do not receive a timer or a verified savings claim.
+- Registered OpenRouter and OpenCode Go routes remain unverified even when their proxy payload reports cache usage.
 - xAI best-effort warming does not promise a provider TTL, a cache hit, or a fixed saving amount.
 - It does not preserve an old anchor after compaction, model or thinking-level changes, branch changes, or other prefix drift.
 - It does not invent a savings amount when the active model has no usable pricing data.
@@ -299,8 +304,9 @@ interface WarmCacheConfig {
 9. **Session resume** - wait for the first real turn instead of restoring an old payload.
 10. **Print or RPC mode** - keep warming when enabled, but skip TUI widgets when no UI exists.
 11. **Direct xAI Grok 4.5** - require the first-party Responses route and a stable captured `prompt_cache_key`.
-12. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
-13. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
+12. **Manual-only proxy routes** - require the explicitly registered provider, API transport, proxy endpoint, and routing metadata; never arm a timer.
+13. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
+14. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 
 ## Package layout
 
