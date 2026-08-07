@@ -24,19 +24,21 @@ export function renderCapabilityNotice(
 ): void {
   if (!ctx.hasUI) return;
   clearWarmUi(ctx);
+  const xai = /xai/i.test(capability.reason);
+  const routeLabel = xai ? "xAI best-effort" : "pi-warm-cache";
   if (capability.state === "unverified") {
     const mode = capability.manualProbe ? "manual-only route" : "unverified route";
     const probe = capability.manualProbe
       ? "Use /warm now for one safe captured-payload probe."
       : "No safe manual probe is available for this captured route.";
     ctx.ui.notify(
-      `pi-warm-cache ${mode}: ${capability.reason}. Automatic warming is disabled. ${probe} Savings are n/a (unverified route).`,
+      `${routeLabel} ${mode}: ${capability.reason}. Automatic warming is disabled. ${probe} Savings are n/a (unverified route).`,
       "warning",
     );
     return;
   }
   ctx.ui.notify(
-    `pi-warm-cache inactive (unsupported route): ${capability.reason}. Automatic and manual warming are disabled.`,
+    `${xai ? "xAI best-effort inactive" : "pi-warm-cache inactive"} (unsupported route): ${capability.reason}. Automatic and manual warming are disabled.`,
     "info",
   );
 }
@@ -55,11 +57,16 @@ export function renderWaitingUi(
   const tokens = formatStatusTokens(anchor.cachedTokens || anchor.promptTokens);
   const ratio = formatProbeRatio(anchor);
   const bestEffort = plan.family === "xai-best-effort";
-  const savings = formatSessionSavings(anchor);
+  const savings = formatSessionSavings(anchor, bestEffort);
   // showWidget controls the editor widget only. The status line remains available
   // as the compact extension surface when the widget is hidden.
   const lines = [
-    ctx.ui.theme.fg("accent", `⚡ Cache-warm wait · extension probe in ${waitLabel}`),
+    ctx.ui.theme.fg(
+      "accent",
+      bestEffort
+        ? `⚡ xAI best-effort cache-warm wait · extension probe in ${waitLabel}`
+        : `⚡ Cache-warm wait · extension probe in ${waitLabel}`,
+    ),
     ctx.ui.theme.fg(
       "dim",
       bestEffort
@@ -76,7 +83,10 @@ export function renderWaitingUi(
   }
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("dim", `warm ${waitLabel} · ${ratio} · ~${formatStatusTokens(anchor.cachedTokens || anchor.promptTokens)}`),
+    ctx.ui.theme.fg(
+      "dim",
+      `${bestEffort ? "xAI best-effort " : ""}warm ${waitLabel} · ${ratio} · ~${formatStatusTokens(anchor.cachedTokens || anchor.promptTokens)}`,
+    ),
   );
 }
 
@@ -93,12 +103,15 @@ export function renderWarmHitUi(
   const ratio = formatProbeRatio(anchor);
   const bestEffort = plan.family === "xai-best-effort";
   const nextLabel = bestEffort
-    ? `Next extension probe in ${plan.waitLabel ?? "n/a"} · xAI best-effort`
+    ? `Next extension probe in ${plan.waitLabel ?? "n/a"} · no fixed xAI cache lifetime promised.`
     : `Next extension probe in ${plan.waitLabel ?? "n/a"} · ${plan.ttlLabel}`;
   const lines = [
-    ctx.ui.theme.fg("success", `⚡ Cache warm · extension probe hit · ~${tokens}`),
+    ctx.ui.theme.fg(
+      "success",
+      `⚡ ${bestEffort ? "xAI best-effort cache warm" : "Cache warm"} · extension probe hit · ~${tokens}`,
+    ),
     ctx.ui.theme.fg("dim", nextLabel),
-    ctx.ui.theme.fg("warning", `${formatSessionSavings(anchor)} · extension probes ${ratio}`),
+    ctx.ui.theme.fg("warning", `${formatSessionSavings(anchor, bestEffort)} · extension probes ${ratio}`),
   ];
 
   if (config.showWidget) {
@@ -110,7 +123,7 @@ export function renderWarmHitUi(
     STATUS_ID,
     ctx.ui.theme.fg(
       "success",
-      `warm ${plan.waitLabel ?? "n/a"} · ${ratio} · ~${formatStatusTokens(cacheRead || anchor.cachedTokens)}`,
+      `${bestEffort ? "xAI best-effort " : ""}warm ${plan.waitLabel ?? "n/a"} · ${ratio} · ~${formatStatusTokens(cacheRead || anchor.cachedTokens)}`,
     ),
   );
 }
@@ -124,12 +137,15 @@ export function renderIdleUi(
   config: WarmCacheConfig,
   reason: string,
   detail?: string,
+  bestEffort = false,
 ): void {
   if (!ctx.hasUI) return;
 
+  const xai = bestEffort || isXaiText(reason) || isXaiText(detail);
+  const title = xai ? "xAI best-effort cache-warm idle" : "Cache-warm idle";
   if (config.showWidget) {
     const lines = [
-      ctx.ui.theme.fg("dim", `⚡ Cache-warm idle · ${compactUiText(reason)}`),
+      ctx.ui.theme.fg("dim", `⚡ ${title} · ${compactUiText(reason)}`),
     ];
     if (detail && detail.length > 0) {
       lines.push(ctx.ui.theme.fg("dim", compactUiText(detail)));
@@ -141,7 +157,7 @@ export function renderIdleUi(
 
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg("dim", `warm · idle · ${compactUiText(reason, 48)}`),
+    ctx.ui.theme.fg("dim", `${xai ? "xAI best-effort " : ""}warm · idle · ${compactUiText(reason, 48)}`),
   );
 }
 
@@ -153,19 +169,22 @@ export function renderReanchorUi(
   ctx: ExtensionContext,
   config: WarmCacheConfig,
   reason: string,
+  bestEffort = false,
 ): void {
   if (!ctx.hasUI) return;
 
+  const xai = bestEffort || isXaiText(reason);
+  const prefix = xai ? "xAI best-effort " : "";
   const cause = reanchorCause(reason);
   if (config.showWidget) {
     ctx.ui.setWidget(WIDGET_ID, [
-      ctx.ui.theme.fg("accent", `⚡ Cache-warm paused · re-anchoring ${cause}`),
-      ctx.ui.theme.fg("dim", "Waiting for next real turn. Extension probes paused."),
+      ctx.ui.theme.fg("accent", `⚡ ${prefix}cache-warm paused · re-anchoring ${cause}`),
+      ctx.ui.theme.fg("dim", `${xai ? "xAI best-effort extension probes paused" : "Waiting for next real turn. Extension probes paused."}`),
     ]);
   } else {
     ctx.ui.setWidget(WIDGET_ID, undefined);
   }
-  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "warm · re-anchoring"));
+  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", `${prefix}warm · re-anchoring`));
 }
 
 /**
@@ -177,22 +196,27 @@ export function renderProbeRetryUi(
   config: WarmCacheConfig,
   detail: string,
   nextDueAt?: number,
+  bestEffort = false,
 ): void {
   if (!ctx.hasUI) return;
 
+  const xai = bestEffort || isXaiText(detail);
   const retryLine =
     typeof nextDueAt === "number" && nextDueAt > Date.now()
       ? `Next extension probe in ${formatDurationShort(nextDueAt - Date.now())}.`
       : "Retrying the extension probe.";
   if (config.showWidget) {
     ctx.ui.setWidget(WIDGET_ID, [
-      ctx.ui.theme.fg("warning", "⚡ Cache-warm retry · extension probe transient miss"),
+      ctx.ui.theme.fg(
+        "warning",
+        `⚡ ${xai ? "xAI best-effort " : "Cache-warm "}retry · extension probe transient miss`,
+      ),
       ctx.ui.theme.fg("dim", `${compactUiText(detail)} · ${retryLine}`),
     ]);
   } else {
     ctx.ui.setWidget(WIDGET_ID, undefined);
   }
-  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", "warm · retrying probe"));
+  ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("dim", `${xai ? "xAI best-effort " : ""}warm · retrying probe`));
 }
 
 /**
@@ -205,22 +229,25 @@ export function renderFailureUi(
   reason: string,
   detail?: string,
   nextDueAt?: number,
+  bestEffort = false,
 ): void {
   if (!ctx.hasUI) return;
 
+  const xai = bestEffort || isXaiText(reason) || isXaiText(detail);
   const blocked = /blocked/i.test(reason);
   const retryLine = blocked
-    ? "Auto-warm stays off until /warm resume."
+    ? `${xai ? "xAI best-effort auto-warm stays off" : "Auto-warm stays off"} until /warm resume.`
     : typeof nextDueAt === "number" && nextDueAt > Date.now()
       ? `Next extension probe in ${formatDurationShort(nextDueAt - Date.now())}.`
       : "Warming stopped until the next real turn or /warm now.";
   const error = /error|failed|no model/i.test(reason);
   const title = error ? "Cache-warm error" : "Cache-warm warning";
   const statusKind = error ? "error" : "warning";
+  const prefix = xai ? "xAI best-effort " : "";
 
   if (config.showWidget) {
     const lines = [
-      ctx.ui.theme.fg(statusKind, `⚡ ${title} · ${shortProblem(reason)}`),
+      ctx.ui.theme.fg(statusKind, `⚡ ${prefix}${title} · ${shortProblem(reason)}`),
     ];
     if (detail && detail.length > 0) {
       lines.push(ctx.ui.theme.fg("dim", compactUiText(detail)));
@@ -233,14 +260,18 @@ export function renderFailureUi(
 
   ctx.ui.setStatus(
     STATUS_ID,
-    ctx.ui.theme.fg(statusKind, `warm · ${error ? "error" : "warning"}: ${shortProblem(reason)}`),
+    ctx.ui.theme.fg(
+      statusKind,
+      `${prefix}warm · ${error ? "error" : "warning"}: ${shortProblem(reason)}`,
+    ),
   );
 }
 
-function formatSessionSavings(anchor: CacheAnchor): string {
+function formatSessionSavings(anchor: CacheAnchor, bestEffort = false): string {
+  const prefix = bestEffort ? "xAI best-effort session" : "Session";
   return anchor.savingsKnown
-    ? `Session ${formatSavingsLabel(anchor)}`
-    : `Session savings ${formatSavingsLabel(anchor)}`;
+    ? `${prefix} ${formatSavingsLabel(anchor)}`
+    : `${prefix} savings ${formatSavingsLabel(anchor)}`;
 }
 
 function formatProbeRatio(anchor: Pick<CacheAnchor, "probeHitCount" | "probeMissCount">): string {
@@ -282,4 +313,8 @@ function compactUiText(value: string, max = 72): string {
   const compact = value.trim().replace(/\s+/g, " ");
   if (compact.length <= max) return compact;
   return `${compact.slice(0, Math.max(1, max - 3)).trimEnd()}...`;
+}
+
+function isXaiText(value: string | undefined): boolean {
+  return typeof value === "string" && /xai/i.test(value);
 }

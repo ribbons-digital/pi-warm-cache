@@ -200,3 +200,17 @@ xAI may report cached reads without a separate cache-write token count through P
 
 Repeated no-read/no-write probes must stop and request a new real-turn anchor when
 the configured failure budget is reached.
+
+### Optional xAI validation
+
+A live xAI run is optional because it requires a direct xAI account and a captured `prompt_cache_key`.
+
+Use `PI_WARM_CACHE_DEBUG=1` when running the session if you need JSONL evidence for each best-effort probe.
+
+Confirm that `/warm` shows `policy=xAI-best-effort`, `strategy=xai-best-effort`, the configured interval, and a redacted `cacheKey` fingerprint.
+
+The raw `prompt_cache_key` must never be copied into status output, logs, issue comments, or test fixtures that represent real credentials.
+
+If the key is missing, invalid, or changes between real turns, automatic warming must stop and the next probe must wait for a new exact real-turn anchor.
+
+The four-minute xAI interval is a best-effort operational heuristic and is not a provider TTL guarantee.

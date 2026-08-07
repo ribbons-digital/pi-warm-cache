@@ -1,6 +1,7 @@
 import type { CacheRetention, Model } from "@earendil-works/pi-ai";
 import { formatDurationShort } from "./config.ts";
 import {
+  getPromptCacheKey,
   isDirectXaiGrokRoute,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
@@ -24,6 +25,7 @@ export {
   isDirectXaiGrokRoute,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
+  isStablePromptCacheKey,
   resolveProviderCapability,
 } from "./capability.ts";
 export type { ProviderCapability, ProviderCapabilityState } from "./types.ts";
@@ -704,4 +706,13 @@ export function stableFingerprint(payload: unknown): string {
     hash = Math.imul(hash, 16777619);
   }
   return `${(hash >>> 0).toString(16)}:${json.length}`;
+}
+
+/**
+ * Return a short redacted fingerprint for a provider cache-routing key.
+ * Never include the key itself in status text or diagnostic events.
+ */
+export function getPromptCacheKeyFingerprint(payload: unknown, api: string | undefined): string {
+  const key = getPromptCacheKey(payload, api);
+  return key ? stableFingerprint(key).split(":")[0]!.slice(0, 8) : "none";
 }

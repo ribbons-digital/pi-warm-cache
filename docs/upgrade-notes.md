@@ -98,7 +98,8 @@ Inactive-capability output also includes the `manualProbe` field.
 | `probeMisses` | The number of extension probe responses that were not hits for the current anchor. Provider errors are recorded as errors and are not counted as probe misses. |
 | `probeFailStreak` | The current consecutive automatic probe failure count and the configured maximum, such as `1/3`. A successful probe or real turn resets the failure streak. |
 | `savingsSummary` | The cumulative hit, miss, estimated-saved, probe-cost, net, and pricing-source fields described below. |
-| `cacheKey` | A short redacted fingerprint of the provider cache-routing key, or `none`. The raw key is not logged in status output. |
+| `policy` | `xAI-best-effort` when the active route is xAI, otherwise omitted. It prevents a best-effort route from being mistaken for a provider TTL claim. |
+| `cacheKey` | A short redacted fingerprint of the provider cache-routing key, or `none`. The raw key is not logged in status output. The fingerprint is recorded even when the key is missing. |
 | `pfp` | The first eight characters of the payload fingerprint. It identifies the captured payload without printing its contents. |
 | `autoWarm` | `on` when a verified automatic timer is allowed, `off` when it is not, or `blocked` after a sticky automatic-warm block. |
 | `codexAuto` | An optional Codex control field. `codexAuto=on` means the Codex timer switch is enabled, but the output-size safety block still applies. |
@@ -148,6 +149,10 @@ When pricing is missing or unusable, monetary fields show `n/a`.
 Unverified and unsupported routes show `n/a (unverified route)` or `n/a (unsupported route)` even when a model entry contains prices.
 The result is an estimate from observed usage, not a billing statement.
 
+For xAI, repeated `read=0 write=0` results use the configured failure budget.
+
+The final best-effort warning explains that xAI may omit cache-write usage and requests a fresh exact anchor instead of claiming a provider write or TTL.
+
 ## JSONL schema
 
 Enable file logging with `PI_WARM_CACHE_DEBUG=1` or `/warm log`.
@@ -183,7 +188,7 @@ Fields in the event-specific column are present only when that event has the cor
 
 | Event | Event-specific fields and meaning |
 |---|---|
-| `capture` | `manualProbeAvailable` records whether the captured shape is safe for a manual probe. `prefixChanged` records whether the old anchor was replaced. `realTurnContinuity` is `comparable` or `unknown`. `realTurnContinuityReason` explains the continuity decision. `modelCost` is the active model cost object or `null`. `pricingSource` is `model` or `unknown`. `savingsKnown` records whether a usable savings delta exists. `inputPricePerMTok` and `cacheReadPricePerMTok` are the resolved prices, or zero when unknown. An unsupported capture can also contain `ignored=true`. |
+| `capture` | `manualProbeAvailable` records whether the captured shape is safe for a manual probe. `prefixChanged` records whether the old anchor was replaced. `cacheKeyChanged` identifies a direct xAI key rotation. `previousCacheKeyFingerprint` records the old redacted key identity when an anchor was replaced. `realTurnContinuity` is `comparable` or `unknown`. `realTurnContinuityReason` explains the continuity decision. `modelCost` is the active model cost object or `null`. `pricingSource` is `model` or `unknown`. `savingsKnown` records whether a usable savings delta exists. `inputPricePerMTok` and `cacheReadPricePerMTok` are the resolved prices, or zero when unknown. An unsupported capture can also contain `ignored=true`. |
 | `usage` | `cacheRead`, `cacheWrite`, `input`, `output`, and `promptTokens` are raw real-turn usage values. `realTurnState` is `hit`, `miss`, or `unknown`. `realTurnReason` explains the classification. A usage event without an anchor omits `sessionId` and records `realTurnReason=no anchor`. |
 | `agent_start` | Records that the real agent turn started and the warm timer was paused. |
 | `agent_settled` | `hasPayload` records whether an exact payload is available. `cachedTokens` is the scheduler's prompt-size hint. `realTurnState` and `realTurnReason` identify the latest real-turn observation. `probeOutcome`, `probeHits`, and `probeMisses` identify the latest probe state and counters. `retryState` records the failure streak and configured limit. |

@@ -61,17 +61,28 @@ export function isDirectXaiGrokRoute(model: Model<any> | undefined): boolean {
   return hasXaiCacheRoutingMetadata(model);
 }
 
+/**
+ * Return true when a cache-routing key is a stable value that can be replayed.
+ *
+ * xAI documents a UUID or application session id, but does not require one
+ * exact format. Keep the check strict about accidental whitespace and control
+ * characters without inventing a provider-specific length or character rule.
+ */
+export function isStablePromptCacheKey(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value === value.trim() &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
 /** Return the provider cache-routing key from an OpenAI Responses payload. */
 export function getPromptCacheKey(payload: unknown, api: string | undefined): string | null {
-  if (
-    api !== "openai-responses" &&
-    api !== "openai-codex-responses"
-  ) {
-    return null;
-  }
+  if (api !== "openai-responses" && api !== "openai-codex-responses") return null;
   if (!payload || typeof payload !== "object") return null;
   const key = (payload as Record<string, unknown>).prompt_cache_key;
-  return typeof key === "string" && key.trim().length > 0 ? key : null;
+  return isStablePromptCacheKey(key) ? key : null;
 }
 
 /**
@@ -107,11 +118,16 @@ function capability(
 }
 
 function directXaiPayloadRejectionReason(payload: unknown): string | null {
-  if (!getPromptCacheKey(payload, "openai-responses")) {
-    return "direct xAI Grok 4.5 route is missing a stable prompt-cache key (prompt_cache_key) in the captured payload; automatic warming is disabled";
+  const rawKey =
+    payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>).prompt_cache_key
+      : undefined;
+  if (!isStablePromptCacheKey(rawKey)) {
+    const detail = rawKey === undefined ? "is missing" : "is not a stable string";
+    return `direct xAI Grok 4.5 best-effort route has no stable prompt-cache key (prompt_cache_key ${detail}) in the captured payload; automatic warming is disabled`;
   }
   if (!isSafeReplayPayload(payload, "openai-responses")) {
-    return "direct xAI Grok 4.5 captured payload is not a safe OpenAI Responses replay shape; automatic warming is disabled";
+    return "direct xAI Grok 4.5 best-effort captured payload is not a safe OpenAI Responses replay shape; automatic warming is disabled";
   }
   return null;
 }
@@ -198,19 +214,19 @@ export function resolveProviderCapability(
     if (!model.baseUrl) {
       return capability(
         "unsupported",
-        "direct xAI Grok 4.5 requires an explicit baseUrl on api.x.ai; automatic warming is disabled without a first-party endpoint",
+        "direct xAI Grok 4.5 best-effort route requires an explicit baseUrl on api.x.ai; automatic warming is disabled without a first-party endpoint",
       );
     }
     if (!hasFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)) {
       return capability(
         "unsupported",
-        "direct xAI Grok 4.5 route baseUrl is not api.x.ai; use the direct first-party xAI endpoint",
+        "direct xAI Grok 4.5 best-effort route baseUrl is not api.x.ai; use the direct first-party xAI endpoint",
       );
     }
     if (!hasXaiCacheRoutingMetadata(model)) {
       return capability(
         "unsupported",
-        "direct xAI Grok 4.5 route has unsupported cache-routing metadata; use the registered direct xAI routing format",
+        "direct xAI Grok 4.5 best-effort route has unsupported cache-routing metadata; use the registered direct xAI routing format",
       );
     }
     if (payload !== undefined) {
@@ -219,7 +235,7 @@ export function resolveProviderCapability(
     }
     return capability(
       "verified",
-      "direct xAI Grok 4.5 Responses route with best-effort prompt-cache routing",
+      "direct xAI Grok 4.5 best-effort Responses route with prompt-cache routing",
     );
   }
 
@@ -229,18 +245,18 @@ export function resolveProviderCapability(
     if (!model.baseUrl) {
       return capability(
         "unsupported",
-        "direct xAI manual probes require an explicit baseUrl on api.x.ai; automatic and manual warming are disabled without a first-party endpoint",
+        "direct xAI best-effort manual probes require an explicit baseUrl on api.x.ai; automatic and manual warming are disabled without a first-party endpoint",
       );
     }
     if (!hasFirstPartyBaseUrl(model, XAI_FIRST_PARTY_HOSTS)) {
       return capability(
         "unsupported",
-        "direct xAI route baseUrl is not api.x.ai; automatic and manual warming are disabled for this route",
+        "direct xAI best-effort route baseUrl is not api.x.ai; automatic and manual warming are disabled for this route",
       );
     }
     return capability(
       "unverified",
-      "direct xAI route has no verified automatic keepalive strategy; automatic warming is disabled, but a safe captured payload may be probed once with /warm now",
+      "direct xAI best-effort route has no verified automatic keepalive strategy; automatic warming is disabled, but a safe captured payload may be probed once with /warm now",
       true,
     );
   }
@@ -294,7 +310,7 @@ export function isSafeReplayPayload(payload: unknown, api: string | undefined): 
       typeof body.instructions === "string" &&
       Array.isArray(body.input) &&
       body.store === false &&
-      typeof body.prompt_cache_key === "string"
+      isStablePromptCacheKey(body.prompt_cache_key)
     );
   }
   return false;
