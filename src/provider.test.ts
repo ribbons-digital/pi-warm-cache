@@ -812,6 +812,205 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   warmer.dispose();
 }
 
+// 11) Disable/re-enable preserves "awaiting-reanchor" and "blocked" states
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  const responses: Array<unknown> = [
+    {
+      stopReason: "stop",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 100,
+        cost: { total: 0.2 },
+      },
+    },
+  ];
+  const completeStub = async (): Promise<any> => {
+    const next = responses.shift();
+    if (next instanceof Error) throw next;
+    return next;
+  };
+  const model = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+    cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model,
+    hasUI: true,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "disable-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+    },
+  } as any;
+
+  // Test 1: Disable while in "awaiting-reanchor" state, then re-enable restores "awaiting-reanchor"
+  const warmer1 = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    completeStub as any,
+  );
+  warmer1.bindContext(ctx);
+  warmer1.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+  });
+  warmer1.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "disable-test",
+    },
+    ctx,
+  );
+  assert(warmer1.getLifecycleState() === "anchored", "should start as anchored after capture");
+  warmer1.invalidateAnchor(ctx, "test hard invalidation");
+  assert(warmer1.getLifecycleState() === "awaiting-reanchor", "should be awaiting-reanchor after invalidation");
+
+  // Disable while in awaiting-reanchor state
+  warmer1.setConfig({ ...warmer1.getConfig(), enabled: false });
+  assert(warmer1.getLifecycleState() === "disabled", "should be disabled after setConfig(enabled: false)");
+
+  // Re-enable should restore awaiting-reanchor
+  warmer1.setConfig({ ...warmer1.getConfig(), enabled: true });
+  assert(warmer1.getLifecycleState() === "awaiting-reanchor", "should restore awaiting-reanchor after re-enable");
+  warmer1.dispose();
+
+  // Test 2: Disable while "blocked" (autoWarmBlockReason set), then re-enable restores "blocked"
+  const warmer2 = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    completeStub as any,
+  );
+  warmer2.bindContext(ctx);
+  warmer2.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+  });
+  warmer2.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "disable-test",
+    },
+    ctx,
+  );
+  assert(warmer2.getLifecycleState() === "anchored", "should start as anchored");
+
+  // Trigger a block by calling the private method indirectly through warmNow with oversized Codex output
+  // Since we can't easily trigger the block through normal flow, we'll use the public getAutoWarmBlockReason API
+  // to verify the block state. First, let's manually invoke the internal path via payload drift
+  const drift = await warmer2.warmNow(ctx);
+  assert(drift.probeOutcome === "payload-drift", "should get payload drift for write without read");
+
+  // Re-capture to get back to anchored, then we'll need to create a different test scenario
+  warmer2.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello2" }] }],
+      prompt_cache_key: "disable-test",
+    },
+    ctx,
+  );
+
+  // Since we can't easily trigger autoWarmBlockReason through the test fixture without Codex,
+  // let's test the scenario differently by using the clearAutoWarmBlock API.
+  // We'll create a new warmer and use a Codex model instead.
+  const codexModel = {
+    id: "gpt-5.6",
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+    baseUrl: "https://api.openai.com/v1",
+    cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
+  } as any;
+  const codexResponses = [
+    // First oversized response (soft-skip)
+    {
+      stopReason: "stop",
+      usage: { input: 1, output: 300, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+    },
+    // Second oversized response (sticky-block)
+    {
+      stopReason: "stop",
+      usage: { input: 1, output: 300, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+    },
+  ];
+  const codexCompleteStub = async (): Promise<any> => {
+    return codexResponses.shift();
+  };
+  const codexCtx = { ...ctx, model: codexModel };
+  const warmer3 = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    codexCompleteStub as any,
+  );
+  warmer3.bindContext(codexCtx);
+  warmer3.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+    allowCodexAutoWarm: true,
+  });
+  warmer3.capturePayload(
+    {
+      model: codexModel.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "codex-test",
+      store: false,
+      stream: true,
+    },
+    codexCtx,
+  );
+  warmer3.noteAssistantUsage(codexCtx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+
+  // First oversized probe (soft-skip)
+  const firstCodex = await warmer3.warmNow(codexCtx);
+  assert(warmer3.getLifecycleState() === "anchored", "first oversized should soft-skip and stay anchored");
+
+  // Second oversized probe (sticky-block)
+  const secondCodex = await warmer3.warmNow(codexCtx);
+  assert(warmer3.getLifecycleState() === "blocked", "second oversized should trigger sticky-block");
+  assert(warmer3.getAutoWarmBlockReason() !== null, "autoWarmBlockReason should be set");
+
+  // Disable while blocked
+  warmer3.setConfig({ ...warmer3.getConfig(), enabled: false });
+  assert(warmer3.getLifecycleState() === "disabled", "should be disabled after setConfig(enabled: false)");
+
+  // Re-enable should restore blocked state
+  warmer3.setConfig({ ...warmer3.getConfig(), enabled: true });
+  assert(warmer3.getLifecycleState() === "blocked", "should restore blocked state after re-enable");
+  assert(warmer3.getAutoWarmBlockReason() !== null, "autoWarmBlockReason should still be set after re-enable");
+
+  // Clear the block and re-disable/re-enable to verify it doesn't restore blocked
+  warmer3.clearAutoWarmBlock("test clear");
+  assert(warmer3.getLifecycleState() === "anchored", "should be anchored after clearing block");
+
+  warmer3.setConfig({ ...warmer3.getConfig(), enabled: false });
+  assert(warmer3.getLifecycleState() === "disabled", "should be disabled again");
+
+  warmer3.setConfig({ ...warmer3.getConfig(), enabled: true });
+  assert(warmer3.getLifecycleState() === "anchored", "should restore anchored (not blocked) after block was cleared");
+
+  warmer3.dispose();
+  warmer2.dispose();
+}
+
 // 10) Direct xAI uses the exact anchor, stable cache routing, legal output
 // shaping, quiet first miss, and a bounded re-anchor after repeated misses.
 {

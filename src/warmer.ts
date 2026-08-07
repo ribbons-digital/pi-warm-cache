@@ -76,6 +76,8 @@ export class SessionWarmer {
   private nextDueAt = 0;
   private anchor: CacheAnchor | null = null;
   private lifecycleState: WarmLifecycleState = "idle";
+  /** Lifecycle state captured before entering "disabled", for restore on re-enable. */
+  private stateBeforeDisabled: WarmLifecycleState | null = null;
   /** Retained probe diagnostics after a drift invalidation, never used for replay. */
   private lastInvalidatedProbe: ProbeObservation | null = null;
   private lastPayload: unknown | null = null;
@@ -161,7 +163,20 @@ export class SessionWarmer {
       return;
     }
     if (this.lifecycleState === "disabled") {
-      this.lifecycleState = this.anchor && this.lastPayload ? "anchored" : "idle";
+      // Restore the lifecycle state captured before entering "disabled"
+      if (this.stateBeforeDisabled === "awaiting-reanchor") {
+        this.lifecycleState = "awaiting-reanchor";
+      } else if (this.stateBeforeDisabled === "blocked" && this.autoWarmBlockReason) {
+        // Only restore "blocked" if the block reason is still active
+        this.lifecycleState = "blocked";
+      } else if (this.stateBeforeDisabled === "blocked" && !this.autoWarmBlockReason) {
+        // Block was cleared while disabled, restore to anchored/idle instead
+        this.lifecycleState = this.anchor && this.lastPayload ? "anchored" : "idle";
+      } else {
+        // Default restoration based on anchor/payload for other states
+        this.lifecycleState = this.anchor && this.lastPayload ? "anchored" : "idle";
+      }
+      this.stateBeforeDisabled = null;
     }
     if (this.ctx?.model && this.lastPayload) {
       this.plan = resolveStrategy(this.ctx.model, this.config, this.lastPayload);
@@ -204,7 +219,10 @@ export class SessionWarmer {
   bindContext(ctx: ExtensionContext): void {
     this.ctx = ctx;
     this.capability = resolveProviderCapability(ctx.model);
-    if (!this.config.enabled) this.lifecycleState = "disabled";
+    if (!this.config.enabled) {
+      this.stateBeforeDisabled = this.lifecycleState;
+      this.lifecycleState = "disabled";
+    }
     this.logFile = warmLogPath(ctx.cwd);
   }
 
@@ -537,6 +555,7 @@ export class SessionWarmer {
     this.ctx = ctx;
     this.capability = resolveProviderCapability(ctx.model);
     if (!this.config.enabled) {
+      this.stateBeforeDisabled = this.lifecycleState;
       this.lifecycleState = "disabled";
     } else if (this.autoWarmBlockReason) {
       this.lifecycleState = "blocked";
@@ -562,6 +581,7 @@ export class SessionWarmer {
   onAgentSettled(ctx: ExtensionContext): void {
     this.ctx = ctx;
     if (!this.config.enabled) {
+      this.stateBeforeDisabled = this.lifecycleState;
       this.lifecycleState = "disabled";
       this.showIdle(ctx, "disabled");
       return;
@@ -914,7 +934,11 @@ export class SessionWarmer {
   }
 
   private stop(reason: string): void {
-    this.lifecycleState = reason === "disabled" ? "disabled" : this.lifecycleState;
+    if (reason === "disabled") {
+      // Capture the current lifecycle state before entering "disabled"
+      this.stateBeforeDisabled = this.lifecycleState;
+      this.lifecycleState = "disabled";
+    }
     this.clearTimers();
     this.abort?.abort();
     this.abort = null;
