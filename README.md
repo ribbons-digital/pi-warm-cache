@@ -176,6 +176,12 @@ The `/warm` status and `/warm now` result include the provider route, capability
 
 `probeHits` and `probeMisses` count extension probes only.
 
+`/warm` includes a stable `savingsSummary` with probe hits, misses, total estimated savings, total probe cost, net, and the pricing source.
+
+Use `/warm savings` to print only that cumulative summary.
+
+When model pricing is unavailable or unusable, the summary reports monetary values as `n/a`.
+
 A first implicit-cache `read=0 write=0` probe is labelled `transient-miss` and retries quietly.
 
 A provider error is reported as an error and does not increment `probeMisses`.
@@ -198,7 +204,8 @@ The extension does not stamp `cache_control.ttl = "1h"` onto real turns.
 ## Commands
 
 ```text
-/warm                  # show status
+/warm                  # show status and cumulative savings
+/warm savings          # show only the cumulative savings summary
 /warm on               # enable and clear a sticky automatic-warm block
 /warm off              # disable warming
 /warm now              # force one probe when the captured route permits it

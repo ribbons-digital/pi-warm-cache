@@ -18,7 +18,12 @@ import {
   stableFingerprint,
 } from "./provider.ts";
 import { appendWarmLog, warmLogPath, type WarmLogEvent } from "./log.ts";
-import { buildWarmResult, formatSavingsLabel, resolveModelPricing } from "./savings.ts";
+import {
+  buildWarmResult,
+  formatSavingsLabel,
+  formatSavingsSummary,
+  resolveModelPricing,
+} from "./savings.ts";
 import {
   clearWarmUi,
   renderFailureUi,
@@ -137,6 +142,19 @@ export class SessionWarmer {
       probeMissCount: this.anchor?.probeMissCount ?? 0,
       lastProbeAt: this.anchor?.lastProbeAt ?? null,
     };
+  }
+
+  getSavingsSummaryText(): string {
+    return formatSavingsSummary(
+      this.anchor ?? {
+        probeHitCount: 0,
+        probeMissCount: 0,
+        totalEstimatedSavedUsd: 0,
+        totalProbeCostUsd: 0,
+        savingsKnown: false,
+        pricingSource: "unknown",
+      },
+    );
   }
 
   getLatestRealTurnObservation(): RealTurnObservation | null {
@@ -626,7 +644,7 @@ export class SessionWarmer {
   }
 
   getStatusText(): string {
-    if (!this.config.enabled) return "disabled";
+    if (!this.config.enabled) return `disabled savingsSummary=${this.getSavingsSummaryText()}`;
     const log =
       this.config.logToFile && this.getLogFile() ? ` log=${this.getLogFile()}` : "";
     const capability = this.currentCapability(this.ctx);
@@ -651,6 +669,7 @@ export class SessionWarmer {
       : capability.automaticWarm
         ? "autoWarm=on"
         : "autoWarm=off";
+    const savingsSummary = this.getSavingsSummaryText();
 
     if (capability.state !== "verified") {
       const manualProbe = this.anchor
@@ -674,6 +693,7 @@ export class SessionWarmer {
         retry,
         `cacheKey=${cacheKey}`,
         this.anchor ? `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}` : "pfp=none",
+        `savingsSummary=${savingsSummary}`,
         last,
         log.trim(),
       ]
@@ -695,6 +715,7 @@ export class SessionWarmer {
           retry,
           "cacheKey=none",
           blocked,
+          `savingsSummary=${savingsSummary}`,
           last,
           log.trim(),
         ]
@@ -712,6 +733,7 @@ export class SessionWarmer {
         retry,
         "cacheKey=none",
         blocked,
+        `savingsSummary=${savingsSummary}`,
         last,
         log.trim(),
       ]
@@ -734,6 +756,7 @@ export class SessionWarmer {
         `strategy=${this.anchor.cacheFamily}`,
         `cacheKey=${cacheKey}`,
         `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
+        `savingsSummary=${savingsSummary}`,
         last,
         log.trim(),
       ]
@@ -754,6 +777,7 @@ export class SessionWarmer {
         retry,
         `cacheKey=${cacheKey}`,
         `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
+        `savingsSummary=${savingsSummary}`,
         last,
         log.trim(),
       ]
@@ -789,6 +813,7 @@ export class SessionWarmer {
       `probe=${probe}`,
       retry,
       `savings=${formatSavingsLabel(this.anchor)}`,
+      `savingsSummary=${savingsSummary}`,
       `pricing=${this.anchor.pricingSource}`,
       `nextDue=${due}`,
       `pfp=${this.anchor.payloadFingerprint.slice(0, 8)}`,
@@ -986,6 +1011,14 @@ export class SessionWarmer {
     fingerprint: string,
   ): ProbeObservation {
     anchor.probeCount += 1;
+    if (anchor.savingsKnown && result.cacheHit) {
+      anchor.totalEstimatedSavedUsd += result.estimatedSavedUsd;
+    }
+    const probeCost = Number.isFinite(result.costUsd) && result.costUsd >= 0 ? result.costUsd : 0;
+    anchor.totalProbeCostUsd += probeCost;
+    anchor.estimatedSavingsUsd = anchor.savingsKnown
+      ? anchor.totalEstimatedSavedUsd - anchor.totalProbeCostUsd
+      : 0;
     if (result.cacheHit) {
       anchor.probeHitCount += 1;
       anchor.cachedTokens = result.cacheRead;
@@ -1410,11 +1443,6 @@ export class SessionWarmer {
         costTotal: result.costUsd,
       };
 
-      if (anchor.savingsKnown && result.costUsd > 0) {
-        // Probe cost is real spend. Real-turn usage never enters this ledger.
-        anchor.estimatedSavingsUsd -= result.costUsd;
-      }
-
       // Classify probe outcome once before observation and updates.
       const outcome: ProbeOutcome = result.cacheHit
         ? "hit"
@@ -1485,9 +1513,6 @@ export class SessionWarmer {
       }
 
       if (result.cacheHit) {
-        if (anchor.savingsKnown) {
-          anchor.estimatedSavingsUsd += result.estimatedSavedUsd;
-        }
         anchor.lastActivityAt = Date.now();
         anchor.consecutiveFailures = 0;
         this.recordAttempt(

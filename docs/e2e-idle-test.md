@@ -38,7 +38,7 @@ File logging is optional. All evidence comes from:
    Expect:
 
    ```
-   enabled family=anthropic-short capability=verified capabilityReason=first-party Anthropic Messages route with cache markers provider=anthropic/claude-fable-5 api=anthropic-messages strategy=anthropic-short cadence=5m prompt-cache TTL intervalMs=240000 cacheKey=none realRead=<big> realWrite=0 probeRead=none prompt≈<big> probeHits=0 probeMisses=0 realTurn=hit (...) probe=none probeFailStreak=0/3 savings=est. $0.0000 saved pricing=model nextDue=<ISO timestamp> pfp=<8-char hash> autoWarm=on last=none
+   enabled family=anthropic-short capability=verified capabilityReason=first-party Anthropic Messages route with cache markers provider=anthropic/claude-fable-5 api=anthropic-messages strategy=anthropic-short cadence=5m prompt-cache TTL intervalMs=240000 cacheKey=none realRead=<big> realWrite=0 probeRead=none prompt≈<big> probeHits=0 probeMisses=0 realTurn=hit (...) probe=none probeFailStreak=0/3 savings=est. $0.0000 saved savingsSummary=probeHits=0 probeMisses=0 totalEstimatedSaved=$0.0000 totalProbeCost=$0.0000 net=$0.0000 pricingSource=model pricing=model nextDue=<ISO timestamp> pfp=<8-char hash> autoWarm=on last=none
    ```
 
    - `inactive capability=unsupported` -> this route is unsupported and the provider will not be called, abort.
@@ -83,7 +83,8 @@ prefix matched.
    anchor.
 3. Watch the widget. It refreshes every 15s and counts down to the ~4m mark.
 4. At the tick the widget flips to a probe-hit render. Then run `/warm` and
-   expect `probeHits=1 probeMisses=0` with `realTurn=hit (...)` and `nextDue` pushed ~4m further out.
+   expect `probeHits=1 probeMisses=0` with `realTurn=hit (...)`, a positive `totalEstimatedSaved`, and `nextDue` pushed ~4m further out.
+   Run `/warm savings` to print only the cumulative savings summary.
 5. Let it run at least **3 ticks** (~12m). One tick proves replay works; three
    prove rescheduling does not drift, collapse into a retry loop, or accumulate
    probe misses.
@@ -113,7 +114,9 @@ Without this control you have only proven the extension runs, not that it works.
 | 3+ timer ticks | `probeHits` increments, `probeMisses=0` |
 | Post-idle real turn, warming on | `realTurn=hit` and `cacheRead > 0` |
 | Post-idle real turn, warming off | `cacheRead = 0` |
+| `savingsSummary=...` | hits, misses, estimated savings, probe cost, net, and pricing source are shown |
 | `savings=est. $... saved` | positive and growing for verified routes with model pricing |
+| Unknown model pricing | monetary summary fields show `n/a` |
 
 Caveat on the last row: the savings figure is an estimate computed from model
 pricing in `savings.ts`, not billed data. It debits actual warm spend on every

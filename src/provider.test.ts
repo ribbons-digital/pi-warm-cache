@@ -33,6 +33,7 @@ import {
   buildWarmResult,
   estimateSavedUsd,
   formatSavingsLabel,
+  formatSavingsSummary,
   resolveModelPricing,
 } from "./savings.ts";
 import { SessionWarmer } from "./warmer.ts";
@@ -626,7 +627,38 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   );
 }
 
-// 9) Session warmer keeps real-turn observations, probe outcomes, and retries separate.
+// 9) Cumulative savings summaries preserve hits, costs, pricing state, and net losses.
+{
+  const known = formatSavingsSummary({
+    probeHitCount: 2,
+    probeMissCount: 1,
+    totalEstimatedSavedUsd: 0.0045,
+    totalProbeCostUsd: 0.01,
+    savingsKnown: true,
+    pricingSource: "model",
+  });
+  assert(
+    known ===
+      "probeHits=2 probeMisses=1 totalEstimatedSaved=$0.0045 totalProbeCost=$0.01 net=-$0.0055 pricingSource=model",
+    `known savings summary is not stable: ${known}`,
+  );
+
+  const unknown = formatSavingsSummary({
+    probeHitCount: 1,
+    probeMissCount: 3,
+    totalEstimatedSavedUsd: 0,
+    totalProbeCostUsd: 0.04,
+    savingsKnown: false,
+    pricingSource: "unknown",
+  });
+  assert(
+    unknown ===
+      "probeHits=1 probeMisses=3 totalEstimatedSaved=n/a totalProbeCost=n/a net=n/a pricingSource=unknown",
+    `unknown savings must be n/a: ${unknown}`,
+  );
+}
+
+// 10) Session warmer keeps real-turn observations, probe outcomes, and retries separate.
 {
   const notifications: Array<{ message: string; level: string }> = [];
   const responses: Array<unknown> = [
@@ -745,6 +777,24 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(warmer.getStatusText().includes("probeHits=1"), "status should expose probe hits");
   assert(warmer.getStatusText().includes("probeMisses=1"), "status should expose probe misses");
   assert(warmer.getStatusText().includes("probeFailStreak=0/3"), "successful probe should reset retry state");
+  const cumulativeStats = warmer.getSessionWarmStats();
+  assert(
+    Math.abs(cumulativeStats.totalEstimatedSavedUsd - 0.00018) < 1e-12,
+    `hit savings should accumulate, got ${cumulativeStats.totalEstimatedSavedUsd}`,
+  );
+  assert(
+    Math.abs(cumulativeStats.totalProbeCostUsd - 0.02) < 1e-12,
+    `probe costs should accumulate, got ${cumulativeStats.totalProbeCostUsd}`,
+  );
+  assert(
+    warmer.getSavingsSummaryText() ===
+      "probeHits=1 probeMisses=1 totalEstimatedSaved=$0.0002 totalProbeCost=$0.02 net=-$0.02 pricingSource=model",
+    `warmer savings summary is not cumulative: ${warmer.getSavingsSummaryText()}`,
+  );
+  assert(
+    warmer.getStatusText().includes("savingsSummary=probeHits=1 probeMisses=1"),
+    "status should expose the stable savings summary",
+  );
 
   // A continuing real turn gets a fresh observation, but the preceding probe
   // remains visible so users can compare the two cache signals.
