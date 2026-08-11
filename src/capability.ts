@@ -1,5 +1,5 @@
 import type { Model } from "@earendil-works/pi-ai";
-import type { ProviderCapability, ProviderCapabilityState } from "./types.ts";
+import type { CacheFamily, ProviderCapability, ProviderCapabilityState } from "./types.ts";
 
 type RouteCompat = {
   cacheControlFormat?: string;
@@ -297,9 +297,32 @@ function resolveProxyRouteCapability(
     return capability("unverified", foreignReason);
   }
 
+  // The Go family is payload-driven. The retained family never probes:
+  // manualProbe stays false so /warm now cannot fire against a payload that
+  // already requests 24h retention on the wire. The plan and the warmer both
+  // derive manual gating from this flag, so they agree with this decision.
+  const goFamily =
+    model.provider === "opencode-go" ? classifyOpencodeGoFamily(payload) : null;
+  if (goFamily === "opencode-go-retained") {
+    return capability(
+      "unverified",
+      `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route); the captured payload requests 24h retention on the wire, so no keepalive or manual probe is scheduled`,
+    );
+  }
+
+  // The plain family carries a degraded hint steering the user onto the keyed
+  // 24h retention path where keepalive is not needed. The hint folds into
+  // capability.reason, which already renders in the banner and notify paths.
+  // Family classification is payload-driven and independent of capability
+  // state, so a registered Go route without instrumentation shows the hint.
+  const plainHint =
+    goFamily === "opencode-go-plain"
+      ? "; set Pi cache retention to long for keyed 24h Go caching"
+      : "";
+
   return capability(
     "unverified",
-    `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)`,
+    `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)${plainHint}`,
     true,
   );
 }
@@ -341,19 +364,32 @@ export function getPromptCacheKey(payload: unknown, api: string | undefined): st
 }
 
 /**
- * xAI Responses needs a provider cache key in the captured body before a
- * best-effort probe can be armed. This is the route's stable cache identity.
+ * Generalized family predicate: true when an OpenAI Responses payload carries
+ * a stable provider cache-routing key.
+ *
+ * This generalizes the direct xAI key gate for automatic eligibility;
+ * OpenCode Go `openai-responses` routes use the same predicate. A
+ * keyed-but-unretained payload is not a separate family and behaves like
+ * plain, because the gateway in-memory TTL is still the default.
  */
-export function hasXaiPromptCacheKey(payload: unknown): boolean {
+export function hasStableResponsesCacheKey(payload: unknown): boolean {
   return (
     isSafeReplayPayload(payload, "openai-responses") &&
     Boolean(getPromptCacheKey(payload, "openai-responses"))
   );
 }
 
+/**
+ * xAI Responses needs a provider cache key in the captured body before a
+ * best-effort probe can be armed. This is the route's stable cache identity.
+ */
+export function hasXaiPromptCacheKey(payload: unknown): boolean {
+  return hasStableResponsesCacheKey(payload);
+}
+
 /** True when a captured direct xAI payload is safe for automatic replay. */
 export function isSafeXaiReplayPayload(payload: unknown): boolean {
-  return hasXaiPromptCacheKey(payload);
+  return hasStableResponsesCacheKey(payload);
 }
 
 /**
@@ -381,6 +417,60 @@ export function payloadHasCacheControl(payload: unknown): boolean {
   };
   visit(payload);
   return found;
+}
+
+/**
+ * True when a `cache_control` object with the given TTL appears anywhere in
+ * the payload tree. Deep-walks nested objects and arrays, matching the
+ * `payloadHasCacheControl` precedent.
+ */
+function payloadHasCacheControlTtl(payload: unknown, ttl: string): boolean {
+  let found = false;
+  const visit = (node: unknown): void => {
+    if (found || !node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    const obj = node as Record<string, unknown>;
+    if (obj.cache_control && typeof obj.cache_control === "object") {
+      const cc = obj.cache_control as Record<string, unknown>;
+      if (cc.ttl === ttl) {
+        found = true;
+        return;
+      }
+    }
+    for (const value of Object.values(obj)) visit(value);
+  };
+  visit(payload);
+  return found;
+}
+
+/**
+ * Classify an OpenCode Go captured payload by its observed cache
+ * instrumentation into one of four families.
+ *
+ * The family is classified from the instrumentation observed in the captured
+ * payload, never from model metadata. Four-way precedence, applied in order:
+ *
+ * 1. `prompt_cache_retention === "24h"` present -> `opencode-go-retained`
+ *    (retention wins over markers, because it is the stronger lifetime signal).
+ * 2. `cache_control` with `ttl: "1h"` present -> `opencode-go-long-marker`.
+ * 3. Any other `cache_control` present -> `opencode-go-short-marker`.
+ * 4. Otherwise -> `opencode-go-plain`.
+ *
+ * Marker families are anthropic-messages-transport observations. A
+ * keyed-but-unretained payload (`prompt_cache_key` without
+ * `prompt_cache_retention`) is not a separate family and behaves like plain,
+ * because the gateway in-memory TTL is still the default.
+ */
+export function classifyOpencodeGoFamily(payload?: unknown): CacheFamily {
+  if (!payload || typeof payload !== "object") return "opencode-go-plain";
+  const body = payload as Record<string, unknown>;
+  if (body.prompt_cache_retention === "24h") return "opencode-go-retained";
+  if (payloadHasCacheControlTtl(payload, "1h")) return "opencode-go-long-marker";
+  if (payloadHasCacheControl(payload)) return "opencode-go-short-marker";
+  return "opencode-go-plain";
 }
 
 function capability(

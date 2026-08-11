@@ -1460,7 +1460,10 @@ export class SessionWarmer {
     }
 
     if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
-      const detail = "captured payload shape is not safe for an unverified manual probe";
+      const detail =
+        anchor.cacheFamily === "opencode-go-retained"
+          ? "the retained OpenCode Go family never probes; the captured payload requests 24h retention on the wire"
+          : "captured payload shape is not safe for an unverified manual probe";
       this.recordAttempt(reason, false, detail);
       this.clearCapabilityUi(ctx);
       return buildWarmResult({
@@ -1498,7 +1501,13 @@ export class SessionWarmer {
       });
     }
 
-    const currentCapability = resolveProviderCapability(model);
+    // Spec decision #14: pass the exact captured payload so payload-derived
+    // capability reasons (the opencode-go plain hint, marker families, and the
+    // foreign-instrumentation refusal) match the anchor and do not fire a
+    // spurious route-changed invalidation on every warm probe. this.lastPayload
+    // is nulled on invalidation and only set alongside a fresh anchor, so it is
+    // the payload that produced anchor.capability.reason.
+    const currentCapability = resolveProviderCapability(model, payload);
     if (
       model.provider !== anchor.provider ||
       model.id !== anchor.modelId ||

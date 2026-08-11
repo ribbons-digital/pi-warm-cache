@@ -1,7 +1,9 @@
 import type { CacheRetention, Model } from "@earendil-works/pi-ai";
 import { formatDurationShort } from "./config.ts";
 import {
+  classifyOpencodeGoFamily,
   getPromptCacheKey,
+  hasStableResponsesCacheKey,
   isDirectXaiGrokRoute,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
@@ -20,7 +22,9 @@ import type {
 
 export {
   canManualProbe,
+  classifyOpencodeGoFamily,
   getPromptCacheKey,
+  hasStableResponsesCacheKey,
   hasXaiPromptCacheKey,
   isDirectXaiGrokRoute,
   isSafeReplayPayload,
@@ -192,12 +196,52 @@ function resolveVerifiedCacheFamily(
   return "unsupported";
 }
 
+const OPENCODE_GO_FAMILIES = new Set<CacheFamily>([
+  "opencode-go-retained",
+  "opencode-go-long-marker",
+  "opencode-go-short-marker",
+  "opencode-go-plain",
+]);
+
+function isOpencodeGoFamily(family: CacheFamily): boolean {
+  return OPENCODE_GO_FAMILIES.has(family);
+}
+
+/**
+ * Cadence label for an OpenCode Go family.
+ *
+ * No OpenCode Go family renders a numeric lifetime: only "best-effort probe
+ * cadence" wording is allowed until an e2e evidence record exists for that
+ * family. The retained family never probes.
+ */
+function opencodeGoFamilyCadence(family: CacheFamily): string | null {
+  switch (family) {
+    case "opencode-go-retained":
+      return "retention requested on the wire; no keepalive scheduled";
+    case "opencode-go-long-marker":
+      return "best-effort probe cadence (~48m)";
+    case "opencode-go-short-marker":
+    case "opencode-go-plain":
+      return "best-effort probe cadence (~4m)";
+    default:
+      return null;
+  }
+}
+
 export function resolveCacheFamily(
   model: Model<any> | undefined,
   anthropicTtl: AnthropicTtlMode,
   payload?: unknown,
 ): CacheFamily {
   const capability = resolveProviderCapability(model, payload);
+  // OpenCode Go families are payload-driven and resolve before any
+  // capability-state collapse, so an unverified Go route still surfaces its
+  // family, cadence label, and hints in diagnostics. This runs before
+  // isAnthropicModel / isOpenAIModel so a Go anthropic-messages route never
+  // inherits a first-party family.
+  if (model?.provider === "opencode-go" && capability.state !== "unsupported") {
+    return classifyOpencodeGoFamily(payload);
+  }
   if (capability.state === "unverified") return "unverified";
   if (capability.state === "unsupported" || !model) return "unsupported";
   return resolveVerifiedCacheFamily(model, anthropicTtl, payload);
@@ -206,12 +250,16 @@ export function resolveCacheFamily(
 export function resolveCacheRetention(family: CacheFamily): CacheRetention {
   switch (family) {
     case "anthropic-long":
+    case "opencode-go-long-marker":
       return "long";
     case "anthropic-short":
     case "openai-explicit":
     case "openai-implicit":
     case "xai-best-effort":
+    case "opencode-go-short-marker":
+    case "opencode-go-plain":
       return "short";
+    case "opencode-go-retained":
     case "unverified":
     case "unsupported":
     default:
@@ -229,15 +277,18 @@ export function resolveStrategy(
   const cacheRetention = resolveCacheRetention(family);
 
   if (capability.state !== "verified") {
+    // Unverified OpenCode Go routes keep their payload-derived family and
+    // cadence label so diagnostics show what the route would do if promoted.
+    // The interval stays null: an unverified route never arms a timer.
+    const goCadence = isOpencodeGoFamily(family) ? opencodeGoFamilyCadence(family) : null;
     return {
       capability,
       family,
       cacheRetention,
       intervalMs: null,
       ttlLabel:
-        capability.state === "unverified"
-          ? capability.reason
-          : "unsupported route",
+        goCadence ??
+        (capability.state === "unverified" ? capability.reason : "unsupported route"),
       waitLabel: null,
       automaticWarm: false,
       manualProbe: capability.manualProbe,
@@ -259,8 +310,36 @@ export function resolveStrategy(
     };
   }
 
+  // OpenCode Go openai-responses automatic eligibility requires a stable
+  // prompt-cache key in the captured body, mirroring direct xAI. The gate is
+  // the generalized `hasStableResponsesCacheKey` predicate. Keyed-but-
+  // unretained is not a separate family; it behaves like plain on the wire.
+  if (
+    family === "opencode-go-plain" &&
+    model?.api === "openai-responses" &&
+    payload !== undefined &&
+    !hasStableResponsesCacheKey(payload)
+  ) {
+    return {
+      capability,
+      family,
+      cacheRetention,
+      intervalMs: null,
+      ttlLabel: "OpenCode Go responses probe waiting for a stable prompt-cache key",
+      waitLabel: null,
+      automaticWarm: false,
+      manualProbe: false,
+      longTtlDegradedReason: null,
+    };
+  }
+
   let longTtlDegradedReason: string | null = null;
-  if (isAnthropicModel(model) && config.anthropicTtl === "1h" && family !== "anthropic-long") {
+  if (
+    isAnthropicModel(model) &&
+    config.anthropicTtl === "1h" &&
+    family !== "anthropic-long" &&
+    !isOpencodeGoFamily(family)
+  ) {
     if (!modelSupportsLongCacheRetention(model)) {
       longTtlDegradedReason = "model/route does not support long cache retention";
     } else {
@@ -292,6 +371,30 @@ export function resolveStrategy(
     case "xai-best-effort":
       ttlMs = XAI_BEST_EFFORT_INTERVAL_MS;
       ttlLabel = "xAI best-effort probe cadence";
+      break;
+    case "opencode-go-retained":
+      // The retained family never schedules a probe. intervalMs null and
+      // automaticWarm false are safe under any state; Slice 8 promotion adds
+      // the explicit verified-no-probe automaticWarm override.
+      return {
+        capability,
+        family,
+        cacheRetention,
+        intervalMs: null,
+        ttlLabel: "retention requested on the wire; no keepalive scheduled",
+        waitLabel: null,
+        automaticWarm: false,
+        manualProbe: false,
+        longTtlDegradedReason: null,
+      };
+    case "opencode-go-long-marker":
+      ttlMs = ANTHROPIC_LONG_TTL_MS;
+      ttlLabel = "best-effort probe cadence (~48m)";
+      break;
+    case "opencode-go-short-marker":
+    case "opencode-go-plain":
+      ttlMs = ANTHROPIC_SHORT_TTL_MS;
+      ttlLabel = "best-effort probe cadence (~4m)";
       break;
     default:
       return {

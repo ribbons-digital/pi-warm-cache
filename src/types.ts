@@ -80,6 +80,10 @@ export type CacheFamily =
   | "openai-explicit"
   | "openai-implicit"
   | "xai-best-effort"
+  | "opencode-go-retained"
+  | "opencode-go-long-marker"
+  | "opencode-go-short-marker"
+  | "opencode-go-plain"
   | "unverified"
   | "unsupported";
 
