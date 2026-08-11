@@ -100,9 +100,22 @@ type ModelCompat = {
    * Older OpenAI models reject the parameter. Default: false.
    */
   supportsExplicitPromptCacheMode?: boolean;
+  /**
+   * The output-cap field this model accepts for openai-completions payloads.
+   * All OpenCode Go completions models declare "max_tokens" and some upstreams
+   * reject the unknown default field. Default when unset: "max_completion_tokens".
+   */
+  maxTokensField?: string;
 };
 
-function getModelCompat(model: Model<any> | undefined): ModelCompat | undefined {
+/**
+ * Return the model compat record.
+ *
+ * Exported for the warmer call site of `applyWarmOutputLimit`, which must pass
+ * `maxTokensField` through so an uncapped completions payload is capped on the
+ * field the model actually accepts.
+ */
+export function getModelCompat(model: Model<any> | undefined): ModelCompat | undefined {
   return (model as { compat?: ModelCompat } | undefined)?.compat;
 }
 
@@ -463,11 +476,15 @@ export function appendWarmUserTurn(
  *   Do not change reasoning.effort unless a same-session probe proves cache-safe.
  * - OpenAI Responses (non-Codex): max_output_tokens floor is 16
  *   (pi-ai / github.com/earendil-works/pi/issues/6265).
+ * - OpenAI Completions (uncapped only): write `compat.maxTokensField` when the
+ *   model declares it, else the default "max_completion_tokens". Some upstreams
+ *   (all OpenCode Go completions models today) reject the unknown default field.
  */
 export function applyWarmOutputLimit(
   payload: unknown,
   maxOutputTokens: number,
   api?: string,
+  compat?: ModelCompat,
 ): unknown {
   if (!payload || typeof payload !== "object") return payload;
   const p = payload as Record<string, unknown>;
@@ -512,7 +529,7 @@ export function applyWarmOutputLimit(
     } else if (api === "openai-responses" || api === "azure-openai-responses") {
       p.max_output_tokens = floor;
     } else if (api === "openai-completions") {
-      p.max_completion_tokens = floor;
+      p[compat?.maxTokensField ?? "max_completion_tokens"] = floor;
     }
     // Unknown API shapes: leave unchanged rather than guess a rejected field.
   }

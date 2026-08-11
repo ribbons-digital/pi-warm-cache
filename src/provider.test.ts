@@ -21,6 +21,7 @@ import {
   decideCodexOversizedAction,
   getPromptCacheKey,
   getPromptCacheKeyFingerprint,
+  getModelCompat,
   hasXaiPromptCacheKey,
   isCodexPayload,
   isPayloadContinuation,
@@ -198,6 +199,82 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
   const recover = decideCodexOversizedAction(20, 1);
   assert(recover.decision === "ok" && recover.consecutiveAfter === 0, "small out clears streak");
+}
+
+// 2d) Uncapped completions fallback honors compat.maxTokensField; the default
+// field stays "max_completion_tokens" without compat; an already-capped body
+// mutates only the declared field.
+{
+  const uncapped = {
+    model: "deepseek-v4-flash",
+    messages: [{ role: "user", content: "hi" }],
+  };
+  const declared = applyWarmOutputLimit(
+    structuredClone(uncapped),
+    8,
+    "openai-completions",
+    { maxTokensField: "max_tokens" },
+  ) as Record<string, unknown>;
+  assert(
+    declared.max_tokens === 8,
+    "uncapped completions must write the declared maxTokensField",
+  );
+  assert(
+    !("max_completion_tokens" in declared),
+    "must not write the default field when maxTokensField is declared",
+  );
+
+  const defaulted = applyWarmOutputLimit(
+    structuredClone(uncapped),
+    8,
+    "openai-completions",
+  ) as Record<string, unknown>;
+  assert(
+    defaulted.max_completion_tokens === 8,
+    "uncapped completions without compat keeps the default field",
+  );
+  assert(!("max_tokens" in defaulted), "must not add max_tokens without compat");
+
+  // Already-capped body: the existing declared field is capped in place and no
+  // other field is added (exact-prefix replay preserved).
+  const cappedOriginal = {
+    model: "deepseek-v4-flash",
+    messages: [{ role: "user", content: "hi" }],
+    max_tokens: 8192,
+  };
+  const cappedOut = applyWarmOutputLimit(
+    structuredClone(cappedOriginal),
+    8,
+    "openai-completions",
+    { maxTokensField: "max_tokens" },
+  ) as Record<string, unknown>;
+  assert(cappedOut.max_tokens === 8, "an existing declared cap field is capped in place");
+  deepEqualExcept(cappedOriginal, cappedOut, WARM_MUTABLE_PAYLOAD_KEYS);
+
+  // The Anthropic and Responses fallbacks stay unchanged when compat is passed.
+  const anthropicUncapped = {
+    model: "claude-fable-5",
+    messages: [{ role: "user", content: "hi" }],
+  };
+  const anthropicOut = applyWarmOutputLimit(
+    structuredClone(anthropicUncapped),
+    8,
+    "anthropic-messages",
+    { maxTokensField: "max_tokens" },
+  ) as Record<string, unknown>;
+  assert(anthropicOut.max_tokens === 8, "the Anthropic fallback keeps writing max_tokens");
+
+  const responsesUncapped = { model: "gpt-5.6", input: [{ role: "user", content: "hi" }] };
+  const responsesOut = applyWarmOutputLimit(
+    structuredClone(responsesUncapped),
+    8,
+    "openai-responses",
+    { maxTokensField: "max_tokens" },
+  ) as Record<string, unknown>;
+  assert(
+    responsesOut.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
+    "the Responses fallback keeps writing max_output_tokens at its legal floor",
+  );
 }
 
 // 3) Strategy intervals stay inside TTL.
@@ -1858,6 +1935,89 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "the refusal reason must be exposed on the /warm now result",
   );
   assert(calls.length === 0, "a refused Go completions payload must never reach the provider");
+  warmer.dispose();
+}
+
+// 11b) The warmer call site passes getModelCompat through: an OpenCode Go
+// completions probe on an uncapped captured body writes the declared
+// maxTokensField (max_tokens), never the default max_completion_tokens.
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  const responses = [
+    {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+    },
+  ];
+  const goModel = {
+    id: "deepseek-v4-flash",
+    provider: "opencode-go",
+    api: "openai-completions",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+    compat: { maxTokensField: "max_tokens" },
+    cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
+  } as any;
+  assert(
+    getModelCompat(goModel)?.maxTokensField === "max_tokens",
+    "getModelCompat must expose the declared maxTokensField",
+  );
+  const calls: Array<{ options: any; payload: any }> = [];
+  const completeStub = async (_model: any, _context: any, options: any): Promise<any> => {
+    const payload = options.onPayload?.(
+      structuredClone({ model: "deepseek-v4-flash", messages: [] }),
+      goModel,
+    );
+    calls.push({ options, payload });
+    return responses.shift();
+  };
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model: goModel,
+    hasUI: true,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "go-session" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+  });
+
+  const captured = {
+    model: "deepseek-v4-flash",
+    messages: [{ role: "user", content: "hello" }],
+  };
+  warmer.capturePayload(captured, ctx);
+  const result = await warmer.warmNow(ctx);
+  assert(result.ok === true, "a manual probe on a clean Go completions payload should run");
+  assert(calls.length === 1, "a manual probe must reach the provider");
+  const shaped = calls[0]?.payload as Record<string, unknown>;
+  assert(
+    shaped.max_tokens === 1,
+    "the probe must cap the declared maxTokensField (max_tokens)",
+  );
+  assert(
+    !("max_completion_tokens" in shaped),
+    "the probe must not write the default max_completion_tokens field",
+  );
+  assert(
+    JSON.stringify(shaped.messages) === JSON.stringify(captured.messages),
+    "the probe must preserve the exact captured prefix",
+  );
   warmer.dispose();
 }
 

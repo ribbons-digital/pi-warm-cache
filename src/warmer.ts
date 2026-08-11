@@ -9,6 +9,7 @@ import {
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
   decideCodexOversizedAction,
   DEFER_BACKOFF_MS,
+  getModelCompat,
   getPromptCacheKey,
   getPromptCacheKeyFingerprint,
   isPayloadContinuation,
@@ -1591,7 +1592,12 @@ export class SessionWarmer {
               : cloned;
             return xaiBestEffort
               ? applyXaiWarmOutputLimit(shaped, this.config.maxOutputTokens)
-              : applyWarmOutputLimit(shaped, this.config.maxOutputTokens, model.api);
+              : applyWarmOutputLimit(
+                  shaped,
+                  this.config.maxOutputTokens,
+                  model.api,
+                  getModelCompat(model),
+                );
           },
         },
       );

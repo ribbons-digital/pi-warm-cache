@@ -184,6 +184,7 @@ The extension therefore:
 
 Anthropic probes use `max_tokens` with the minimum required by the thinking budget.
 OpenAI Responses and xAI Responses probes use a legal `max_output_tokens` floor of 16.
+OpenAI Completions probes cap the field the model declares via `compat.maxTokensField` (all OpenCode Go completions models declare `max_tokens`), falling back to `max_completion_tokens` when unset.
 Codex Responses probes never add `max_output_tokens` and use the Codex-specific policy.
 
 ### Lifecycle hooks
