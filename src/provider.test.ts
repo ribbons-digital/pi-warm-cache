@@ -15,6 +15,7 @@ import {
   applyWarmOutputLimit,
   applyXaiWarmOutputLimit,
   canManualProbe,
+  classifyOpencodeGoFamily,
   classifyProbeOutcome,
   classifyRealTurnObservation,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
@@ -22,6 +23,7 @@ import {
   getPromptCacheKey,
   getPromptCacheKeyFingerprint,
   getModelCompat,
+  hasStableResponsesCacheKey,
   hasXaiPromptCacheKey,
   isCodexPayload,
   isPayloadContinuation,
@@ -36,6 +38,8 @@ import {
   payloadHasCacheControl,
   supportsManualProbe,
   XAI_BEST_EFFORT_INTERVAL_MS,
+  resolveCacheFamily,
+  resolveCacheRetention,
   resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
@@ -691,8 +695,8 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       "the fall-through regression route must never auto-warm",
     );
     assert(
-      resolveStrategy(goAnthropicCompat, DEFAULT_CONFIG).family === "unverified",
-      "the fall-through regression route must not receive a verified family",
+      resolveStrategy(goAnthropicCompat, DEFAULT_CONFIG).family === "opencode-go-plain",
+      "the fall-through regression route must not receive a verified family; the payload-driven plain family applies",
     );
 
     // A registered OpenCode Go route without any compat still resolves; the
@@ -717,7 +721,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       "a safe anthropic payload should permit a manual probe on the Go anthropic route",
     );
     const goStrategy = resolveStrategy(goAnthropicNoCompat, DEFAULT_CONFIG);
-    assert(goStrategy.family === "unverified", "OpenCode Go must not inherit an Anthropic family");
+    assert(
+      goStrategy.family === "opencode-go-plain",
+      "OpenCode Go must not inherit an Anthropic family; the payload-driven plain family applies",
+    );
     assert(goStrategy.intervalMs === null, "manual-only OpenCode Go route must not receive a timer");
 
     // Foreign-instrumentation refusal: an opencode-go openai-completions
@@ -868,6 +875,229 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     assert(
       canManualProbe(goAnthropicMarkers, goAnthropicMarkerPayload),
       "anthropic-messages markers must not disable the manual probe",
+    );
+
+    // Payload-driven family classification for every instrumentation state.
+    // The family is independent of capability state and comes from the
+    // instrumentation actually observed on the captured payload.
+    const goAnthropicFamilyModel = {
+      id: "qwen3.7-max",
+      provider: "opencode-go",
+      api: "anthropic-messages",
+      baseUrl: "https://opencode.ai/zen/go",
+    } as any;
+    assert(
+      classifyOpencodeGoFamily({ model: "qwen3.7-max", messages: [], system: [] }) ===
+        "opencode-go-plain",
+      "anthropic-messages without markers must classify plain",
+    );
+    assert(
+      classifyOpencodeGoFamily(undefined) === "opencode-go-plain",
+      "no payload must classify plain",
+    );
+    assert(
+      classifyOpencodeGoFamily({
+        model: "qwen3.7-max",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+          },
+        ],
+        system: [],
+      }) === "opencode-go-short-marker",
+      "any cache_control without ttl must classify short-marker",
+    );
+    assert(
+      classifyOpencodeGoFamily({
+        model: "qwen3.7-max",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } },
+            ],
+          },
+        ],
+        system: [],
+      }) === "opencode-go-long-marker",
+      "cache_control with ttl 1h must classify long-marker",
+    );
+    assert(
+      classifyOpencodeGoFamily({
+        model: "qwen3.7-max",
+        prompt_cache_retention: "24h",
+        messages: [{ role: "user", content: "hi" }],
+        system: [],
+      }) === "opencode-go-retained",
+      "prompt_cache_retention 24h must classify retained",
+    );
+    // Retention wins over markers: it is the stronger lifetime signal.
+    assert(
+      classifyOpencodeGoFamily({
+        model: "qwen3.7-max",
+        prompt_cache_retention: "24h",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+          },
+        ],
+        system: [],
+      }) === "opencode-go-retained",
+      "retention must win over a co-occurring marker",
+    );
+    // Keyed-but-unretained is not a separate family: it behaves like plain.
+    assert(
+      classifyOpencodeGoFamily({
+        model: "grok-4.5",
+        input: [{ role: "user", content: "hi" }],
+        prompt_cache_key: "go-session-1",
+      }) === "opencode-go-plain",
+      "prompt_cache_key without prompt_cache_retention must behave like plain",
+    );
+
+    // The retained family never schedules a probe: intervalMs null and no
+    // automatic warming from day one, independent of capability state.
+    const retainedStrategy = resolveStrategy(
+      goAnthropicFamilyModel,
+      DEFAULT_CONFIG,
+      { model: "qwen3.7-max", prompt_cache_retention: "24h", messages: [], system: [] },
+    );
+    assert(
+      retainedStrategy.family === "opencode-go-retained",
+      "a retained payload must resolve the retained family even while unverified",
+    );
+    assert(retainedStrategy.intervalMs === null, "retained must never schedule a probe");
+    assert(!retainedStrategy.automaticWarm, "retained must never auto-warm");
+    assert(
+      retainedStrategy.ttlLabel.includes("no keepalive scheduled"),
+      "retained label must explain that no keepalive is scheduled",
+    );
+
+    // Marker and plain families surface their cadence label even while
+    // unverified. No Go family renders a numeric lifetime, and no timer is
+    // armed: every unverified Go family resolves intervalMs null.
+    const longMarkerStrategy = resolveStrategy(
+      goAnthropicFamilyModel,
+      DEFAULT_CONFIG,
+      {
+        model: "qwen3.7-max",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } },
+            ],
+          },
+        ],
+        system: [],
+      },
+    );
+    assert(
+      longMarkerStrategy.family === "opencode-go-long-marker",
+      "long-marker family must resolve",
+    );
+    assert(longMarkerStrategy.intervalMs === null, "unverified long-marker must not arm a timer");
+    assert(
+      longMarkerStrategy.ttlLabel.includes("best-effort probe cadence (~48m)"),
+      "long-marker must show the best-effort cadence label, not a numeric lifetime",
+    );
+    const shortMarkerStrategy = resolveStrategy(
+      goAnthropicFamilyModel,
+      DEFAULT_CONFIG,
+      {
+        model: "qwen3.7-max",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+          },
+        ],
+        system: [],
+      },
+    );
+    assert(
+      shortMarkerStrategy.family === "opencode-go-short-marker",
+      "short-marker family must resolve",
+    );
+    assert(shortMarkerStrategy.intervalMs === null, "unverified short-marker must not arm a timer");
+    assert(
+      shortMarkerStrategy.ttlLabel.includes("best-effort probe cadence (~4m)"),
+      "short-marker must show the best-effort cadence label",
+    );
+    const plainStrategy = resolveStrategy(
+      goAnthropicFamilyModel,
+      DEFAULT_CONFIG,
+      { model: "qwen3.7-max", messages: [{ role: "user", content: "hi" }], system: [] },
+    );
+    assert(plainStrategy.family === "opencode-go-plain", "plain family must resolve");
+    assert(plainStrategy.intervalMs === null, "unverified plain must not arm a timer");
+    assert(
+      plainStrategy.ttlLabel.includes("best-effort probe cadence (~4m)"),
+      "plain must show the best-effort cadence label",
+    );
+    assert(
+      resolveProviderCapability(goAnthropicFamilyModel, {
+        model: "qwen3.7-max",
+        messages: [{ role: "user", content: "hi" }],
+        system: [],
+      }).reason.includes("set Pi cache retention to long for keyed 24h Go caching"),
+      "the plain family must fold the degraded retention hint into capability.reason",
+    );
+    assert(
+      !resolveProviderCapability(goAnthropicFamilyModel, {
+        model: "qwen3.7-max",
+        prompt_cache_retention: "24h",
+        messages: [],
+        system: [],
+      }).reason.includes("set Pi cache retention to long"),
+      "the retained family must not carry the plain degraded hint",
+    );
+
+    // resolveCacheRetention mapping for the four Go families.
+    assert(
+      resolveCacheRetention("opencode-go-long-marker") === "long",
+      "long-marker maps to long retention",
+    );
+    assert(
+      resolveCacheRetention("opencode-go-short-marker") === "short",
+      "short-marker maps to short retention",
+    );
+    assert(resolveCacheRetention("opencode-go-plain") === "short", "plain maps to short retention");
+    assert(
+      resolveCacheRetention("opencode-go-retained") === "none",
+      "retained never probes so retention is none",
+    );
+
+    // resolveCacheFamily is payload-driven for Go routes even while unverified
+    // and resolves before the capability-state collapse.
+    assert(
+      resolveCacheFamily(goAnthropicFamilyModel, "auto", {
+        model: "qwen3.7-max",
+        prompt_cache_retention: "24h",
+        messages: [],
+        system: [],
+      }) === "opencode-go-retained",
+      "resolveCacheFamily must surface the retained family before the capability-state collapse",
+    );
+    assert(
+      resolveCacheFamily(goAnthropicFamilyModel, "auto", undefined) === "opencode-go-plain",
+      "resolveCacheFamily with no payload must default to plain for Go routes",
+    );
+
+    // The generalized responses key predicate mirrors the direct xAI gate.
+    assert(
+      hasStableResponsesCacheKey({
+        model: "grok-4.5",
+        input: [{ role: "user", content: "hi" }],
+        prompt_cache_key: "go-session-1",
+      }),
+      "a responses payload with a stable key must pass the generalized key predicate",
+    );
+    assert(
+      !hasStableResponsesCacheKey({ model: "grok-4.5", input: [{ role: "user", content: "hi" }] }),
+      "a responses payload without a key must fail the generalized key predicate",
     );
   }
 

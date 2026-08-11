@@ -70,6 +70,15 @@ No OpenCode Go completions model declares it today, so a captured completions pa
 The rule derives from the compat declaration, not a model-id denylist, so a future completions model that declares the format is handled without a code change.
 The `anthropic-messages` transport carries `cache_control` by design and is never refused.
 
+OpenCode Go cache families are payload-driven.
+The extension classifies each captured payload by the cache instrumentation actually observed on it, independent of capability state, so an unverified Go route still surfaces its family, cadence label, and hints in diagnostics.
+`prompt_cache_retention: "24h"` on the wire selects the retained family, which never schedules a probe.
+`cache_control` with `ttl: "1h"` selects long-marker; any other `cache_control` selects short-marker; no instrumentation selects plain.
+When retention and markers co-occur, retention wins because it is the stronger lifetime signal.
+A keyed-but-unretained payload (`prompt_cache_key` without `prompt_cache_retention`) is not a separate family and behaves like plain.
+The plain family carries a degraded hint in its status line to set Pi cache retention to long.
+No OpenCode Go family renders a numeric lifetime; only best-effort probe cadence wording is used until an e2e evidence record exists.
+
 ### Unsupported routes
 
 Unregistered proxy routes, proxy routes with a different endpoint or routing format, and other API-compatible routes do not receive support.
@@ -253,6 +262,15 @@ A provider error is reported as an error and does not increment `probeMisses`.
 | `openai-explicit` | 30-minute explicit prompt-cache mode | about 24 minutes | `short` |
 | `openai-implicit` | older in-memory idle window | about 6.4 minutes | `short` |
 | `xai-best-effort` | no fixed provider TTL claim | 4-minute heuristic | `short` plus captured key |
+| `opencode-go-retained` | 24h retention requested on the wire | no keepalive scheduled | `none` |
+| `opencode-go-long-marker` | anthropic-style `cache_control` with `ttl: "1h"` | about 48 minutes (best-effort) | `long` |
+| `opencode-go-short-marker` | `cache_control` ephemeral without ttl | about 4 minutes (best-effort) | `short` |
+| `opencode-go-plain` | no cache instrumentation | about 4 minutes (best-effort) | `short` |
+
+The OpenCode Go families resolve from the captured payload, not from model metadata, and never render a numeric lifetime until an e2e evidence record exists.
+All four families start unverified and manual-only, so no Go route arms a timer today; the listed cadences describe what each family would do after promotion to verified.
+Their intervals are best-effort probe cadences, not provider TTL claims.
+The retained family never probes and stays unverified, so its row lists no keepalive.
 
 The existing `interval` configuration overrides the default interval for every strategy, including xAI best-effort probes.
 
@@ -328,6 +346,7 @@ interface WarmCacheConfig {
 13. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
 14. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 15. **Foreign instrumentation on an OpenCode Go completions payload** - refuse replay when `cache_control` appears without `cacheControlFormat: "anthropic"` compat, because the route cannot legally carry it.
+16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family never probes and stays unverified; the plain family carries the degraded retention hint in its reason.
 
 ## Package layout
 
