@@ -12,13 +12,16 @@ import {
   getModelCompat,
   getPromptCacheKey,
   getPromptCacheKeyFingerprint,
+  isBestEffortNoWriteFamily,
   isPayloadContinuation,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
+  resolveMaxIdleWarmMs,
   resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
 } from "./provider.ts";
+import { formatDurationShort } from "./config.ts";
 import { appendWarmLog, warmLogPath, type WarmLogEvent } from "./log.ts";
 import {
   buildWarmResult,
@@ -40,6 +43,7 @@ import {
 import type { StrategyResolution } from "./provider.ts";
 import type {
   CacheAnchor,
+  CacheFamily,
   ProbeObservation,
   ProbeOutcome,
   ProviderCapability,
@@ -71,6 +75,74 @@ class WarmConcurrencyGate {
 }
 
 const globalGate = new WarmConcurrencyGate();
+
+/**
+ * Per-provider probe-spend ledger, keyed by provider (spendUsd + probeCount).
+ *
+ * Module-level beside globalGate because the spend ceiling is per provider per
+ * campaign, not per session: every Go session shares one dollar-capped
+ * subscription. The ledger resets on real-turn activity for that provider
+ * (capturePayload + noteAssistantUsage), so it bounds each idle stretch rather
+ * than the process lifetime.
+ */
+class ProbeSpendLedger {
+  private spendUsd = new Map<string, number>();
+  private probeCount = new Map<string, number>();
+
+  reset(provider: string): void {
+    this.spendUsd.delete(provider);
+    this.probeCount.delete(provider);
+  }
+
+  resetAll(): void {
+    this.spendUsd.clear();
+    this.probeCount.clear();
+  }
+
+  add(provider: string, costUsd: number): void {
+    this.spendUsd.set(provider, (this.spendUsd.get(provider) ?? 0) + costUsd);
+    this.probeCount.set(provider, (this.probeCount.get(provider) ?? 0) + 1);
+  }
+
+  getSpendUsd(provider: string): number {
+    return this.spendUsd.get(provider) ?? 0;
+  }
+
+  getProbeCount(provider: string): number {
+    return this.probeCount.get(provider) ?? 0;
+  }
+}
+
+const probeSpendLedger = new ProbeSpendLedger();
+
+/** Default spend ceiling when `warmSpendCeilingUsd` is null: $1.00 for opencode-go. */
+const DEFAULT_SPEND_CEILING_USD = 1.0;
+
+/** Probe-count fallback ceiling when model cost fields are zero or unusable. */
+const SPEND_PROBE_COUNT_FALLBACK = 250;
+
+/**
+ * Resolve the spend ceiling for a provider, or null when the provider is not
+ * ceiling-active. warmSpendCeilingUsd 0 = unlimited (ceiling inactive for all
+ * providers, including opencode-go).
+ */
+function resolveProviderSpendCeilingUsd(
+  config: WarmCacheConfig,
+  provider: string,
+): number | null {
+  if (config.warmSpendCeilingUsd !== null) {
+    return config.warmSpendCeilingUsd > 0 ? config.warmSpendCeilingUsd : null;
+  }
+  return provider === "opencode-go" ? DEFAULT_SPEND_CEILING_USD : null;
+}
+
+/**
+ * Exported test seam: the module-level ledger is shared across test blocks in
+ * one process, so tests reset it explicitly before exercising the ceiling.
+ */
+export function resetProbeSpendLedgerForTest(): void {
+  probeSpendLedger.resetAll();
+}
 
 type CompleteRequest = typeof complete;
 
@@ -123,6 +195,12 @@ export class SessionWarmer {
    * /warm on|resume (not by capturePayload / agent_settled).
    */
   private autoWarmBlockReason: string | null = null;
+  /**
+   * Per-instance probe-spend soft block. Cleared ONLY by this instance's
+   * capturePayload; other sessions' capturePayload clears only their own
+   * field. Never sets lifecycleState "blocked".
+   */
+  private spendBlockReason: string | null = null;
   /** Consecutive Codex warm ticks with out >= CODEX_WARM_OUTPUT_ABORT_TOKENS. */
   private consecutiveCodexOversized = 0;
   /** Last scheduled probe deferral, retained until a probe gets a slot. */
@@ -388,10 +466,15 @@ export class SessionWarmer {
     this.ctx = ctx;
     this.logFile = warmLogPath(ctx.cwd);
     this.deferredProbe = null;
+    // Any real capture clears this instance's probe-spend soft block and
+    // resets the per-provider campaign ledger (the ledger is per-campaign:
+    // it bounds each idle stretch rather than the process lifetime).
+    this.spendBlockReason = null;
     const reanchorWasPending =
       this.lifecycleState === "awaiting-reanchor" || this.pendingReanchor !== null;
     const payloadFingerprint = stableFingerprint(payload);
     const model = ctx.model;
+    if (model) probeSpendLedger.reset(model.provider);
     const cacheKeyFingerprint = getPromptCacheKeyFingerprint(payload, model?.api);
     this.capability = resolveProviderCapability(model, payload);
 
@@ -542,6 +625,9 @@ export class SessionWarmer {
       savingsKnown,
       pricingSource: pricing.source,
       lastActivityAt: capturedAt,
+      // Idle-cutoff base: only real turns refresh this clock. Probe hits never
+      // touch it, so an idle session stops probing once the cutoff is reached.
+      lastRealTurnAt: capturedAt,
       // Keep the latest probe alongside a continuing real-turn observation so
       // /warm can show whether that probe preceded the next real turn. A
       // changed prefix starts a new anchor and must not inherit old evidence.
@@ -643,6 +729,10 @@ export class SessionWarmer {
     },
   ): void {
     this.ctx = ctx;
+    // Real-turn activity resets the per-provider campaign ledger so it bounds
+    // each idle stretch rather than the process lifetime.
+    const ledgerProvider = this.anchor?.provider ?? ctx.model?.provider;
+    if (ledgerProvider) probeSpendLedger.reset(ledgerProvider);
     const cacheRead = usage.cacheRead ?? 0;
     const cacheWrite = usage.cacheWrite ?? 0;
     const input = usage.input ?? 0;
@@ -689,6 +779,8 @@ export class SessionWarmer {
     if (cacheRead > 0) this.anchor.cachedTokens = cacheRead;
     if (promptTokens > 0) this.anchor.promptTokens = promptTokens;
     this.anchor.lastActivityAt = Date.now();
+    // A real turn refreshes the idle-cutoff base. Probe hits never do.
+    this.anchor.lastRealTurnAt = Date.now();
     this.anchor.consecutiveFailures = 0;
     this.log({
       event: "usage",
@@ -858,6 +950,7 @@ export class SessionWarmer {
         ? "codexAuto=on"
         : "",
       this.autoWarmBlockReason ? `blockReason=${this.autoWarmBlockReason}` : "",
+      this.spendBlockReason ? `spendCeiling=${this.spendBlockReason}` : "spendCeiling=ok",
       anchor ? `probes=${anchor.probeCount}` : "probes=0",
       anchor ? `savings=${formatSavingsLabel(anchor)}` : "",
       anchor ? `pricing=${anchor.pricingSource}` : "",
@@ -1010,6 +1103,45 @@ export class SessionWarmer {
       const elapsed = Date.now() - anchor.lastActivityAt;
       delay = Math.max(1_000, plan.intervalMs - elapsed);
     }
+
+    // Idle warm cutoff, checked after the delayMs deferral paths merge so a
+    // busy/concurrency deferral also stops once the session has been idle past
+    // the bound. Do not pre-compute fire-time idle here; the runWarm fire
+    // check enforces the strict boundary at fire time.
+    const cutoffMs = resolveMaxIdleWarmMs(
+      this.config,
+      anchor.cacheFamily,
+      anchor.cacheFamily === "xai-best-effort" ? (plan.intervalMs ?? undefined) : undefined,
+    );
+    if (cutoffMs !== null) {
+      const idleMs = Date.now() - anchor.lastRealTurnAt;
+      if (idleMs >= cutoffMs) {
+        this.clearTimers();
+        const idleLabel = formatDurationShort(idleMs);
+        this.log({
+          event: "idle_cutoff",
+          source: "system",
+          sessionId: anchor.sessionId,
+          provider: anchor.provider,
+          modelId: anchor.modelId,
+          api: anchor.modelApi,
+          capabilityState: anchor.capability.state,
+          capabilityReason: anchor.capability.reason,
+          automaticWarm: anchor.capability.automaticWarm,
+          family: anchor.cacheFamily,
+          cacheKeyFingerprint: anchor.cacheKeyFingerprint,
+          idleMs,
+          cutoffMs,
+          reason: "idle warm cutoff reached",
+        });
+        this.showIdle(
+          ctx,
+          "idle cutoff reached",
+          `no real turn for ${idleLabel} (cutoff ${formatDurationShort(cutoffMs)}); warming paused until the next real turn`,
+        );
+        return;
+      }
+    }
     this.nextDueAt = Date.now() + delay;
 
     renderWaitingUi(ctx, this.config, anchor, plan, this.nextDueAt, this.getDeferredProbe());
@@ -1141,6 +1273,9 @@ export class SessionWarmer {
     }
     const probeCost = Number.isFinite(result.costUsd) && result.costUsd >= 0 ? result.costUsd : 0;
     anchor.totalProbeCostUsd += probeCost;
+    // Module-level per-provider campaign ledger. Incremented on every provider
+    // response; the spend ceiling checks it in runWarm before the gate.
+    probeSpendLedger.add(anchor.provider, probeCost);
     anchor.estimatedSavingsUsd = anchor.savingsKnown
       ? anchor.totalEstimatedSavedUsd - anchor.totalProbeCostUsd
       : 0;
@@ -1423,6 +1558,36 @@ export class SessionWarmer {
       };
     }
 
+    // Per-instance probe-spend soft block. Cleared only by this instance's
+    // capturePayload, so another session's real turn cannot resume our probes
+    // by resetting the shared module-level ledger.
+    if (reason === "timer" && this.spendBlockReason) {
+      const detail = `spend ceiling: ${this.spendBlockReason}`;
+      this.recordAttempt(reason, false, detail);
+      this.clearTimers();
+      if (ctx) {
+        this.showIdle(
+          ctx,
+          "spend ceiling reached",
+          `${this.spendBlockReason} · a real turn resets the campaign ledger; /warm now bypasses the ceiling`,
+        );
+      }
+      return {
+        ok: false,
+        cacheHit: false,
+        probeOutcome: "unavailable",
+        cacheRead: 0,
+        cacheWrite: 0,
+        input: 0,
+        output: 0,
+        costUsd: 0,
+        estimatedSavedUsd: 0,
+        error: this.spendBlockReason,
+        unavailable: true,
+        fingerprint: anchor?.payloadFingerprint ?? "",
+      };
+    }
+
     if (!ctx || !anchor || !payload || !plan) {
       const detail =
         capability.state === "unverified"
@@ -1474,6 +1639,48 @@ export class SessionWarmer {
       });
     }
 
+    // Timer-fire idle cutoff. A timer probe fires only while idle since the
+    // last real turn is strictly below the cutoff at fire time. This early
+    // return (before this.warming = true) means the finally reschedule never
+    // runs, so the abort cannot re-arm the loop. Never counts as a probe
+    // failure and never touches consecutiveFailures.
+    if (reason === "timer") {
+      const cutoffMs = resolveMaxIdleWarmMs(
+        this.config,
+        anchor.cacheFamily,
+        anchor.cacheFamily === "xai-best-effort" ? (plan.intervalMs ?? undefined) : undefined,
+      );
+      if (cutoffMs !== null) {
+        const idleMs = Date.now() - anchor.lastRealTurnAt;
+        if (idleMs >= cutoffMs) {
+          const detail = `idle warm cutoff reached (idle ${formatDurationShort(idleMs)} >= ${formatDurationShort(cutoffMs)})`;
+          this.clearTimers();
+          this.recordAttempt(reason, false, detail);
+          if (ctx) {
+            this.showIdle(
+              ctx,
+              "idle cutoff reached",
+              "no real turn since the last warm boundary; warming paused until the next real turn",
+            );
+          }
+          return {
+            ok: false,
+            cacheHit: false,
+            probeOutcome: "unavailable",
+            cacheRead: 0,
+            cacheWrite: 0,
+            input: 0,
+            output: 0,
+            costUsd: 0,
+            estimatedSavedUsd: 0,
+            error: detail,
+            unavailable: true,
+            fingerprint: anchor.payloadFingerprint,
+          };
+        }
+      }
+    }
+
     if (!ctx.isIdle() && reason === "timer") {
       const deferral = this.deferProbe("agent busy", reason);
       this.recordAttempt(reason, false, `agent busy - ${formatDeferralStatus(deferral)}`);
@@ -1522,6 +1729,48 @@ export class SessionWarmer {
         error: "model changed",
         anchor,
       });
+    }
+
+    // Per-provider probe-spend ceiling, checked before the concurrency gate so
+    // a ceiling-active provider never spends while a slot is waiting. Scoped to
+    // timer fires only; /warm now bypasses both guards.
+    if (reason === "timer") {
+      const ceilingUsd = resolveProviderSpendCeilingUsd(this.config, anchor.provider);
+      if (ceilingUsd !== null) {
+        const campaignSpend = probeSpendLedger.getSpendUsd(anchor.provider);
+        const campaignProbes = probeSpendLedger.getProbeCount(anchor.provider);
+        const overSpend = campaignSpend >= ceilingUsd;
+        const overProbeCount = campaignProbes >= SPEND_PROBE_COUNT_FALLBACK;
+        if (overSpend || overProbeCount) {
+          this.spendBlockReason = overSpend
+            ? `probe spend ceiling reached ($${ceilingUsd.toFixed(2)} for ${anchor.provider}; campaign total $${campaignSpend.toFixed(2)})`
+            : `probe count ceiling reached (${SPEND_PROBE_COUNT_FALLBACK} probes for ${anchor.provider} this campaign)`;
+          const detail = `spend ceiling: ${this.spendBlockReason}`;
+          this.clearTimers();
+          this.recordAttempt(reason, false, detail);
+          if (ctx) {
+            this.showIdle(
+              ctx,
+              "spend ceiling reached",
+              `${this.spendBlockReason} · a real turn resets the campaign ledger`,
+            );
+          }
+          return {
+            ok: false,
+            cacheHit: false,
+            probeOutcome: "unavailable",
+            cacheRead: 0,
+            cacheWrite: 0,
+            input: 0,
+            output: 0,
+            costUsd: 0,
+            estimatedSavedUsd: 0,
+            error: this.spendBlockReason,
+            unavailable: true,
+            fingerprint: anchor.payloadFingerprint,
+          };
+        }
+      }
     }
 
     if (!globalGate.tryEnter(this.config.maxConcurrentWarmSessions)) {
@@ -1701,10 +1950,11 @@ export class SessionWarmer {
       if (result.cacheHit) {
         anchor.lastActivityAt = Date.now();
         anchor.consecutiveFailures = 0;
+        const bestEffortHit = isBestEffortNoWriteFamily(anchor.cacheFamily);
         this.recordAttempt(
           reason,
           true,
-          `${anchor.cacheFamily === "xai-best-effort" ? "xAI best-effort probe hit" : "probe hit"} ` +
+          `${bestEffortHit ? `${bestEffortNoWriteLabel(anchor.cacheFamily)} probe hit` : "probe hit"} ` +
             `read=${result.cacheRead} write=${result.cacheWrite} out=${result.output} in=${result.input}`,
           usageSnap,
           outcome,
@@ -1712,17 +1962,22 @@ export class SessionWarmer {
         renderWarmHitUi(ctx, this.config, anchor, plan, result.cacheRead);
       } else {
         const payloadDrift = outcome === "payload-drift";
-        // classifyProbeOutcome upgrades the final budgeted xAI no-read result
-        // to payload-drift because this route may not report cache writes.
-        const xaiNoWriteReanchor =
-          anchor.cacheFamily === "xai-best-effort" &&
-          result.cacheRead === 0 &&
-          result.cacheWrite === 0;
+        const bestEffortNoWrite = isBestEffortNoWriteFamily(anchor.cacheFamily);
+        // classifyProbeOutcome upgrades the final budgeted no-read result to
+        // payload-drift because these routes may not report cache writes.
+        const noWriteReanchor =
+          bestEffortNoWrite && result.cacheRead === 0 && result.cacheWrite === 0;
         const transientImplicitMiss = outcome === "transient-miss";
-        const xaiBestEffort = anchor.cacheFamily === "xai-best-effort";
+        const bestEffortLabel = bestEffortNoWriteLabel(anchor.cacheFamily);
+        // The xAI branch keeps its exact current wording; the Go marker/plain
+        // families use the gateway phrasing.
+        const omitWritePhrase =
+          anchor.cacheFamily === "xai-best-effort"
+            ? "xAI may omit cache-write usage"
+            : "the gateway may omit cache-write usage";
         anchor.consecutiveFailures += 1;
-        const detail = xaiNoWriteReanchor
-          ? `xAI best-effort probe ${outcome} read=0 write=0; xAI may omit cache-write usage; ` +
+        const detail = noWriteReanchor
+          ? `${bestEffortLabel} probe ${outcome} read=0 write=0; ${omitWritePhrase}; ` +
             `retry=${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} ` +
             `in=${result.input} out=${result.output} cost=${result.costUsd}`
           : `probe ${outcome} read=${result.cacheRead} write=${result.cacheWrite} ` +
@@ -1730,13 +1985,13 @@ export class SessionWarmer {
         this.recordAttempt(reason, false, detail, usageSnap, outcome);
 
         if (payloadDrift) {
-          const reanchorDetail = xaiNoWriteReanchor
-            ? `xAI best-effort probes returned no cached reads or writes for ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} attempts. ` +
-              "xAI may omit cache-write usage, so the configured failure budget is exhausted and a new real-turn anchor is required."
+          const reanchorDetail = noWriteReanchor
+            ? `${bestEffortLabel} probes returned no cached reads or writes for ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} attempts. ` +
+              `${omitWritePhrase}, so the configured failure budget is exhausted and a new real-turn anchor is required.`
             : `write=${result.cacheWrite} read=0. Payload likely diverged from provider cache.`;
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `pi-warm-cache: ${xaiBestEffort ? "xAI best-effort probe miss" : "probe miss"}; re-anchor required (${reanchorDetail})`,
+              `pi-warm-cache: ${bestEffortNoWrite ? `${bestEffortLabel} probe miss` : "probe miss"}; re-anchor required (${reanchorDetail})`,
               "warning",
             );
           }
@@ -1753,27 +2008,27 @@ export class SessionWarmer {
           renderProbeRetryUi(
             ctx,
             this.config,
-            xaiNoWriteReanchor
-              ? `xAI best-effort probe returned read=0 write=0; xAI may omit cache-write usage. ` +
+            noWriteReanchor
+              ? `${bestEffortLabel} probe returned read=0 write=0; ${omitWritePhrase}. ` +
                 `Retrying within the configured failure budget (${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}).`
               : `read=${result.cacheRead} write=${result.cacheWrite} · retry scheduled`,
             this.nextDueAt > Date.now() ? this.nextDueAt : undefined,
-            xaiBestEffort,
+            anchor.cacheFamily === "xai-best-effort",
           );
         } else {
-          const persistentMissDetail = xaiNoWriteReanchor
-            ? `xAI best-effort probe still returned no cached reads or writes. ` +
-              `xAI may omit cache-write usage; retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} remains within the configured failure budget.`
+          const persistentMissDetail = noWriteReanchor
+            ? `${bestEffortLabel} probe still returned no cached reads or writes. ` +
+              `${omitWritePhrase}; retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures} remains within the configured failure budget.`
             : `read=${result.cacheRead} write=${result.cacheWrite}`;
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `pi-warm-cache: ${xaiBestEffort ? "xAI best-effort probe miss" : "persistent probe miss"} (${persistentMissDetail})`,
+              `pi-warm-cache: ${bestEffortNoWrite ? `${bestEffortLabel} probe miss` : "persistent probe miss"} (${persistentMissDetail})`,
               "warning",
             );
           }
           this.showFailure(
             ctx,
-            `${xaiBestEffort ? "xAI best-effort probe miss" : "probe miss"} · retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`,
+            `${bestEffortNoWrite ? `${bestEffortLabel} probe miss` : "probe miss"} · retry ${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}`,
             persistentMissDetail,
           );
         }
@@ -1816,6 +2071,10 @@ export class SessionWarmer {
       }
     }
   }
+}
+
+function bestEffortNoWriteLabel(family: CacheFamily): string {
+  return family === "xai-best-effort" ? "xAI best-effort" : "OpenCode Go best-effort";
 }
 
 function formatRealTurnStatus(observation: RealTurnObservation): string {

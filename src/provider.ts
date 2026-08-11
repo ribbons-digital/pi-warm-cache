@@ -50,6 +50,63 @@ export const XAI_BEST_EFFORT_INTERVAL_MS = 4 * 60_000;
 /** Default ping delay as a fraction of TTL (stay safely inside). */
 const DEFAULT_TTL_FRACTION = 0.8;
 
+/** Idle-cutoff floor shared by every family (max(30m, 2 x referenceMs)). */
+const MIN_IDLE_CUTOFF_MS = 30 * 60_000;
+
+/**
+ * True for families whose probes may not report cache-write usage: direct xAI
+ * best-effort and the OpenCode Go marker/plain families. The retained Go
+ * family never probes and is excluded structurally.
+ */
+export function isBestEffortNoWriteFamily(family: CacheFamily): boolean {
+  return (
+    family === "xai-best-effort" ||
+    family === "opencode-go-long-marker" ||
+    family === "opencode-go-short-marker" ||
+    family === "opencode-go-plain"
+  );
+}
+
+/**
+ * Idle warm cutoff for a family: max(30m, 2 x referenceMs), where referenceMs
+ * is the family TTL when one exists and the effective interval otherwise.
+ * Only xai-best-effort is interval-referenced; TTL families ignore interval
+ * overrides.
+ *
+ * - config.maxIdleWarmMs null: formula.
+ * - config.maxIdleWarmMs 0: no cutoff (warm until failure), returns null.
+ * - config.maxIdleWarmMs positive: literal cutoff.
+ */
+export function resolveMaxIdleWarmMs(
+  config: WarmCacheConfig,
+  family: CacheFamily,
+  effectiveIntervalMs?: number,
+): number | null {
+  if (config.maxIdleWarmMs !== null) {
+    return config.maxIdleWarmMs === 0 ? null : config.maxIdleWarmMs;
+  }
+  let referenceMs: number;
+  switch (family) {
+    case "anthropic-long":
+    case "opencode-go-long-marker":
+      referenceMs = ANTHROPIC_LONG_TTL_MS;
+      break;
+    case "openai-explicit":
+      referenceMs = OPENAI_EXPLICIT_TTL_MS;
+      break;
+    case "openai-implicit":
+      referenceMs = OPENAI_IMPLICIT_TTL_MS;
+      break;
+    case "xai-best-effort":
+      referenceMs = effectiveIntervalMs ?? XAI_BEST_EFFORT_INTERVAL_MS;
+      break;
+    default:
+      referenceMs = ANTHROPIC_SHORT_TTL_MS;
+      break;
+  }
+  return Math.max(MIN_IDLE_CUTOFF_MS, 2 * referenceMs);
+}
+
 /** Backoff when warm is deferred because agent is busy or gate is full. */
 export const DEFER_BACKOFF_MS = 30_000;
 
@@ -449,12 +506,15 @@ export function classifyProbeOutcome(args: {
   if (args.cacheWrite > 0 && args.cacheRead === 0) return "payload-drift";
 
   const noReadNoWrite = args.cacheRead === 0 && args.cacheWrite === 0;
-  // xAI Responses currently reports cached reads but not a separate cache-write
-  // token count. After the configured retry budget, repeated no-read results
-  // become a re-anchor candidate instead of an endless replay loop.
+  // The best-effort no-write-reporting families (direct xAI and the OpenCode
+  // Go marker/plain families) may not report a separate cache-write token
+  // count. After the configured retry budget, repeated no-read results become
+  // a re-anchor candidate instead of an endless replay loop. The escalation
+  // branch stays BEFORE the transient branch so a budget-exhausted result is
+  // never mislabelled as a quiet retry.
   const maxFailures = Math.max(1, args.maxConsecutiveFailures ?? 3);
   if (
-    args.cacheFamily === "xai-best-effort" &&
+    isBestEffortNoWriteFamily(args.cacheFamily) &&
     noReadNoWrite &&
     args.consecutiveFailuresBefore + 1 >= maxFailures
   ) {
@@ -462,7 +522,7 @@ export function classifyProbeOutcome(args: {
   }
 
   const transientFamily =
-    args.cacheFamily === "openai-implicit" || args.cacheFamily === "xai-best-effort";
+    args.cacheFamily === "openai-implicit" || isBestEffortNoWriteFamily(args.cacheFamily);
   if (noReadNoWrite && transientFamily && args.consecutiveFailuresBefore === 0) {
     return "transient-miss";
   }

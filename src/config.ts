@@ -61,6 +61,21 @@ export function parseConfigArgs(args: string, base: WarmCacheConfig = DEFAULT_CO
       next.intervalMs = parseDurationMs(value);
       continue;
     }
+    if (key === "maxidle") {
+      // parseDurationMs("0") returns 1000ms (the 1s minimum). The literal 0 is
+      // a dedicated opt-out that restores warm-until-failure, so it is
+      // special-cased before delegating.
+      if (value.trim() === "0") next.maxIdleWarmMs = 0;
+      else next.maxIdleWarmMs = parseDurationMs(value);
+      continue;
+    }
+    if (key === "spend") {
+      // Negative/NaN spend tokens are silently ignored, matching the
+      // max=/mincached= pattern. spend=0 means unlimited.
+      const n = Number(value);
+      if (Number.isFinite(n) && n >= 0) next.warmSpendCeilingUsd = n;
+      continue;
+    }
     if (key === "max" || key === "maxconcurrent") {
       const n = Number(value);
       if (Number.isFinite(n) && n >= 1) next.maxConcurrentWarmSessions = Math.floor(n);

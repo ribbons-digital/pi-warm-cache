@@ -267,6 +267,16 @@ A provider error is reported as an error and does not increment `probeMisses`.
 | `opencode-go-short-marker` | `cache_control` ephemeral without ttl | about 4 minutes (best-effort) | `short` |
 | `opencode-go-plain` | no cache instrumentation | about 4 minutes (best-effort) | `short` |
 
+### Spend guardrails
+
+The idle warm cutoff applies to every family: the timer stops when the session has been idle since the last real turn for `max(30m, 2 x referenceMs)`, where `referenceMs` is the family TTL when one exists and the interval otherwise.
+`anthropic-long` and `opencode-go-long-marker` probe at 48m and 96m under a 120m cutoff; short families stop after 30m idle.
+`maxidle=0` restores warm-until-failure.
+
+The probe-spend ceiling is active by default only for `opencode-go` at $1.00 per provider per campaign, with a 250-probe fallback when model cost fields are zero or unusable.
+The `spend=` token extends the ceiling to any provider; `spend=0` disables it for every provider (an extension mirroring `maxidle=0`).
+A real turn resets the campaign ledger; both guards are scoped to timer fires only, so `/warm now` always bypasses them.
+
 The OpenCode Go families resolve from the captured payload, not from model metadata, and never render a numeric lifetime until an e2e evidence record exists.
 All four families start unverified and manual-only, so no Go route arms a timer today; the listed cadences describe what each family would do after promotion to verified.
 Their intervals are best-effort probe cadences, not provider TTL claims.
@@ -299,7 +309,7 @@ The extension does not stamp `cache_control.ttl = "1h"` onto real turns.
 /warm auto              # select the provider strategy automatically
 /warm log              # enable JSONL diagnostics
 /warm nolog            # disable JSONL diagnostics
-/warm interval=3.5m max=2
+/warm interval=3.5m max=2 maxidle=2h spend=2.5
 ```
 
 The extension can also be configured when Pi starts:
@@ -320,6 +330,8 @@ interface WarmCacheConfig {
   maxConcurrentWarmSessions: number; // default 3
   minCachedTokens: number;           // default 512
   maxConsecutiveFailures: number;    // default 3
+  maxIdleWarmMs: number | null;      // null = max(30m, 2 x referenceMs); 0 = no cutoff
+  warmSpendCeilingUsd: number | null;// null = $1.00 for opencode-go; 0 = unlimited
   showWidget: boolean;               // default true
   warmSuffix: string;                // reserved for route-specific policies
   maxOutputTokens: number;           // preferred output floor
@@ -347,6 +359,7 @@ interface WarmCacheConfig {
 14. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 15. **Foreign instrumentation on an OpenCode Go completions payload** - refuse replay when `cache_control` appears without `cacheControlFormat: "anthropic"` compat, because the route cannot legally carry it.
 16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family never probes (including `/warm now`) and stays unverified; the plain family carries the degraded retention hint in its reason.
+17. **Interleaved sessions and the shared spend ledger** - the probe-spend ledger is module-level and keyed per provider, so when one session on the same provider takes real turns while another session idles, the shared campaign counter never accumulates for the idle session. The idle cutoff still bounds the idle session's probes, and the per-instance soft block stops it once its own probes trip the ceiling. Revisit before Slice 8.
 
 ## Package layout
 

@@ -107,6 +107,18 @@ export interface WarmCacheConfig {
   minCachedTokens: number;
   /** Stop after this many consecutive probe failures. */
   maxConsecutiveFailures: number;
+  /**
+   * Idle warm cutoff in ms, measured from the last real turn.
+   * null = formula max(30m, 2 x referenceMs) for every family.
+   * 0 = no cutoff (warm until failure). Set with the `maxidle=` token.
+   */
+  maxIdleWarmMs: number | null;
+  /**
+   * Per-provider probe-spend ceiling in USD per campaign.
+   * null = $1.00 default, active only for opencode-go.
+   * 0 = unlimited. Set with the `spend=` token.
+   */
+  warmSpendCeilingUsd: number | null;
   /** Show the editor widget while waiting / after a probe hit. */
   showWidget: boolean;
   /** Append a tiny warm user turn instead of replaying the exact last prefix only. */
@@ -134,6 +146,8 @@ export const DEFAULT_CONFIG: WarmCacheConfig = {
   maxConcurrentWarmSessions: 3,
   minCachedTokens: 512,
   maxConsecutiveFailures: 3,
+  maxIdleWarmMs: null,
+  warmSpendCeilingUsd: null,
   showWidget: true,
   warmSuffix:
     "Reply with exactly the single word: OK. Do not think. Do not explain. Do nothing else.",
@@ -173,6 +187,11 @@ export interface CacheAnchor {
   pricingSource: "model" | "unknown";
   /** Wall clock of last real agent activity that refreshed the cache. */
   lastActivityAt: number;
+  /**
+   * Wall clock of the last real turn (capturePayload / noteAssistantUsage).
+   * Probe hits never refresh this clock; it is the idle-cutoff base.
+   */
+  lastRealTurnAt: number;
   /** Wall clock of the last successful warm-probe hit. */
   lastProbeAt: number | null;
   /** Estimated USD saved by warm-probe hits this session (vs cold input re-read). */

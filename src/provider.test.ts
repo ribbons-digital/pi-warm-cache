@@ -25,6 +25,7 @@ import {
   getModelCompat,
   hasStableResponsesCacheKey,
   hasXaiPromptCacheKey,
+  isBestEffortNoWriteFamily,
   isCodexPayload,
   isPayloadContinuation,
   minimumOutputTokensForPayload,
@@ -40,6 +41,7 @@ import {
   XAI_BEST_EFFORT_INTERVAL_MS,
   resolveCacheFamily,
   resolveCacheRetention,
+  resolveMaxIdleWarmMs,
   resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
@@ -52,8 +54,9 @@ import {
   formatSavingsSummary,
   resolveModelPricing,
 } from "./savings.ts";
+import { parseConfigArgs } from "./config.ts";
 import piWarmCache from "./index.ts";
-import { SessionWarmer } from "./warmer.ts";
+import { resetProbeSpendLedgerForTest, SessionWarmer } from "./warmer.ts";
 import {
   renderCapabilityNotice,
   renderFailureUi,
@@ -2858,6 +2861,629 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     hiddenCalls.filter((call) => call.kind === "status").length === 6,
     "the compact status line should remain available when only the widget is hidden",
   );
+}
+
+// 17) Slice 5 idle-cutoff math, maxidle=/spend= token parsing, and the
+// best-effort no-write family truth table (pure functions).
+{
+  // resolveMaxIdleWarmMs formula: max(30m, 2 x referenceMs), where referenceMs
+  // is the family TTL when one exists and the interval otherwise.
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "anthropic-long") === 120 * 60_000,
+    "anthropic-long (1h TTL) cutoff must be 120m",
+  );
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "opencode-go-long-marker") === 120 * 60_000,
+    "opencode-go long-marker (1h TTL) cutoff must be 120m",
+  );
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "anthropic-short") === 30 * 60_000,
+    "anthropic-short (5m TTL) cutoff must hit the 30m floor",
+  );
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "opencode-go-short-marker") === 30 * 60_000,
+    "opencode-go short-marker (5m TTL) cutoff must hit the 30m floor",
+  );
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "opencode-go-plain") === 30 * 60_000,
+    "opencode-go plain (5m TTL) cutoff must hit the 30m floor",
+  );
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "openai-explicit") === 60 * 60_000,
+    "openai-explicit (30m TTL) cutoff must be 60m",
+  );
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "openai-implicit") === 30 * 60_000,
+    "openai-implicit (8m TTL) cutoff must hit the 30m floor",
+  );
+  assert(
+    resolveMaxIdleWarmMs(DEFAULT_CONFIG, "xai-best-effort", 4 * 60_000) === 30 * 60_000,
+    "xai-best-effort (4m interval) cutoff must hit the 30m floor",
+  );
+  assert(
+    resolveMaxIdleWarmMs(
+      { ...DEFAULT_CONFIG, intervalMs: 20 * 60_000 },
+      "xai-best-effort",
+      20 * 60_000,
+    ) === 40 * 60_000,
+    "xai-best-effort cutoff must follow the effective interval (2 x 20m)",
+  );
+  // TTL families ignore interval overrides; only xai is interval-referenced.
+  assert(
+    resolveMaxIdleWarmMs({ ...DEFAULT_CONFIG, intervalMs: 60_000 }, "anthropic-long") ===
+      120 * 60_000,
+    "TTL families must ignore interval overrides",
+  );
+  // Literal config wins over the formula; 0 = no cutoff.
+  assert(
+    resolveMaxIdleWarmMs({ ...DEFAULT_CONFIG, maxIdleWarmMs: 45 * 60_000 }, "anthropic-short") ===
+      45 * 60_000,
+    "a positive maxIdleWarmMs must win over the formula",
+  );
+  assert(
+    resolveMaxIdleWarmMs({ ...DEFAULT_CONFIG, maxIdleWarmMs: 0 }, "anthropic-long") === null,
+    "maxidle=0 must restore warm-until-failure",
+  );
+
+  // maxidle= / spend= token parsing. The literal 0 is special-cased because
+  // parseDurationMs("0") returns 1000ms.
+  assert(
+    parseConfigArgs("maxidle=0").maxIdleWarmMs === 0,
+    "maxidle=0 must parse to the literal 0 opt-out",
+  );
+  assert(
+    parseConfigArgs("maxidle=2h").maxIdleWarmMs === 2 * 3_600_000,
+    "maxidle=2h must parse to milliseconds",
+  );
+  assert(
+    parseConfigArgs("maxidle=45m").maxIdleWarmMs === 45 * 60_000,
+    "maxidle=45m must parse to milliseconds",
+  );
+  assert(
+    parseConfigArgs("maxidle=nope").maxIdleWarmMs === null,
+    "an unparseable maxidle token must stay null (formula)",
+  );
+  assert(
+    parseConfigArgs("spend=2.5").warmSpendCeilingUsd === 2.5,
+    "spend=2.5 must parse to USD",
+  );
+  assert(
+    parseConfigArgs("spend=0").warmSpendCeilingUsd === 0,
+    "spend=0 must parse to the unlimited marker",
+  );
+  assert(
+    parseConfigArgs("spend=abc").warmSpendCeilingUsd === null,
+    "a non-numeric spend token must be silently ignored",
+  );
+  assert(
+    parseConfigArgs("spend=-1").warmSpendCeilingUsd === null,
+    "a negative spend token must be silently ignored",
+  );
+
+  // isBestEffortNoWriteFamily truth table.
+  assert(isBestEffortNoWriteFamily("xai-best-effort"), "xAI best-effort is a no-write family");
+  assert(
+    isBestEffortNoWriteFamily("opencode-go-long-marker"),
+    "Go long-marker is a no-write family",
+  );
+  assert(
+    isBestEffortNoWriteFamily("opencode-go-short-marker"),
+    "Go short-marker is a no-write family",
+  );
+  assert(isBestEffortNoWriteFamily("opencode-go-plain"), "Go plain is a no-write family");
+  assert(
+    !isBestEffortNoWriteFamily("opencode-go-retained"),
+    "the retained family never probes and is excluded structurally",
+  );
+  assert(!isBestEffortNoWriteFamily("anthropic-short"), "anthropic-short is not a no-write family");
+  assert(!isBestEffortNoWriteFamily("anthropic-long"), "anthropic-long is not a no-write family");
+  assert(!isBestEffortNoWriteFamily("openai-explicit"), "openai-explicit is not a no-write family");
+  assert(!isBestEffortNoWriteFamily("openai-implicit"), "openai-implicit is not a no-write family");
+  assert(!isBestEffortNoWriteFamily("unverified"), "unverified is not a no-write family");
+  assert(!isBestEffortNoWriteFamily("unsupported"), "unsupported is not a no-write family");
+}
+
+// 18) Timer-fire idle cutoff boundary: anthropic-long probes at 48m and 96m
+// under a 120m cutoff, a boundary probe at the cutoff does not fire, a short
+// family stops after 30m idle, and maxidle=0 restores warm-until-failure.
+// Fire-time guard simulated by manipulating anchor.lastRealTurnAt and calling
+// runWarm("timer") directly with a call-counting stub (test-15 pattern).
+{
+  const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-idle-cutoff-"));
+  const anthropicModel = {
+    id: "claude-sonnet-4-5",
+    provider: "anthropic",
+    api: "anthropic-messages",
+    baseUrl: "https://api.anthropic.com/v1",
+  } as any;
+  const longPayload = {
+    model: "claude-sonnet-4-5",
+    max_tokens: 16000,
+    system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }],
+    messages: [
+      {
+        role: "user",
+        content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } }],
+      },
+    ],
+  };
+  const shortPayload = {
+    model: "claude-sonnet-4-5",
+    max_tokens: 16000,
+    system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }],
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+  };
+  let calls = 0;
+  const completeStub = async (): Promise<any> => {
+    calls += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const ctx = {
+    cwd,
+    model: anthropicModel,
+    hasUI: false,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "idle-cutoff-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+    },
+  } as any;
+
+  // anthropic-long: probes at 48m and 96m, aborts at the 120m boundary.
+  const longWarmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  longWarmer.bindContext(ctx);
+  longWarmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, logToFile: true });
+  longWarmer.capturePayload(longPayload, ctx);
+  longWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const longAnchor = (longWarmer as any).anchor;
+  assert(
+    longAnchor.cacheFamily === "anthropic-long",
+    "the 1h-marker payload must classify anthropic-long",
+  );
+  assert(
+    resolveMaxIdleWarmMs(longWarmer.getConfig(), "anthropic-long") === 120 * 60_000,
+    "the anthropic-long cutoff must be 120m",
+  );
+
+  longAnchor.lastRealTurnAt = Date.now() - 48 * 60_000;
+  const at48m = await (longWarmer as any).runWarm("timer");
+  assert(at48m.ok && at48m.probeOutcome === "hit", "anthropic-long must still probe at 48m idle");
+  assert(Number(calls) === 1, "the 48m probe must be the only provider call so far");
+  (longWarmer as any).clearTimers();
+
+  longAnchor.lastRealTurnAt = Date.now() - 96 * 60_000;
+  const at96m = await (longWarmer as any).runWarm("timer");
+  assert(at96m.ok && at96m.probeOutcome === "hit", "anthropic-long must still probe at 96m idle");
+  assert(Number(calls) === 2, "the 96m probe must be the second provider call");
+  (longWarmer as any).clearTimers();
+
+  longAnchor.lastRealTurnAt = Date.now() - 120 * 60_000;
+  const at120m = await (longWarmer as any).runWarm("timer");
+  assert(
+    !at120m.ok && at120m.unavailable === true && at120m.probeOutcome === "unavailable",
+    "a timer probe at exactly the 120m cutoff must not fire",
+  );
+  assert(Number(calls) === 2, "the cutoff abort must never call the provider");
+  assert(
+    (longWarmer as any).nextDueAt === 0,
+    "the cutoff abort must clear timers (no re-arm loop)",
+  );
+  assert(
+    longWarmer.getStatusText().includes("nextDue=none"),
+    "the cutoff abort status must show no pending timer",
+  );
+  assert(
+    longWarmer.getStatusText().includes("probeFailStreak=0/3"),
+    "the cutoff abort must never count as a probe failure",
+  );
+  // /warm now bypasses the idle cutoff entirely.
+  const manualBypass = await longWarmer.warmNow(ctx);
+  assert(manualBypass.ok, "/warm now must bypass the idle cutoff");
+  assert(Number(calls) === 3, "the manual bypass must be the third provider call");
+  // The reschedule() arm path must also refuse to arm once idle is past the
+  // cutoff: agent_settled after the abort must not re-arm a timer.
+  longWarmer.onAgentSettled(ctx);
+  assert(
+    (longWarmer as any).nextDueAt === 0,
+    "reschedule must not arm a timer past the idle cutoff",
+  );
+  longWarmer.dispose();
+
+  // anthropic-short: fires at 20m, stops at the 30m floor; maxidle=0 restores
+  // warm-until-failure.
+  const shortWarmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  shortWarmer.bindContext(ctx);
+  shortWarmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10 });
+  shortWarmer.capturePayload(shortPayload, ctx);
+  shortWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const shortAnchor = (shortWarmer as any).anchor;
+  assert(shortAnchor.cacheFamily === "anthropic-short", "the short payload must classify anthropic-short");
+  assert(
+    resolveMaxIdleWarmMs(shortWarmer.getConfig(), "anthropic-short") === 30 * 60_000,
+    "the anthropic-short cutoff must be 30m",
+  );
+
+  shortAnchor.lastRealTurnAt = Date.now() - 20 * 60_000;
+  const at20m = await (shortWarmer as any).runWarm("timer");
+  assert(at20m.ok, "a short family must still probe at 20m idle");
+  (shortWarmer as any).clearTimers();
+
+  shortAnchor.lastRealTurnAt = Date.now() - 30 * 60_000;
+  const at30m = await (shortWarmer as any).runWarm("timer");
+  assert(
+    !at30m.ok && at30m.unavailable === true && at30m.probeOutcome === "unavailable",
+    "a short family must stop at the 30m idle cutoff",
+  );
+  assert(
+    shortWarmer.getStatusText().includes("probeFailStreak=0/3"),
+    "the short-family cutoff abort must not count as a probe failure",
+  );
+
+  shortWarmer.setConfig({ ...shortWarmer.getConfig(), maxIdleWarmMs: 0 });
+  shortAnchor.lastRealTurnAt = Date.now() - 5 * 3_600_000;
+  const unlimited = await (shortWarmer as any).runWarm("timer");
+  assert(unlimited.ok, "maxidle=0 must restore warm-until-failure after the cutoff");
+  shortWarmer.dispose();
+  rmSync(cwd, { recursive: true, force: true });
+}
+
+// 19) Per-provider probe-spend ceiling: dollar stop, spend=0 unlimited, the
+// 250-probe fallback for zero-cost pricing, and a real-turn reset that clears
+// the per-instance soft block.
+{
+  resetProbeSpendLedgerForTest();
+  const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-spend-ledger-"));
+  const model = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+  } as any;
+  let calls = 0;
+  const completeStub = async (): Promise<any> => {
+    calls += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const ctx = {
+    cwd,
+    model,
+    hasUI: false,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "spend-ledger-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const payload = {
+    model: model.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: "keep warm" }] }],
+    prompt_cache_key: "spend-test",
+  };
+
+  // Dollar ceiling: 1 cent. One probe costs 1 cent, so the second timer fire
+  // must soft-block without calling the provider.
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    warmSpendCeilingUsd: 0.01,
+  });
+  warmer.capturePayload(payload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+
+  const first = await (warmer as any).runWarm("timer");
+  assert(first.ok && first.probeOutcome === "hit", "the first timer probe must fire under the ceiling");
+  assert(Number(calls) === 1, "one probe must cost one cent against the 1-cent ceiling");
+
+  const blocked = await (warmer as any).runWarm("timer");
+  assert(
+    !blocked.ok && blocked.unavailable === true && blocked.probeOutcome === "unavailable",
+    "a timer probe over the spend ceiling must soft-block",
+  );
+  assert(Number(calls) === 1, "the soft-block must never call the provider");
+  assert(
+    warmer.getStatusText().includes("spendCeiling=probe spend ceiling reached"),
+    "status must expose the distinct spendCeiling field",
+  );
+  assert(
+    warmer.getStatusText().includes("lifecycle=anchored"),
+    "the spend soft-block must never set lifecycleState blocked",
+  );
+  // /warm now bypasses the ceiling, but the timer stays soft-blocked.
+  const manualBypass = await warmer.warmNow(ctx);
+  assert(manualBypass.ok, "/warm now must bypass the spend ceiling");
+  const stillBlocked = await (warmer as any).runWarm("timer");
+  assert(
+    !stillBlocked.ok && stillBlocked.unavailable === true,
+    "a timer probe must stay soft-blocked even after a manual bypass",
+  );
+  assert(
+    Number(calls) === 2,
+    "the manual bypass is the second call; the timer stays blocked",
+  );
+
+  // A real turn clears this instance's soft block and resets the campaign ledger.
+  warmer.capturePayload(payload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const resumed = await (warmer as any).runWarm("timer");
+  assert(resumed.ok, "a real turn must clear the soft block and reset the ledger");
+  assert(Number(calls) === 3, "the post-reset probe must be the third provider call");
+  warmer.dispose();
+
+  // spend=0 means unlimited: probes never trip the ceiling.
+  const unlimitedWarmer = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    completeStub as any,
+  );
+  unlimitedWarmer.bindContext(ctx);
+  unlimitedWarmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    warmSpendCeilingUsd: 0,
+  });
+  unlimitedWarmer.capturePayload(payload, ctx);
+  unlimitedWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const u1 = await (unlimitedWarmer as any).runWarm("timer");
+  const u2 = await (unlimitedWarmer as any).runWarm("timer");
+  assert(u1.ok && u2.ok, "spend=0 must keep the ceiling inactive for every provider");
+  assert(
+    unlimitedWarmer.getStatusText().includes("spendCeiling=ok"),
+    "an inactive ceiling must report spendCeiling=ok",
+  );
+  unlimitedWarmer.dispose();
+
+  // 250-probe fallback: a zero-cost provider never trips the dollar ceiling,
+  // so the probe-count ceiling stops the campaign instead.
+  resetProbeSpendLedgerForTest();
+  let zeroCostCalls = 0;
+  const zeroCostStub = async (): Promise<any> => {
+    zeroCostCalls += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0 },
+    };
+  };
+  const fallbackWarmer = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    zeroCostStub as any,
+  );
+  fallbackWarmer.bindContext(ctx);
+  fallbackWarmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    warmSpendCeilingUsd: 1.0,
+  });
+  fallbackWarmer.capturePayload(payload, ctx);
+  fallbackWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  for (let i = 0; i < 250; i++) {
+    const probe = await (fallbackWarmer as any).runWarm("timer");
+    assert(probe.ok, `probe ${i + 1} must fire under the 250-probe fallback`);
+  }
+  const fallbackBlocked = await (fallbackWarmer as any).runWarm("timer");
+  assert(
+    !fallbackBlocked.ok &&
+      fallbackBlocked.unavailable === true &&
+      String(fallbackBlocked.error).includes("probe count ceiling"),
+    "the 251st timer probe must trip the probe-count fallback",
+  );
+  assert(
+    Number(zeroCostCalls) === 250,
+    "the probe-count fallback must stop after exactly 250 provider calls",
+  );
+  fallbackWarmer.dispose();
+  resetProbeSpendLedgerForTest();
+  rmSync(cwd, { recursive: true, force: true });
+}
+
+// 20) OpenCode Go outcome classification joins the transient/no-write set, and
+// an awaiting-reanchor invalidation resets the failure budget without ever
+// counting as a warm-probe failure (regression pin).
+{
+  // Pure classification: Go marker/plain families retry quietly first, then
+  // escalate to payload-drift once the failure budget is exhausted. The
+  // retained family is excluded structurally.
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "opencode-go-short-marker",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 0,
+      maxConsecutiveFailures: 3,
+    }) === "transient-miss",
+    "first Go short-marker no-read/no-write must retry quietly",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "opencode-go-long-marker",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 0,
+      maxConsecutiveFailures: 3,
+    }) === "transient-miss",
+    "first Go long-marker no-read/no-write must retry quietly",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "opencode-go-plain",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 1,
+      maxConsecutiveFailures: 3,
+    }) === "miss",
+    "a repeated Go no-read/no-write must stay retryable mid-budget",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "opencode-go-plain",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 2,
+      maxConsecutiveFailures: 3,
+    }) === "payload-drift",
+    "a budget-exhausted Go plain result must request a re-anchor",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "opencode-go-long-marker",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 2,
+      maxConsecutiveFailures: 3,
+    }) === "payload-drift",
+    "a budget-exhausted Go long-marker result must request a re-anchor",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "opencode-go-retained",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 0,
+      maxConsecutiveFailures: 3,
+    }) === "miss",
+    "the retained family must never join the transient set",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "opencode-go-short-marker",
+      cacheRead: 0,
+      cacheWrite: 100,
+      consecutiveFailuresBefore: 0,
+    }) === "payload-drift",
+    "write-without-read must stay a drift candidate for Go families",
+  );
+  // The xAI truth table stays byte-identical.
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "xai-best-effort",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 0,
+      maxConsecutiveFailures: 3,
+    }) === "transient-miss",
+    "first xAI no-read/no-write must retry quietly",
+  );
+  assert(
+    classifyProbeOutcome({
+      cacheFamily: "xai-best-effort",
+      cacheRead: 0,
+      cacheWrite: 0,
+      consecutiveFailuresBefore: 2,
+      maxConsecutiveFailures: 3,
+    }) === "payload-drift",
+    "budget-exhausted xAI must still request a re-anchor",
+  );
+
+  // Regression pin: a compaction invalidation resets the failure budget, and
+  // the awaiting-reanchor window is never counted as a warm-probe failure, so
+  // stale misses do not carry into the post-re-anchor session.
+  const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-reanchor-budget-"));
+  const model = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+  } as any;
+  const responses: Array<unknown> = [
+    {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+    },
+    {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+    },
+  ];
+  const completeStub = async (): Promise<any> => responses.shift();
+  const ctx = {
+    cwd,
+    model,
+    hasUI: false,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "reanchor-budget-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const oldPayload = {
+    model: model.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: "old prefix" }] }],
+    prompt_cache_key: "budget-old",
+  };
+  const newPayload = {
+    model: model.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: "new prefix" }] }],
+    prompt_cache_key: "budget-new",
+  };
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
+  warmer.capturePayload(oldPayload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const staleMiss = await warmer.warmNow(ctx);
+  assert(
+    staleMiss.probeOutcome === "transient-miss",
+    "the stale probe must be an ordinary miss, not a failure",
+  );
+  assert(
+    warmer.getStatusText().includes("probeFailStreak=1/3"),
+    "the stale miss must count against the failure budget",
+  );
+  warmer.invalidateAnchor(ctx, "compacted · waiting for next turn");
+  assert(
+    warmer.getLifecycleState() === "awaiting-reanchor",
+    "compaction must enter awaiting-reanchor",
+  );
+  const waiting = await warmer.warmNow(ctx);
+  assert(waiting.unavailable === true, "the awaiting-reanchor window must not probe");
+  warmer.capturePayload(newPayload, ctx);
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  assert(
+    warmer.getLifecycleState() === "anchored",
+    "the fresh capture must finish the re-anchor",
+  );
+  assert(
+    warmer.getStatusText().includes("probeFailStreak=0/3"),
+    "a re-anchor must reset the failure budget so stale misses do not carry",
+  );
+  const postReanchorHit = await warmer.warmNow(ctx);
+  assert(
+    postReanchorHit.probeOutcome === "hit",
+    "the post-re-anchor session must probe cleanly with a reset budget",
+  );
+  assert(
+    warmer.getStatusText().includes("probeFailStreak=0/3"),
+    "the post-re-anchor hit must keep the failure budget reset",
+  );
+  warmer.dispose();
+  rmSync(cwd, { recursive: true, force: true });
 }
 
 console.log("provider.test.ts: all assertions passed");
