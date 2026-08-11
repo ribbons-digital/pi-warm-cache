@@ -8,7 +8,8 @@
 
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
@@ -440,6 +441,14 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     resolveProviderCapability(openRouterWrongEndpoint).state === "unsupported",
     "OpenRouter routes with a different endpoint must fail closed",
   );
+  const openRouterWrongPath = {
+    ...openRouterXai,
+    baseUrl: "https://openrouter.ai/api/v2",
+  } as any;
+  assert(
+    resolveProviderCapability(openRouterWrongPath).state === "unsupported",
+    "OpenRouter routes on an unregistered path must fail closed (exact-path matching)",
+  );
   const openRouterWrongRouting = {
     ...openRouterXai,
     compat: { sessionAffinityFormat: "openai" },
@@ -464,45 +473,173 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "OpenRouter routes with missing metadata must not enable manualProbe",
   );
 
-  const openCodeGrok = {
-    id: "grok-4.5",
-    provider: "opencode-go",
-    api: "openai-responses",
-    baseUrl: "https://opencode.ai/zen/go/v1",
-    compat: { sessionAffinityFormat: "openai" },
-  } as any;
-  const openCodeCapability = resolveProviderCapability(openCodeGrok);
-  assert(openCodeCapability.state === "unverified", "OpenCode Go should use the manual-only tier");
-  assert(!openCodeCapability.automaticWarm, "OpenCode Go manual-only routes must never auto-warm");
-  assert(openCodeCapability.manualProbe, "registered OpenCode Go routes should permit manual probes");
-  assert(canManualProbe(openCodeGrok, xaiPayload), "safe OpenCode Go payload should permit a manual probe");
-  const openCodeStrategy = resolveStrategy(openCodeGrok, DEFAULT_CONFIG, xaiPayload);
-  assert(openCodeStrategy.family === "unverified", "OpenCode Go must not inherit an OpenAI family");
-  assert(openCodeStrategy.intervalMs === null, "manual-only OpenCode Go route must not receive a timer");
+  // OpenCode Go: per-api proxy route registry with exact baseUrl paths.
+  {
+    // Drive the gate from the live pi-ai registry so catalog churn stays
+    // visible: 3 anthropic-messages, 12 openai-completions, 1 openai-responses.
+    const registryPath = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "node_modules",
+      "@earendil-works",
+      "pi-ai",
+      "dist",
+      "providers",
+      "data",
+      "opencode-go.json",
+    );
+    const registry = JSON.parse(readFileSync(registryPath, "utf8")) as Record<
+      string,
+      Record<string, any>
+    >;
+    const goModels: any[] = [];
+    for (const [api, modelsById] of Object.entries(registry)) {
+      for (const model of Object.values(modelsById)) {
+        goModels.push({ ...model, api });
+      }
+    }
+    assert(
+      goModels.length === 16,
+      `expected 16 OpenCode Go registry models, got ${goModels.length}`,
+    );
+    const goApiCounts: Record<string, number> = {};
+    for (const model of goModels) {
+      goApiCounts[model.api] = (goApiCounts[model.api] ?? 0) + 1;
+      const capability = resolveProviderCapability(model);
+      assert(
+        capability.state === "unverified",
+        `opencode-go ${model.api}/${model.id} should use the manual-only tier, got ${capability.state}`,
+      );
+      assert(!capability.automaticWarm, `opencode-go ${model.id} must never auto-warm`);
+      assert(capability.manualProbe, `opencode-go ${model.id} should permit manual probes`);
+      assert(
+        capability.reason.includes("manual-only") &&
+          capability.reason.includes("savings are n/a"),
+        `opencode-go ${model.id} reason must explain the safety and savings limits`,
+      );
+      const expectedPath = model.api === "anthropic-messages" ? "/zen/go" : "/zen/go/v1";
+      assert(
+        model.baseUrl === `https://opencode.ai${expectedPath}`,
+        `opencode-go ${model.id} should register the exact ${expectedPath} baseUrl`,
+      );
+    }
+    assert(goApiCounts["anthropic-messages"] === 3, "expected 3 anthropic-messages models");
+    assert(goApiCounts["openai-completions"] === 12, "expected 12 openai-completions models");
+    assert(goApiCounts["openai-responses"] === 1, "expected 1 openai-responses model");
 
-  const openCodeWrongRouting = {
-    ...openCodeGrok,
-    compat: { sessionAffinityFormat: "openrouter" },
-  } as any;
-  assert(
-    resolveProviderCapability(openCodeWrongRouting).state === "unsupported",
-    "OpenCode Go routes with OpenRouter routing metadata must fail closed",
-  );
+    // The single responses model carries the registered routing metadata and
+    // resolves through its exact path; the anthropic-messages models need no
+    // compat at all.
+    const goGrok = {
+      id: "grok-4.5",
+      provider: "opencode-go",
+      api: "openai-responses",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+      compat: { sessionAffinityFormat: "openai-nosession" },
+    } as any;
+    assert(
+      resolveProviderCapability(goGrok).state === "unverified",
+      "the responses model must resolve through its registered path",
+    );
+    const goGrokTrailingSlash = { ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/" } as any;
+    assert(
+      resolveProviderCapability(goGrokTrailingSlash).state === "unverified",
+      "a trailing slash must normalize to the registered path",
+    );
+    const goGrokExtraPath = { ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/extra" } as any;
+    assert(
+      resolveProviderCapability(goGrokExtraPath).state === "unsupported",
+      "a longer path must not match via prefix semantics",
+    );
 
-  const openCodeMissingMetadata = {
-    id: "grok-4.5",
-    provider: "opencode-go",
-    api: "openai-responses",
-    baseUrl: "https://opencode.ai/zen/go/v1",
-  } as any;
-  assert(
-    resolveProviderCapability(openCodeMissingMetadata).state === "unsupported",
-    "OpenCode Go routes with missing session-affinity metadata must fail closed",
-  );
-  assert(
-    !resolveProviderCapability(openCodeMissingMetadata).manualProbe,
-    "OpenCode Go routes with missing metadata must not enable manualProbe",
-  );
+    // Wrong-path fixtures: each (provider, api) pair has exactly one path.
+    // /zen/go is a prefix of /zen/go/v1 and must not match the wrong transport.
+    const goAnthropicOnCompletionsPath = {
+      id: "minimax-m3",
+      provider: "opencode-go",
+      api: "anthropic-messages",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    } as any;
+    assert(
+      resolveProviderCapability(goAnthropicOnCompletionsPath).state === "unsupported",
+      "an anthropic model on the completions path must fail closed",
+    );
+    const goCompletionsOnAnthropicPath = {
+      id: "deepseek-v4-flash",
+      provider: "opencode-go",
+      api: "openai-completions",
+      baseUrl: "https://opencode.ai/zen/go",
+    } as any;
+    assert(
+      resolveProviderCapability(goCompletionsOnAnthropicPath).state === "unsupported",
+      "a completions model on the anthropic path must fail closed",
+    );
+
+    // Wrong-api fixture: an unregistered OpenCode Go transport fails closed.
+    const goWrongApi = {
+      id: "grok-4.5",
+      provider: "opencode-go",
+      api: "openai-codex-responses",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    } as any;
+    assert(
+      resolveProviderCapability(goWrongApi).state === "unsupported",
+      "an unregistered OpenCode Go API must fail closed",
+    );
+    assert(
+      resolveProviderCapability(goWrongApi).reason.includes("not registered"),
+      "an unregistered OpenCode Go API must name the missing registration",
+    );
+
+    // Regression: a provider match always returns a decision. An OpenCode Go
+    // anthropic model copying first-party metadata must never reach the
+    // first-party verified branch.
+    const goAnthropicCompat = {
+      id: "qwen3.7-max",
+      provider: "opencode-go",
+      api: "anthropic-messages",
+      baseUrl: "https://opencode.ai/zen/go",
+      compat: { cacheControlFormat: "anthropic" },
+    } as any;
+    const goAnthropicCompatCapability = resolveProviderCapability(goAnthropicCompat);
+    assert(
+      goAnthropicCompatCapability.state === "unverified",
+      "opencode-go anthropic models must not reach first-party verified via cacheControlFormat",
+    );
+    assert(
+      !goAnthropicCompatCapability.automaticWarm,
+      "the fall-through regression route must never auto-warm",
+    );
+    assert(
+      resolveStrategy(goAnthropicCompat, DEFAULT_CONFIG).family === "unverified",
+      "the fall-through regression route must not receive a verified family",
+    );
+
+    // A registered OpenCode Go route without any compat still resolves; the
+    // anthropic-messages transport does not require routing metadata.
+    const goAnthropicNoCompat = {
+      id: "qwen3.7-plus",
+      provider: "opencode-go",
+      api: "anthropic-messages",
+      baseUrl: "https://opencode.ai/zen/go",
+    } as any;
+    assert(
+      resolveProviderCapability(goAnthropicNoCompat).state === "unverified",
+      "anthropic-messages models need no compat routing metadata to resolve",
+    );
+    const goAnthropicPayload = {
+      model: "qwen3.7-plus",
+      system: [{ type: "text", text: "sys" }],
+      messages: [{ role: "user", content: "hi" }],
+    };
+    assert(
+      canManualProbe(goAnthropicNoCompat, goAnthropicPayload),
+      "a safe anthropic payload should permit a manual probe on the Go anthropic route",
+    );
+    const goStrategy = resolveStrategy(goAnthropicNoCompat, DEFAULT_CONFIG);
+    assert(goStrategy.family === "unverified", "OpenCode Go must not inherit an Anthropic family");
+    assert(goStrategy.intervalMs === null, "manual-only OpenCode Go route must not receive a timer");
+  }
 
   const unknownResponses = {
     id: "gpt-compatible",

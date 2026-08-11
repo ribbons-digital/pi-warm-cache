@@ -13,35 +13,129 @@ const ANTHROPIC_FIRST_PARTY_HOSTS = new Set(["api.anthropic.com"]);
 const OPENAI_FIRST_PARTY_HOSTS = new Set(["api.openai.com"]);
 const XAI_FIRST_PARTY_HOSTS = new Set(["api.x.ai"]);
 
-type ManualOnlyRouteRegistration = {
+/** Payload shapes a registered proxy transport can legally carry. */
+type PayloadEligibilityRule = "messages" | "input" | "messages-and-system";
+
+/** Per-family verification state for one proxy route transport. */
+type ProxyRouteFamilyState = {
+  /**
+   * All families start unverified. Promotion is a data change that flips this
+   * entry to "verified" and cites an e2e evidence record.
+   */
+  state: "unverified" | "verified";
+  /** e2e evidence record (pi-ai version, model, real baseUrl). Null until promoted. */
+  evidence: string | null;
+};
+
+function unverifiedFamily(): ProxyRouteFamilyState {
+  return { state: "unverified", evidence: null };
+}
+
+/**
+ * One registered manual-only proxy route, keyed on (provider, api).
+ *
+ * The per-api eligibility gate is the registration itself: the API transport
+ * must be registered for the provider and the baseUrl must match the exact
+ * registered path. OpenRouter additionally keeps its compat routing-format
+ * gate (`sessionAffinityFormat: "openrouter"`); OpenCode Go routes are gated
+ * by the per-api registration and exact baseUrl path instead of any compat
+ * field, because `sessionAffinityFormat` is emitted only by the OpenAI
+ * Responses adapter and pi-ai never sets it on the completions or
+ * anthropic-messages transports.
+ *
+ * BaseUrl matching is exact-path equality after trailing-slash normalization.
+ * `/zen/go` is a prefix of `/zen/go/v1` and must never match it.
+ *
+ * This list is not an OpenAI/Anthropic compatibility fallback.
+ */
+type ProxyRouteRegistration = {
   provider: string;
   label: string;
-  apis: ReadonlySet<string>;
-  hosts: ReadonlySet<string>;
-  sessionAffinityFormats: ReadonlySet<NonNullable<RouteCompat["sessionAffinityFormat"]>>;
+  api: string;
+  host: string;
+  /** Exact path after trailing-slash normalization, e.g. "/zen/go/v1". */
+  baseUrlPath: string;
+  /**
+   * The payload shapes this transport can legally carry. `isSafeReplayPayload`
+   * enforces the same shapes on a captured payload before a manual probe.
+   */
+  payloadEligibility: PayloadEligibilityRule;
+  /** Optional compat routing-format gate; OpenRouter requires "openrouter". */
+  sessionAffinityFormat?: NonNullable<RouteCompat["sessionAffinityFormat"]>;
+  /** Per-family verification state for this transport. */
+  families: Readonly<Record<string, ProxyRouteFamilyState>>;
 };
 
 /**
- * Routes in this list are deliberately manual-only.
+ * Routes in this table are deliberately manual-only.
  *
- * Provider identity, API transport, first-party proxy endpoint, and the
- * adapter's routing format must all match before a captured payload can be
- * probed. This list is not an OpenAI/Anthropic compatibility fallback.
+ * Provider identity, API transport, exact proxy endpoint path, and (where the
+ * entry declares one) the adapter's routing format must all match before a
+ * captured payload can be probed.
  */
-const MANUAL_ONLY_PROXY_ROUTES: readonly ManualOnlyRouteRegistration[] = [
+const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
+  // OpenRouter: both OpenAI transports at /api/v1 with the routing-format gate
+  // unchanged from the previous registration. No per-family verification state
+  // applies; the family registry below belongs to OpenCode Go transports.
   {
     provider: "openrouter",
     label: "OpenRouter",
-    apis: new Set(["openai-responses", "openai-completions"]),
-    hosts: new Set(["openrouter.ai"]),
-    sessionAffinityFormats: new Set(["openrouter"]),
+    api: "openai-responses",
+    host: "openrouter.ai",
+    baseUrlPath: "/api/v1",
+    payloadEligibility: "input",
+    sessionAffinityFormat: "openrouter",
+    families: {},
+  },
+  {
+    provider: "openrouter",
+    label: "OpenRouter",
+    api: "openai-completions",
+    host: "openrouter.ai",
+    baseUrlPath: "/api/v1",
+    payloadEligibility: "messages",
+    sessionAffinityFormat: "openrouter",
+    families: {},
+  },
+  // OpenCode Go: three API shapes with distinct exact baseUrl paths. The
+  // anthropic-messages transport lives at /zen/go; both OpenAI transports
+  // live at /zen/go/v1.
+  {
+    provider: "opencode-go",
+    label: "OpenCode Go",
+    api: "anthropic-messages",
+    host: "opencode.ai",
+    baseUrlPath: "/zen/go",
+    payloadEligibility: "messages-and-system",
+    families: {
+      "short-marker": unverifiedFamily(),
+      "long-marker": unverifiedFamily(),
+      "plain-fallback": unverifiedFamily(),
+    },
   },
   {
     provider: "opencode-go",
     label: "OpenCode Go",
-    apis: new Set(["openai-responses", "openai-completions"]),
-    hosts: new Set(["opencode.ai"]),
-    sessionAffinityFormats: new Set(["openai", "openai-nosession"]),
+    api: "openai-completions",
+    host: "opencode.ai",
+    baseUrlPath: "/zen/go/v1",
+    payloadEligibility: "messages",
+    families: {
+      plain: unverifiedFamily(),
+      retained: unverifiedFamily(),
+    },
+  },
+  {
+    provider: "opencode-go",
+    label: "OpenCode Go",
+    api: "openai-responses",
+    host: "opencode.ai",
+    baseUrlPath: "/zen/go/v1",
+    payloadEligibility: "input",
+    families: {
+      plain: unverifiedFamily(),
+      retained: unverifiedFamily(),
+    },
   },
 ];
 
@@ -81,49 +175,91 @@ function routeLabel(model: Model<any>): string {
   return `${model.provider || "unknown"}/${model.api || "unknown"}`;
 }
 
-function resolveManualOnlyProxyCapability(model: Model<any>): ProviderCapability | null {
-  const registration = MANUAL_ONLY_PROXY_ROUTES.find(
+/**
+ * Exact-path baseUrl equality for a registered proxy route.
+ *
+ * The scheme must be https and the hostname must match the registered host.
+ * The path must equal the registered path after trailing-slash
+ * normalization: `/zen/go` is a prefix of `/zen/go/v1` and never matches it.
+ */
+function hasExactProxyBaseUrl(
+  model: Model<any>,
+  registration: ProxyRouteRegistration,
+): boolean {
+  if (!model.baseUrl) return false;
+  try {
+    const url = new URL(model.baseUrl);
+    if (url.protocol !== "https:") return false;
+    if (url.hostname.toLowerCase() !== registration.host) return false;
+    let path = url.pathname;
+    if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+    return path === registration.baseUrlPath;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve a registered manual-only proxy route.
+ *
+ * A provider match always returns a decision, never null: a registered proxy
+ * provider can never fall through to a first-party verified branch, even when
+ * its compat copies first-party metadata (for example `cacheControlFormat:
+ * "anthropic"`).
+ *
+ * `payload` is threaded for the payload-dependent gates later slices add; in
+ * this slice proxy resolution does not depend on it.
+ */
+function resolveProxyRouteCapability(
+  model: Model<any>,
+  payload?: unknown,
+): ProviderCapability | null {
+  const registrations = PROXY_ROUTE_REGISTRY.filter(
     (route) => route.provider === model.provider,
   );
-  if (!registration) return null;
+  if (registrations.length === 0) return null;
+  const label = registrations[0]!.label;
 
-  if (!registration.apis.has(model.api)) {
+  const registration = registrations.find((route) => route.api === model.api);
+  if (!registration) {
     return capability(
       "unsupported",
-      `${registration.label} route API ${model.api || "unknown"} is not registered for manual-only probing; automatic and manual warming are disabled`,
+      `${label} route API ${model.api || "unknown"} is not registered for manual-only probing; automatic and manual warming are disabled`,
     );
   }
 
   if (!model.baseUrl) {
     return capability(
       "unsupported",
-      `${registration.label} manual-only route requires an explicit baseUrl on ${[...registration.hosts][0]}; automatic and manual warming are disabled without the registered proxy endpoint`,
+      `${label} manual-only route requires an explicit baseUrl on ${registration.host}; automatic and manual warming are disabled without the registered proxy endpoint`,
     );
   }
-  if (!hasFirstPartyBaseUrl(model, new Set(registration.hosts))) {
+  if (!hasExactProxyBaseUrl(model, registration)) {
     return capability(
       "unsupported",
-      `${registration.label} manual-only route baseUrl is not the registered ${[...registration.hosts][0]} endpoint; automatic and manual warming are disabled for this route`,
+      `${label} manual-only route baseUrl is not the registered ${registration.host}${registration.baseUrlPath} endpoint; automatic and manual warming are disabled for this route`,
     );
   }
 
   const sessionAffinityFormat = getCompat(model)?.sessionAffinityFormat;
-  if (sessionAffinityFormat === undefined) {
-    return capability(
-      "unsupported",
-      `${registration.label} manual-only route requires cache-routing metadata; automatic and manual warming are disabled without a registered sessionAffinityFormat`,
-    );
-  }
-  if (!registration.sessionAffinityFormats.has(sessionAffinityFormat)) {
-    return capability(
-      "unsupported",
-      `${registration.label} manual-only route has unsupported cache-routing metadata; automatic and manual warming are disabled for this route`,
-    );
+  if (registration.sessionAffinityFormat !== undefined) {
+    if (sessionAffinityFormat === undefined) {
+      return capability(
+        "unsupported",
+        `${label} manual-only route requires cache-routing metadata; automatic and manual warming are disabled without a registered sessionAffinityFormat`,
+      );
+    }
+    if (sessionAffinityFormat !== registration.sessionAffinityFormat) {
+      return capability(
+        "unsupported",
+        `${label} manual-only route has unsupported cache-routing metadata; automatic and manual warming are disabled for this route`,
+      );
+    }
   }
 
   return capability(
     "unverified",
-    `${registration.label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)`,
+    `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)`,
     true,
   );
 }
@@ -233,8 +369,8 @@ export function resolveProviderCapability(
   // Selected proxy routes have their own explicit manual-only registration.
   // Resolve them before generic Anthropic/OpenAI compatibility checks so a
   // proxy cannot become verified merely by copying first-party metadata.
-  const manualOnlyProxy = resolveManualOnlyProxyCapability(model);
-  if (manualOnlyProxy) return manualOnlyProxy;
+  const proxyRoute = resolveProxyRouteCapability(model, payload);
+  if (proxyRoute) return proxyRoute;
 
   // Anthropic-compatible routes are verified only when the route metadata says
   // that Anthropic cache markers are emitted, or when the provider is first-party.
