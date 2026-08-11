@@ -65,26 +65,37 @@ export function estimateSavedUsd(
   return (cacheReadTokens / 1_000_000) * delta;
 }
 
+export type SavingsLabelInput = Pick<
+  CacheAnchor,
+  "estimatedSavingsUsd" | "savingsKnown" | "pricingSource"
+> &
+  Partial<Pick<CacheAnchor, "capability">> &
+  Partial<Pick<CacheAnchor, "provider">>;
+
 /**
  * Full phrase for widget/status.
  * Known: "est. $0.23 saved"
  * Unknown: "savings n/a (no model pricing)"
+ *
+ * The subscription budget-dollars marker keys on the billing identity
+ * (anchor.provider === "opencode-go"), never on payload instrumentation. It
+ * appends only on the dollar-rendering branches; the n/a branches never get
+ * the phrase.
  */
-export function formatSavingsLabel(
-  anchor: Pick<CacheAnchor, "estimatedSavingsUsd" | "savingsKnown" | "pricingSource"> &
-    Partial<Pick<CacheAnchor, "capability">>,
-): string {
+export function formatSavingsLabel(anchor: SavingsLabelInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
   if (!anchor.savingsKnown) return "n/a (no model pricing)";
+  const budgetDollars = anchor.provider === "opencode-go";
+  const suffix = budgetDollars ? " (subscription budget-dollars)" : "";
   const n = anchor.estimatedSavingsUsd;
   // Large probe output can make net negative even on a cache hit.
   if (n < 0) {
     const loss = Math.abs(n) < 0.01 ? Math.abs(n).toFixed(4) : Math.abs(n).toFixed(2);
-    return `est. net cost $${loss} (warm output expensive)`;
+    return `est. net cost $${loss} (warm output expensive)${suffix}`;
   }
   const amount = n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
-  return `est. ${amount} saved`;
+  return `est. ${amount} saved${suffix}`;
 }
 
 export type SavingsSummaryInput = Pick<
@@ -96,11 +107,16 @@ export type SavingsSummaryInput = Pick<
   | "savingsKnown"
   | "pricingSource"
 > &
-  Partial<Pick<CacheAnchor, "capability">>;
+  Partial<Pick<CacheAnchor, "capability">> &
+  Partial<Pick<CacheAnchor, "provider">>;
 
 /**
  * Stable cumulative savings text for the /warm status and command output.
  * Monetary values stay n/a when the active model has no usable pricing.
+ *
+ * The savingsUnit=budget-dollars marker is emitted as the last field ONLY
+ * for opencode-go (billing identity); every other route stays byte-identical
+ * and a missing provider emits no marker.
  */
 export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
@@ -110,14 +126,16 @@ export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
     anchor.savingsKnown ? formatUsd(value) : "n/a";
   const net = anchor.totalEstimatedSavedUsd - anchor.totalProbeCostUsd;
 
-  return [
+  const fields = [
     `probeHits=${anchor.probeHitCount}`,
     `probeMisses=${anchor.probeMissCount}`,
     `totalEstimatedSaved=${amount(anchor.totalEstimatedSavedUsd)}`,
     `totalProbeCost=${amount(anchor.totalProbeCostUsd)}`,
     `net=${anchor.savingsKnown ? formatUsd(net) : "n/a"}`,
     `pricingSource=${anchor.pricingSource}`,
-  ].join(" ");
+  ];
+  if (anchor.provider === "opencode-go") fields.push("savingsUnit=budget-dollars");
+  return fields.join(" ");
 }
 
 function formatUsd(value: number): string {

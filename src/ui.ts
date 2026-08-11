@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { formatDurationShort } from "./config.ts";
+import { bestEffortFamilyLabel } from "./provider.ts";
 import { formatSavingsLabel } from "./savings.ts";
 import type {
   CacheAnchor,
@@ -104,8 +105,8 @@ export function renderWaitingUi(
   const waitLabel = formatDurationShort(remainingMs || plan.intervalMs || 0);
   const tokens = formatStatusTokens(anchor.cachedTokens || anchor.promptTokens);
   const ratio = formatProbeRatio(anchor);
-  const bestEffort = plan.family === "xai-best-effort";
-  const savings = formatSessionSavings(anchor, bestEffort);
+  const label = bestEffortFamilyLabel(plan.family);
+  const savings = formatSessionSavings(anchor, label);
   const waitDetail = deferral
     ? deferral.reason === "concurrency limit"
       ? `deferred - ${deferral.activeWarmSessions}/${deferral.maxConcurrentWarmSessions} slots used`
@@ -116,14 +117,14 @@ export function renderWaitingUi(
   const lines = [
     ctx.ui.theme.fg(
       "accent",
-      bestEffort
-        ? `⚡ xAI best-effort cache-warm wait · extension probe in ${waitLabel}`
+      label
+        ? `⚡ ${label} cache-warm wait · extension probe in ${waitLabel}`
         : `⚡ Cache-warm wait · extension probe in ${waitLabel}`,
     ),
     ctx.ui.theme.fg(
       "dim",
-      bestEffort
-        ? `xAI best-effort cadence · ~${tokens} prefix`
+      label
+        ? `${label} cadence · ~${tokens} prefix`
         : `Inside ${plan.ttlLabel} · ~${tokens} prefix`,
     ),
     ctx.ui.theme.fg("warning", waitDetail),
@@ -138,7 +139,7 @@ export function renderWaitingUi(
     STATUS_ID,
     ctx.ui.theme.fg(
       "dim",
-      `${bestEffort ? "xAI best-effort " : ""}warm ${waitLabel} · ${
+      `${label ? `${label} ` : ""}warm ${waitLabel} · ${
         deferral ? `deferred · ${formatDeferralStatus(deferral)}` : ratio
       } · ~${formatStatusTokens(anchor.cachedTokens || anchor.promptTokens)}`,
     ),
@@ -163,17 +164,20 @@ export function renderWarmHitUi(
 
   const tokens = formatStatusTokens(cacheRead || anchor.cachedTokens);
   const ratio = formatProbeRatio(anchor);
-  const bestEffort = plan.family === "xai-best-effort";
-  const nextLabel = bestEffort
-    ? `Next extension probe in ${plan.waitLabel ?? "n/a"} · no fixed xAI cache lifetime promised.`
-    : `Next extension probe in ${plan.waitLabel ?? "n/a"} · ${plan.ttlLabel}`;
+  const label = bestEffortFamilyLabel(plan.family);
+  const nextLabel =
+    label === "xAI best-effort"
+      ? `Next extension probe in ${plan.waitLabel ?? "n/a"} · no fixed xAI cache lifetime promised.`
+      : label !== null
+        ? `Next extension probe in ${plan.waitLabel ?? "n/a"} · no fixed cache lifetime promised.`
+        : `Next extension probe in ${plan.waitLabel ?? "n/a"} · ${plan.ttlLabel}`;
   const lines = [
     ctx.ui.theme.fg(
       "success",
-      `⚡ ${bestEffort ? "xAI best-effort cache warm" : "Cache warm"} · extension probe hit · ~${tokens}`,
+      `⚡ ${label ? `${label} cache warm` : "Cache warm"} · extension probe hit · ~${tokens}`,
     ),
     ctx.ui.theme.fg("dim", nextLabel),
-    ctx.ui.theme.fg("warning", `${formatSessionSavings(anchor, bestEffort)} · extension probes ${ratio}`),
+    ctx.ui.theme.fg("warning", `${formatSessionSavings(anchor, label)} · extension probes ${ratio}`),
   ];
 
   if (config.showWidget) {
@@ -185,7 +189,7 @@ export function renderWarmHitUi(
     STATUS_ID,
     ctx.ui.theme.fg(
       "success",
-      `${bestEffort ? "xAI best-effort " : ""}warm ${plan.waitLabel ?? "n/a"} · ${ratio} · ~${formatStatusTokens(cacheRead || anchor.cachedTokens)}`,
+      `${label ? `${label} ` : ""}warm ${plan.waitLabel ?? "n/a"} · ${ratio} · ~${formatStatusTokens(cacheRead || anchor.cachedTokens)}`,
     ),
   );
 }
@@ -193,17 +197,21 @@ export function renderWarmHitUi(
 /**
  * Neutral idle/info state (not an error).
  * Used for waiting-for-first-turn, disabled, unsupported, prefix-too-small.
+ *
+ * label is the best-effort family label ("xAI best-effort", "OpenCode Go
+ * best-effort", or null). The isXaiText sniff applies only when label is
+ * null: an explicit non-xai label always wins over "xai" in detail text.
  */
 export function renderIdleUi(
   ctx: ExtensionContext,
   config: WarmCacheConfig,
   reason: string,
   detail?: string,
-  bestEffort = false,
+  label: string | null = null,
 ): void {
   if (!ctx.hasUI) return;
 
-  const xai = bestEffort || isXaiText(reason) || isXaiText(detail);
+  const xai = label === "xAI best-effort" || (label === null && (isXaiText(reason) || isXaiText(detail)));
   const title = xai ? "xAI best-effort cache-warm idle" : "Cache-warm idle";
   if (config.showWidget) {
     const lines = [
@@ -231,11 +239,11 @@ export function renderReanchorUi(
   ctx: ExtensionContext,
   config: WarmCacheConfig,
   reason: string,
-  bestEffort = false,
+  label: string | null = null,
 ): void {
   if (!ctx.hasUI) return;
 
-  const xai = bestEffort || isXaiText(reason);
+  const xai = label === "xAI best-effort" || (label === null && isXaiText(reason));
   const prefix = xai ? "xAI best-effort " : "";
   const cause = reanchorCause(reason);
   if (config.showWidget) {
@@ -258,11 +266,11 @@ export function renderProbeRetryUi(
   config: WarmCacheConfig,
   detail: string,
   nextDueAt?: number,
-  bestEffort = false,
+  label: string | null = null,
 ): void {
   if (!ctx.hasUI) return;
 
-  const xai = bestEffort || isXaiText(detail);
+  const xai = label === "xAI best-effort" || (label === null && isXaiText(detail));
   const retryLine =
     typeof nextDueAt === "number" && nextDueAt > Date.now()
       ? `Next extension probe in ${formatDurationShort(nextDueAt - Date.now())}.`
@@ -291,11 +299,11 @@ export function renderFailureUi(
   reason: string,
   detail?: string,
   nextDueAt?: number,
-  bestEffort = false,
+  label: string | null = null,
 ): void {
   if (!ctx.hasUI) return;
 
-  const xai = bestEffort || isXaiText(reason) || isXaiText(detail);
+  const xai = label === "xAI best-effort" || (label === null && (isXaiText(reason) || isXaiText(detail)));
   const blocked = /blocked/i.test(reason);
   const retryLine = blocked
     ? `${xai ? "xAI best-effort auto-warm stays off" : "Auto-warm stays off"} until /warm resume.`
@@ -329,8 +337,8 @@ export function renderFailureUi(
   );
 }
 
-function formatSessionSavings(anchor: CacheAnchor, bestEffort = false): string {
-  const prefix = bestEffort ? "xAI best-effort session" : "Session";
+function formatSessionSavings(anchor: CacheAnchor, label: string | null): string {
+  const prefix = label ? `${label} session` : "Session";
   return anchor.savingsKnown
     ? `${prefix} ${formatSavingsLabel(anchor)}`
     : `${prefix} savings ${formatSavingsLabel(anchor)}`;

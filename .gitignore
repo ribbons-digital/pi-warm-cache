@@ -11,3 +11,6 @@ dist/
 .memory-lane-scope
 docs/specs/
 skills-lock.json
+
+# Subagent session artifacts
+.pi-subagents/

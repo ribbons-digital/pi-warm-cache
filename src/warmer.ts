@@ -4,6 +4,7 @@ import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
   applyXaiWarmOutputLimit,
+  bestEffortFamilyLabel,
   classifyProbeOutcome,
   classifyRealTurnObservation,
   CODEX_WARM_OUTPUT_ABORT_TOKENS,
@@ -1247,7 +1248,7 @@ export class SessionWarmer {
       this.clearCapabilityUi(ctx);
       return;
     }
-    renderIdleUi(ctx, this.config, reason, detail, this.isXaiRoute());
+    renderIdleUi(ctx, this.config, reason, detail, this.bestEffortUiLabel());
   }
 
   /** Non-alarming hard-invalidation state. No probe is allowed before re-anchor. */
@@ -1256,7 +1257,7 @@ export class SessionWarmer {
       this.clearCapabilityUi(ctx);
       return;
     }
-    renderReanchorUi(ctx, this.config, reason, this.isXaiRoute());
+    renderReanchorUi(ctx, this.config, reason, this.bestEffortUiLabel());
   }
 
   /** Real failures / retries (keep panel visible with reason). */
@@ -1271,7 +1272,20 @@ export class SessionWarmer {
       reason,
       detail,
       this.nextDueAt > Date.now() ? this.nextDueAt : undefined,
-      this.isXaiRoute(),
+      this.bestEffortUiLabel(),
+    );
+  }
+
+  /**
+   * Best-effort UI label for this instance: family label first, then a
+   * provider-keyed fallback for collapsed-family surfaces (unverified routes
+   * collapse the family to "unverified", so isXaiRoute() keeps the xAI label
+   * there). Never model-id driven.
+   */
+  private bestEffortUiLabel(): string | null {
+    return (
+      bestEffortFamilyLabel(this.plan?.family ?? this.anchor?.cacheFamily) ??
+      (this.isXaiRoute() ? "xAI best-effort" : null)
     );
   }
 
@@ -1988,7 +2002,7 @@ export class SessionWarmer {
         this.recordAttempt(
           reason,
           true,
-          `${bestEffortHit ? `${bestEffortNoWriteLabel(anchor.cacheFamily)} probe hit` : "probe hit"} ` +
+          `${bestEffortHit ? `${bestEffortFamilyLabel(anchor.cacheFamily) ?? "best-effort"} probe hit` : "probe hit"} ` +
             `read=${result.cacheRead} write=${result.cacheWrite} out=${result.output} in=${result.input}`,
           usageSnap,
           outcome,
@@ -2002,7 +2016,7 @@ export class SessionWarmer {
         const noWriteReanchor =
           bestEffortNoWrite && result.cacheRead === 0 && result.cacheWrite === 0;
         const transientImplicitMiss = outcome === "transient-miss";
-        const bestEffortLabel = bestEffortNoWriteLabel(anchor.cacheFamily);
+        const bestEffortLabel = bestEffortFamilyLabel(anchor.cacheFamily) ?? "best-effort";
         // The xAI branch keeps its exact current wording; the Go marker/plain
         // families use the gateway phrasing.
         const omitWritePhrase =
@@ -2047,7 +2061,7 @@ export class SessionWarmer {
                 `Retrying within the configured failure budget (${anchor.consecutiveFailures}/${this.config.maxConsecutiveFailures}).`
               : `read=${result.cacheRead} write=${result.cacheWrite} · retry scheduled`,
             this.nextDueAt > Date.now() ? this.nextDueAt : undefined,
-            anchor.cacheFamily === "xai-best-effort",
+            bestEffortFamilyLabel(anchor.cacheFamily),
           );
         } else {
           const persistentMissDetail = noWriteReanchor
@@ -2105,10 +2119,6 @@ export class SessionWarmer {
       }
     }
   }
-}
-
-function bestEffortNoWriteLabel(family: CacheFamily): string {
-  return family === "xai-best-effort" ? "xAI best-effort" : "OpenCode Go best-effort";
 }
 
 function formatRealTurnStatus(observation: RealTurnObservation): string {
