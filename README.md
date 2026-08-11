@@ -275,6 +275,7 @@ The idle warm cutoff applies to every family: the timer stops when the session h
 
 The probe-spend ceiling is active by default only for `opencode-go` at $1.00 per provider per campaign, with a 250-probe fallback when model cost fields are zero or unusable.
 The `spend=` token extends the ceiling to any provider; `spend=0` disables it for every provider (an extension mirroring `maxidle=0`).
+Raising or disabling the ceiling resumes a soft-blocked session immediately; lowering it keeps the block until the next real turn.
 A real turn resets the campaign ledger; both guards are scoped to timer fires only, so `/warm now` always bypasses them.
 
 The OpenCode Go families resolve from the captured payload, not from model metadata, and never render a numeric lifetime until an e2e evidence record exists.

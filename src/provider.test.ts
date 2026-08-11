@@ -3293,6 +3293,97 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "the probe-count fallback must stop after exactly 250 provider calls",
   );
   fallbackWarmer.dispose();
+
+  // Config change resumes a soft-blocked session: raising the ceiling or
+  // disabling it (spend=0) clears this instance's soft block immediately,
+  // matching the documented spend=0 opt-out.
+  let resumeCalls = 0;
+  const resumeStub = async (): Promise<any> => {
+    resumeCalls += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const resumeWarmer = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    resumeStub as any,
+  );
+  resumeWarmer.bindContext(ctx);
+  resumeWarmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    warmSpendCeilingUsd: 0.01,
+  });
+  resumeWarmer.capturePayload(payload, ctx);
+  resumeWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const r1 = await (resumeWarmer as any).runWarm("timer");
+  assert(r1.ok, "the first probe must fire against the 1-cent ceiling");
+  const rBlocked = await (resumeWarmer as any).runWarm("timer");
+  assert(!rBlocked.ok, "the second timer fire must soft-block");
+  assert(Number(resumeCalls) === 1, "the soft block must hold before any config change");
+  // spend=0 (unlimited) resumes warming without waiting for a real turn.
+  resumeWarmer.setConfig({ ...resumeWarmer.getConfig(), warmSpendCeilingUsd: 0 });
+  const rUnlimited = await (resumeWarmer as any).runWarm("timer");
+  assert(rUnlimited.ok, "spend=0 must resume a soft-blocked session immediately");
+  assert(Number(resumeCalls) === 2, "the resumed probe must be the second provider call");
+  assert(
+    resumeWarmer.getStatusText().includes("spendCeiling=ok"),
+    "the resumed session must report spendCeiling=ok",
+  );
+  // A lowered ceiling keeps the block; a raised ceiling resumes it.
+  resumeWarmer.setConfig({ ...resumeWarmer.getConfig(), warmSpendCeilingUsd: 0.01 });
+  const rLowered = await (resumeWarmer as any).runWarm("timer");
+  assert(
+    !rLowered.ok && rLowered.unavailable === true,
+    "a lowered ceiling must keep the session soft-blocked",
+  );
+  assert(Number(resumeCalls) === 2, "no provider call while the lowered ceiling holds");
+  resumeWarmer.setConfig({ ...resumeWarmer.getConfig(), warmSpendCeilingUsd: 5 });
+  const rRaised = await (resumeWarmer as any).runWarm("timer");
+  assert(rRaised.ok, "a raised ceiling must resume a soft-blocked session");
+  assert(Number(resumeCalls) === 3, "the resumed probe must be the third provider call");
+  resumeWarmer.dispose();
+
+  // The 250-probe fallback must NOT fire while the campaign has real spend: a
+  // priced session is bounded by dollars, never by the unrelated probe count.
+  resetProbeSpendLedgerForTest();
+  let pricedCalls = 0;
+  const pricedStub = async (): Promise<any> => {
+    pricedCalls += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const pricedWarmer = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    pricedStub as any,
+  );
+  pricedWarmer.bindContext(ctx);
+  pricedWarmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    warmSpendCeilingUsd: 100,
+  });
+  pricedWarmer.capturePayload(payload, ctx);
+  pricedWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  for (let i = 0; i < 250; i++) {
+    const probe = await (pricedWarmer as any).runWarm("timer");
+    assert(probe.ok, `priced probe ${i + 1} must fire past the fallback count`);
+  }
+  const priced251 = await (pricedWarmer as any).runWarm("timer");
+  assert(
+    priced251.ok,
+    "the 250-probe fallback must not fire while the campaign has real spend",
+  );
+  assert(
+    Number(pricedCalls) === 251,
+    "a priced campaign must be bounded by dollars, not the probe count",
+  );
+  pricedWarmer.dispose();
   resetProbeSpendLedgerForTest();
   rmSync(cwd, { recursive: true, force: true });
 }

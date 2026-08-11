@@ -293,6 +293,21 @@ export class SessionWarmer {
 
   setConfig(config: WarmCacheConfig): void {
     this.config = { ...config };
+    // Re-evaluate the per-instance spend soft block when the ceiling changes:
+    // raising the ceiling or disabling it (spend=0) resumes warming for this
+    // instance, matching the documented spend=0 opt-out. A lowered ceiling
+    // keeps the block until this instance's next real turn. Other sessions'
+    // config changes never touch this field.
+    if (this.spendBlockReason && this.anchor && !this.spendCeilingTripped(this.anchor.provider)) {
+      this.spendBlockReason = null;
+      this.log({
+        event: "spend_block_cleared",
+        source: "system",
+        sessionId: this.anchor.sessionId,
+        provider: this.anchor.provider,
+        reason: "ceiling raised or disabled via config",
+      });
+    }
     if (!this.config.enabled) {
       this.stop("disabled");
       return;
@@ -1420,6 +1435,19 @@ export class SessionWarmer {
     };
   }
 
+  /**
+   * True when the probe-spend ceiling (or its zero-cost probe-count fallback) is
+   * tripped for a provider under the current config. Used by setConfig to
+   * re-evaluate a soft block and by runWarm before the concurrency gate.
+   */
+  private spendCeilingTripped(provider: string): boolean {
+    const ceilingUsd = resolveProviderSpendCeilingUsd(this.config, provider);
+    if (ceilingUsd === null) return false;
+    const spend = probeSpendLedger.getSpendUsd(provider);
+    const count = probeSpendLedger.getProbeCount(provider);
+    return spend >= ceilingUsd || (spend === 0 && count >= SPEND_PROBE_COUNT_FALLBACK);
+  }
+
   private deferProbe(
     reason: WarmDeferralReason,
     attemptReason: "timer" | "manual",
@@ -1740,7 +1768,13 @@ export class SessionWarmer {
         const campaignSpend = probeSpendLedger.getSpendUsd(anchor.provider);
         const campaignProbes = probeSpendLedger.getProbeCount(anchor.provider);
         const overSpend = campaignSpend >= ceilingUsd;
-        const overProbeCount = campaignProbes >= SPEND_PROBE_COUNT_FALLBACK;
+        // The probe-count fallback applies only while the campaign has no
+        // measurable spend: when model cost fields are zero or unusable,
+        // costUsd is always zero and a dollar ceiling never trips, so the
+        // count ceiling bounds the campaign instead. A priced session is
+        // bounded by dollars, never by this count.
+        const overProbeCount =
+          campaignSpend === 0 && campaignProbes >= SPEND_PROBE_COUNT_FALLBACK;
         if (overSpend || overProbeCount) {
           this.spendBlockReason = overSpend
             ? `probe spend ceiling reached ($${ceilingUsd.toFixed(2)} for ${anchor.provider}; campaign total $${campaignSpend.toFixed(2)})`
