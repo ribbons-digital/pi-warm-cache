@@ -441,6 +441,14 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     resolveProviderCapability(openRouterWrongEndpoint).state === "unsupported",
     "OpenRouter routes with a different endpoint must fail closed",
   );
+  const openRouterWrongPath = {
+    ...openRouterXai,
+    baseUrl: "https://openrouter.ai/api/v2",
+  } as any;
+  assert(
+    resolveProviderCapability(openRouterWrongPath).state === "unsupported",
+    "OpenRouter routes on an unregistered path must fail closed (exact-path matching)",
+  );
   const openRouterWrongRouting = {
     ...openRouterXai,
     compat: { sessionAffinityFormat: "openai" },

@@ -53,7 +53,9 @@ Other direct xAI models on the first-party xAI endpoint can use one clearly labe
 They do not receive an automatic timer or a verified savings claim.
 
 Selected OpenRouter and OpenCode Go routes are also manual-only.
-They must use the registered first-party proxy endpoint, an explicitly supported API transport, and compatible session-affinity metadata.
+Each route must match its per-api registration in the proxy route registry: the registered API transport, the exact registered baseUrl path, and (for OpenRouter) compatible `sessionAffinityFormat: "openrouter"` routing metadata.
+OpenCode Go registers three API shapes with exact endpoints: `anthropic-messages` at `https://opencode.ai/zen/go`, and `openai-completions` and `openai-responses` at `https://opencode.ai/zen/go/v1`.
+A longer path never matches a shorter registered path.
 They never inherit a first-party OpenAI or Anthropic strategy.
 
 ### Unsupported routes
