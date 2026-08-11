@@ -485,6 +485,14 @@ export class SessionWarmer {
       previousPayload = null;
     }
 
+    // enterAwaitingReanchor recomputes the capability without the payload,
+    // which would drop payload-derived refusals (for example the opencode-go
+    // foreign-instrumentation gate on a completions payload carrying illegal
+    // cache_control) and re-enable /warm now on an unsafe exact payload.
+    // Restore the payload-aware resolution so the re-anchored anchor keeps the
+    // refusal and manualProbeAvailable stays false for this captured body.
+    this.capability = resolveProviderCapability(model, payload);
+
     this.lastInvalidatedProbe = null;
     this.lastPayload = structuredClone(payload);
     this.plan = resolveStrategy(model, this.config, this.lastPayload);

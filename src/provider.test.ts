@@ -26,11 +26,14 @@ import {
   isPayloadContinuation,
   minimumOutputTokensForPayload,
   modelSupportsLongCacheRetention,
+  opencodeGoForeignInstrumentationReason,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
   isStablePromptCacheKey,
   OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
   payloadHasAnthropicLongTtl,
+  payloadHasCacheControl,
+  supportsManualProbe,
   XAI_BEST_EFFORT_INTERVAL_MS,
   resolveProviderCapability,
   resolveStrategy,
@@ -639,6 +642,156 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     const goStrategy = resolveStrategy(goAnthropicNoCompat, DEFAULT_CONFIG);
     assert(goStrategy.family === "unverified", "OpenCode Go must not inherit an Anthropic family");
     assert(goStrategy.intervalMs === null, "manual-only OpenCode Go route must not receive a timer");
+
+    // Foreign-instrumentation refusal: an opencode-go openai-completions
+    // payload may carry cache_control only when the route compat declares
+    // cacheControlFormat: "anthropic". No opencode-go completions model
+    // declares it today, so any cache_control is evidence of third-party
+    // mutation (for example the community pi-opencode-go-cache rewriter) and
+    // is refused for replay.
+    const goCompletions = {
+      id: "deepseek-v4-flash",
+      provider: "opencode-go",
+      api: "openai-completions",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    } as any;
+    const goCompletionsClean = {
+      model: "deepseek-v4-flash",
+      messages: [{ role: "user", content: "hi" }],
+    };
+    assert(
+      canManualProbe(goCompletions, goCompletionsClean),
+      "a clean completions payload still permits a manual probe",
+    );
+    assert(
+      supportsManualProbe(goCompletions),
+      "supportsManualProbe without a payload must stay permissive for a registered manual-only route",
+    );
+
+    // Nested markers deep in a completions payload are refused: the deep-walk
+    // scans nested objects and arrays at any depth.
+    const goCompletionsNestedMarker = {
+      model: "deepseek-v4-flash",
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          tool_calls: [
+            {
+              type: "function",
+              function: {
+                name: "bash",
+                arguments: { metadata: { cache_control: { type: "ephemeral" } } },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    assert(
+      payloadHasCacheControl(goCompletionsNestedMarker),
+      "the deep-walk must find a cache_control key at any depth",
+    );
+    const refusedCapability = resolveProviderCapability(goCompletions, goCompletionsNestedMarker);
+    assert(
+      refusedCapability.state === "unverified",
+      "a refused completions payload keeps the route unverified, not unsupported",
+    );
+    assert(
+      !refusedCapability.manualProbe,
+      "an illegal cache_control payload must disable the manual probe",
+    );
+    assert(
+      refusedCapability.reason.includes("cache_control") &&
+        refusedCapability.reason.includes("foreign instrumentation") &&
+        refusedCapability.reason.includes("read-only"),
+      "the refusal reason must name the foreign instrumentation and the capture ordering",
+    );
+    assert(
+      opencodeGoForeignInstrumentationReason(goCompletions, goCompletionsNestedMarker) !== null,
+      "the detector must fire on a nested marker",
+    );
+    assert(
+      !canManualProbe(goCompletions, goCompletionsNestedMarker),
+      "a completions payload carrying illegal cache_control must be refused for replay",
+    );
+    assert(
+      !supportsManualProbe(goCompletions, goCompletionsNestedMarker),
+      "supportsManualProbe must refuse the illegal payload too",
+    );
+
+    // Compat-conditional allow: a completions model that declares
+    // cacheControlFormat: "anthropic" may carry cache_control with no refusal.
+    const goCompletionsAnthropicCompat = {
+      id: "future-completions-model",
+      provider: "opencode-go",
+      api: "openai-completions",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+      compat: { cacheControlFormat: "anthropic" },
+    } as any;
+    const goCompletionsMarkerPayload = {
+      model: "future-completions-model",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+        },
+      ],
+    };
+    assert(
+      opencodeGoForeignInstrumentationReason(goCompletionsAnthropicCompat, goCompletionsMarkerPayload) ===
+        null,
+      "no refusal when the route compat declares cacheControlFormat: anthropic",
+    );
+    assert(
+      canManualProbe(goCompletionsAnthropicCompat, goCompletionsMarkerPayload),
+      "compat-conditional allow: a cache_control payload is legal when the route declares the format",
+    );
+
+    // A GLM fixture is refused like any other completions model: there is no
+    // model-id denylist, the rule derives purely from the compat declaration.
+    const goGlm = {
+      id: "glm-5.1",
+      provider: "opencode-go",
+      api: "openai-completions",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+      compat: { maxTokensField: "max_tokens" },
+    } as any;
+    assert(
+      opencodeGoForeignInstrumentationReason(goGlm, goCompletionsNestedMarker) !== null,
+      "glm-5.1 has no denylist; the refusal is pure compat shape",
+    );
+    assert(
+      !canManualProbe(goGlm, goCompletionsNestedMarker),
+      "glm-5.1 refuses an illegal cache_control payload like any other completions model",
+    );
+
+    // Anthropic-messages markers are legal: that transport carries
+    // cache_control by design, so the refusal never fires for it.
+    const goAnthropicMarkers = {
+      id: "qwen3.7-max",
+      provider: "opencode-go",
+      api: "anthropic-messages",
+      baseUrl: "https://opencode.ai/zen/go",
+    } as any;
+    const goAnthropicMarkerPayload = {
+      model: "qwen3.7-max",
+      system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } }],
+        },
+      ],
+    };
+    assert(
+      opencodeGoForeignInstrumentationReason(goAnthropicMarkers, goAnthropicMarkerPayload) === null,
+      "anthropic-messages markers are legal; the refusal never fires for that transport",
+    );
+    assert(
+      canManualProbe(goAnthropicMarkers, goAnthropicMarkerPayload),
+      "anthropic-messages markers must not disable the manual probe",
+    );
   }
 
   const unknownResponses = {
@@ -1618,6 +1771,93 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(xaiWaiting.unavailable === true, "xAI drift must not probe before re-anchor");
   assert(calls.length === xaiCallsBeforeWaitingProbe, "xAI awaiting re-anchor must not call the provider");
   assert(notifications.some((entry) => entry.level === "warning"), "xAI re-anchor should be visible");
+  warmer.dispose();
+}
+
+// 11a) Foreign-instrumentation refusal survives the prefix-change re-anchor
+// path: a clean opencode-go completions turn followed by a turn carrying
+// injected cache_control must keep the refusal on the new anchor, so /warm now
+// refuses to replay the tampered body and never calls the provider.
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  const calls: unknown[] = [];
+  const completeStub = async (args: unknown): Promise<any> => {
+    calls.push(args);
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const goModel = {
+    id: "deepseek-v4-flash",
+    provider: "opencode-go",
+    api: "openai-completions",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model: goModel,
+    hasUI: true,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "go-session" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+  });
+
+  warmer.capturePayload(
+    { model: "deepseek-v4-flash", messages: [{ role: "user", content: "hello" }] },
+    ctx,
+  );
+  assert(warmer.getLifecycleState() === "anchored", "a clean Go completions turn should anchor");
+
+  // The rewriter injects cache_control into the next turn. The refusal must
+  // survive the prefix-change re-anchor and disable the manual probe.
+  warmer.capturePayload(
+    {
+      model: "deepseek-v4-flash",
+      messages: [
+        { role: "user", content: "hello" },
+        {
+          role: "user",
+          content: [{ type: "text", text: "injected", cache_control: { type: "ephemeral" } }],
+        },
+      ],
+    },
+    ctx,
+  );
+  const refusedCapability = warmer.getCapability();
+  assert(
+    refusedCapability.reason.includes("foreign instrumentation"),
+    "the re-anchored capability must keep the refusal reason",
+  );
+  assert(
+    !refusedCapability.manualProbe,
+    "a cache_control-carrying completions turn must keep manualProbe disabled",
+  );
+  const refused = await warmer.warmNow(ctx);
+  assert(refused.unavailable === true, "a refused Go completions payload must not probe");
+  assert(
+    refused.capabilityReason?.includes("cache_control"),
+    "the refusal reason must be exposed on the /warm now result",
+  );
+  assert(calls.length === 0, "a refused Go completions payload must never reach the provider");
   warmer.dispose();
 }
 

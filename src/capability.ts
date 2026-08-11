@@ -200,6 +200,35 @@ function hasExactProxyBaseUrl(
 }
 
 /**
+ * Return a refusal reason when an OpenCode Go completions payload carries
+ * `cache_control` the route compat cannot legally carry, else null.
+ *
+ * The rule is compat-conditional: an `openai-completions` payload may only
+ * carry `cache_control` when the route compat declares `cacheControlFormat:
+ * "anthropic"`. No opencode-go completions model declares it today, so a
+ * captured completions payload containing `cache_control` is evidence of
+ * third-party mutation, for example the community `pi-opencode-go-cache`
+ * rewriter, and is unsafe to replay.
+ *
+ * There is no model-id denylist anywhere. A future completions model that
+ * declares the format is handled without a code change, and the same shape
+ * rule protects non-GLM models from replaying a rewritten body.
+ *
+ * The anthropic-messages transport carries `cache_control` by design, so the
+ * refusal never fires for it.
+ */
+export function opencodeGoForeignInstrumentationReason(
+  model: Model<any> | undefined,
+  payload?: unknown,
+): string | null {
+  if (!model || model.provider !== "opencode-go") return null;
+  if (model.api !== "openai-completions") return null;
+  if (getCompat(model)?.cacheControlFormat === "anthropic") return null;
+  if (!payloadHasCacheControl(payload)) return null;
+  return "opencode-go openai-completions captured payload carries cache_control, but this route's compat does not declare cacheControlFormat: \"anthropic\"; the payload shows foreign instrumentation (for example the community pi-opencode-go-cache rewriter) and is refused for replay. Capture is read-only on before_provider_request, so a rewriter editing before capture yields this refused body and one editing after capture yields a cache miss, never an error";
+}
+
+/**
  * Resolve a registered manual-only proxy route.
  *
  * A provider match always returns a decision, never null: a registered proxy
@@ -207,8 +236,11 @@ function hasExactProxyBaseUrl(
  * its compat copies first-party metadata (for example `cacheControlFormat:
  * "anthropic"`).
  *
- * `payload` is threaded for the payload-dependent gates later slices add; in
- * this slice proxy resolution does not depend on it.
+ * `payload` is threaded for the payload-dependent foreign-instrumentation
+ * gate: an opencode-go completions payload carrying `cache_control` without
+ * `cacheControlFormat: "anthropic"` compat is refused for replay. The route
+ * stays unverified and the payload-specific refusal disables the manual probe
+ * for that payload only; a later clean real-turn payload resolves normally.
  */
 function resolveProxyRouteCapability(
   model: Model<any>,
@@ -255,6 +287,14 @@ function resolveProxyRouteCapability(
         `${label} manual-only route has unsupported cache-routing metadata; automatic and manual warming are disabled for this route`,
       );
     }
+  }
+
+  const foreignReason = opencodeGoForeignInstrumentationReason(model, payload);
+  if (foreignReason) {
+    // The route is registered but this exact payload is unsafe to replay.
+    // manualProbe stays false, so the refusal gates /warm now and the manual
+    // probe flags for this payload only.
+    return capability("unverified", foreignReason);
   }
 
   return capability(
@@ -314,6 +354,33 @@ export function hasXaiPromptCacheKey(payload: unknown): boolean {
 /** True when a captured direct xAI payload is safe for automatic replay. */
 export function isSafeXaiReplayPayload(payload: unknown): boolean {
   return hasXaiPromptCacheKey(payload);
+}
+
+/**
+ * True when the payload carries a `cache_control` key anywhere in its tree.
+ *
+ * This is the foreign-instrumentation detector. It scans nested objects and
+ * arrays, matching the deep-walk precedent of `payloadHasAnthropicLongTtl`.
+ * Key presence counts regardless of value: a rewriter writes the key, so even
+ * a null or empty value is evidence of mutation.
+ */
+export function payloadHasCacheControl(payload: unknown): boolean {
+  let found = false;
+  const visit = (node: unknown): void => {
+    if (found || !node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    const obj = node as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(obj, "cache_control")) {
+      found = true;
+      return;
+    }
+    for (const value of Object.values(obj)) visit(value);
+  };
+  visit(payload);
+  return found;
 }
 
 function capability(
@@ -528,7 +595,7 @@ export function canManualProbe(
   model: Model<any> | undefined,
   payload: unknown,
 ): boolean {
-  const resolved = resolveProviderCapability(model);
+  const resolved = resolveProviderCapability(model, payload);
   return resolved.manualProbe && isSafeReplayPayload(payload, model?.api);
 }
 

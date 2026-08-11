@@ -26,6 +26,8 @@ export {
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
   isStablePromptCacheKey,
+  opencodeGoForeignInstrumentationReason,
+  payloadHasCacheControl,
   resolveProviderCapability,
 } from "./capability.ts";
 export type { ProviderCapability, ProviderCapabilityState } from "./types.ts";
@@ -80,7 +82,11 @@ export function supportsAutomaticWarm(model: Model<any> | undefined): boolean {
 
 /** True when the route is allowed to make a one-shot manual probe. */
 export function supportsManualProbe(model: Model<any> | undefined, payload?: unknown): boolean {
-  const capability = resolveProviderCapability(model);
+  // The payload is passed through so payload-dependent gates (the direct xAI
+  // key gate and the opencode-go foreign-instrumentation refusal) can disable
+  // the manual probe for an unsafe exact payload. With no payload supplied the
+  // resolution is unchanged: undefined payloads never trigger those gates.
+  const capability = resolveProviderCapability(model, payload);
   if (!capability.manualProbe) return false;
   return payload === undefined ? true : isSafeReplayPayload(payload, model?.api);
 }
