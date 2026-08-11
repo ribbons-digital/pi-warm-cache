@@ -22,6 +22,13 @@ These four rules are non-negotiable:
 4. **No invented pricing** - savings estimates use only the model-supplied `cost` fields.
    If pricing is missing or unusable, report `n/a`.
 
+Capture is read-only: pi-warm-cache never rewrites real turns.
+Provider guidance lists extension payload mutation as a top cause of cache instability, so read-only capture is both a safety rule and cache hygiene.
+
+Capture happens on the read-only `before_provider_request` hook.
+If a co-installed rewriter edits the body before our hook, we capture and replay its body, and the foreign-instrumentation rule refuses it when it is illegal for the route.
+If a rewriter edits after our capture, our replay differs from the real wire body and the failure mode is a cache miss, never an error.
+
 The extension supports Pi only.
 Tau is out of scope.
 
@@ -57,6 +64,11 @@ Each route must match its per-api registration in the proxy route registry: the 
 OpenCode Go registers three API shapes with exact endpoints: `anthropic-messages` at `https://opencode.ai/zen/go`, and `openai-completions` and `openai-responses` at `https://opencode.ai/zen/go/v1`.
 A longer path never matches a shorter registered path.
 They never inherit a first-party OpenAI or Anthropic strategy.
+
+OpenCode Go `openai-completions` payloads may carry `cache_control` only when the route compat declares `cacheControlFormat: "anthropic"`.
+No OpenCode Go completions model declares it today, so a captured completions payload containing `cache_control` is evidence of third-party mutation (for example the community `pi-opencode-go-cache` rewriter) and is refused for replay with a reason naming the foreign instrumentation.
+The rule derives from the compat declaration, not a model-id denylist, so a future completions model that declares the format is handled without a code change.
+The `anthropic-messages` transport carries `cache_control` by design and is never refused.
 
 ### Unsupported routes
 
@@ -314,6 +326,7 @@ interface WarmCacheConfig {
 12. **Manual-only proxy routes** - require the explicitly registered provider, API transport, proxy endpoint, and routing metadata; never arm a timer.
 13. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
 14. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
+15. **Foreign instrumentation on an OpenCode Go completions payload** - refuse replay when `cache_control` appears without `cacheControlFormat: "anthropic"` compat, because the route cannot legally carry it.
 
 ## Package layout
 
