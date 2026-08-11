@@ -355,9 +355,23 @@ export function isStablePromptCacheKey(value: unknown): value is string {
   );
 }
 
-/** Return the provider cache-routing key from an OpenAI Responses payload. */
+/**
+ * Return the provider cache-routing key from a supported payload.
+ *
+ * Accepted apis: openai-responses, openai-codex-responses,
+ * openai-completions, and azure-openai-responses. Diagnostics only: the key
+ * feeds the redacted fingerprint and never any gate beyond the literal
+ * "openai-responses" keyed checks.
+ */
 export function getPromptCacheKey(payload: unknown, api: string | undefined): string | null {
-  if (api !== "openai-responses" && api !== "openai-codex-responses") return null;
+  if (
+    api !== "openai-responses" &&
+    api !== "openai-codex-responses" &&
+    api !== "openai-completions" &&
+    api !== "azure-openai-responses"
+  ) {
+    return null;
+  }
   if (!payload || typeof payload !== "object") return null;
   const key = (payload as Record<string, unknown>).prompt_cache_key;
   return isStablePromptCacheKey(key) ? key : null;

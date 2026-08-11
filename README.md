@@ -236,6 +236,9 @@ When enabled, diagnostics are written to `.pi/warm-cache.jsonl`.
 The [diagnostics reference](docs/upgrade-notes.md) defines the `/warm` status fields, lifecycle states, savings summary, and JSONL schema.
 The `/warm` status and `/warm now` result include the provider route, capability state, strategy, cadence, payload fingerprint, redacted cache-key identity, observed usage, retry state, and active warm-session count.
 
+The redacted cache-key fingerprint also covers `openai-completions` and `azure-openai-responses` payloads: any captured top-level `prompt_cache_key` is reduced to an 8-hex identity and never written to status or logs.
+This is diagnostics only and never gates a route; the stable-responses-key gate and the xAI key-change invalidation stay keyed on the exact `openai-responses` api.
+
 When a timer probe is deferred, `/warm` reports the deferral reason and the occupied concurrency slots.
 The `/warm now` output reports the same information when its request is deferred.
 
@@ -248,6 +251,9 @@ The `/warm now` output reports the same information when its request is deferred
 Use `/warm savings` to print only that cumulative summary.
 
 When model pricing is unavailable or unusable, the summary reports monetary values as `n/a`.
+
+OpenCode Go savings are framed honestly as subscription budget-dollars: the label appends `(subscription budget-dollars)` and the summary appends `savingsUnit=budget-dollars`, because Go spend draws on a subscription budget rather than per-token invoicing.
+The marker keys on the provider billing identity and only ever on the dollar-rendering branches; every other route stays byte-identical.
 
 A first implicit-cache `read=0 write=0` probe is labelled `transient-miss` and retries quietly.
 

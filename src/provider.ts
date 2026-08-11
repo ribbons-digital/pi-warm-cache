@@ -68,6 +68,26 @@ export function isBestEffortNoWriteFamily(family: CacheFamily): boolean {
 }
 
 /**
+ * Human label for a best-effort cache family, or null for every other family.
+ *
+ * Family-driven only: never model-id driven. Unverified routes collapse the
+ * family to "unverified", so a caller that still needs an xAI label on that
+ * collapsed surface (for example the warmer idle/reanchor/failure UI) falls
+ * back on provider identity after this returns null.
+ */
+export function bestEffortFamilyLabel(family: CacheFamily | undefined): string | null {
+  if (family === "xai-best-effort") return "xAI best-effort";
+  if (
+    family === "opencode-go-long-marker" ||
+    family === "opencode-go-short-marker" ||
+    family === "opencode-go-plain"
+  ) {
+    return "OpenCode Go best-effort";
+  }
+  return null;
+}
+
+/**
  * Idle warm cutoff for a family: max(30m, 2 x referenceMs), where referenceMs
  * is the family TTL when one exists and the effective interval otherwise.
  * Only xai-best-effort is interval-referenced; TTL families ignore interval
@@ -896,9 +916,12 @@ export function stableFingerprint(payload: unknown): string {
 
 /**
  * Return a short redacted fingerprint for a provider cache-routing key.
+ * Always exactly 8 hex characters (left-padded) or "none".
  * Never include the key itself in status text or diagnostic events.
  */
 export function getPromptCacheKeyFingerprint(payload: unknown, api: string | undefined): string {
   const key = getPromptCacheKey(payload, api);
-  return key ? stableFingerprint(key).split(":")[0]!.slice(0, 8) : "none";
+  return key
+    ? stableFingerprint(key).split(":")[0]!.slice(0, 8).padStart(8, "0")
+    : "none";
 }

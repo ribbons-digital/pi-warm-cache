@@ -14,6 +14,7 @@ import {
   appendWarmUserTurn,
   applyWarmOutputLimit,
   applyXaiWarmOutputLimit,
+  bestEffortFamilyLabel,
   canManualProbe,
   classifyOpencodeGoFamily,
   classifyProbeOutcome,
@@ -451,7 +452,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "   " }), "blank xAI key must be rejected");
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "xai\nkey" }), "control characters must be rejected");
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "key\u009Bvalue" }), "C1 control characters (U+0080-U+009F) must be rejected");
-  assert(getPromptCacheKey(xaiPayload, "openai-completions") === null, "wrong API must not expose a Responses key");
+  assert(getPromptCacheKey(xaiPayload, "anthropic-messages") === null, "wrong API must not expose a cache key");
   assert(!canManualProbe(directXai, xaiPayload), "verified xAI should not use the unverified probe path");
   const xaiWithoutKey = { ...xaiPayload, prompt_cache_key: undefined };
   const xaiWithoutKeyStrategy = resolveStrategy(directXai, DEFAULT_CONFIG, xaiWithoutKey);
@@ -2767,10 +2768,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   } as any;
   renderWaitingUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiAnchor, xaiPlan, Date.now() + 180_000);
   renderWarmHitUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiAnchor, xaiPlan, 128_000);
-  renderReanchorUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "prompt_cache_key changed", true);
-  renderProbeRetryUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "read=0 write=0", undefined, true);
-  renderFailureUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "probe miss", "read=0 write=0", undefined, true);
-  renderIdleUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "prefix too small", undefined, true);
+  renderReanchorUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "prompt_cache_key changed", "xAI best-effort");
+  renderProbeRetryUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "read=0 write=0", undefined, "xAI best-effort");
+  renderFailureUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "probe miss", "read=0 write=0", undefined, "xAI best-effort");
+  renderIdleUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "prefix too small", undefined, "xAI best-effort");
   const xaiUiText = xaiCalls
     .flatMap((call) => (Array.isArray(call.value) ? call.value : [String(call.value)]))
     .map(String)
@@ -3574,6 +3575,627 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "the post-re-anchor hit must keep the failure budget reset",
   );
   warmer.dispose();
+  rmSync(cwd, { recursive: true, force: true });
+}
+
+// 21) Slice 6 diagnostics: completions/azure cache-key fingerprinting, xAI
+// key-change gating pins, best-effort family labels, budget-dollar savings
+// framing, and the label-driven UI copy.
+{
+  // getPromptCacheKey accepts openai-completions and azure-openai-responses;
+  // openai-responses stays unchanged; the new apis never affect the
+  // responses-key gate.
+  const completionsPayload = {
+    model: "deepseek-v4-flash",
+    messages: [{ role: "user", content: "hi" }],
+    prompt_cache_key: "go-session-1",
+  };
+  assert(
+    getPromptCacheKey(completionsPayload, "openai-completions") === "go-session-1",
+    "completions key detector should return the captured key",
+  );
+  assert(
+    getPromptCacheKey(
+      { ...completionsPayload, prompt_cache_key: undefined },
+      "openai-completions",
+    ) === null,
+    "absent completions key must return null",
+  );
+  assert(
+    getPromptCacheKey({ ...completionsPayload, prompt_cache_key: " " }, "openai-completions") ===
+      null,
+    "unstable completions key must return null",
+  );
+  const azurePayload = {
+    model: "gpt-5.6",
+    input: [{ role: "user", content: "hi" }],
+    prompt_cache_key: "azure-session",
+  };
+  assert(
+    getPromptCacheKey(azurePayload, "azure-openai-responses") === "azure-session",
+    "azure responses key detector should return the captured key",
+  );
+  assert(
+    getPromptCacheKey({ input: [], prompt_cache_key: "openai-key" }, "openai-responses") ===
+      "openai-key",
+    "openai-responses key detection must stay unchanged",
+  );
+  // The new apis never affect hasStableResponsesCacheKey, which passes the
+  // literal "openai-responses" and requires the exact Responses replay shape.
+  assert(
+    !hasStableResponsesCacheKey({ messages: [], prompt_cache_key: "k" }),
+    "completions-shaped payloads must never satisfy the responses key gate",
+  );
+  assert(
+    hasStableResponsesCacheKey({ input: [], prompt_cache_key: "k" }),
+    "responses-shaped payloads must still satisfy the responses key gate",
+  );
+
+  // Fingerprint audit: redacted 8-hex, stable, never the raw key, "none" when
+  // absent. The same holds for the newly accepted apis.
+  const completionsFp = getPromptCacheKeyFingerprint(completionsPayload, "openai-completions");
+  assert(
+    /^[0-9a-f]{8}$/.test(completionsFp),
+    `completions fingerprint must be 8 hex chars, got ${completionsFp}`,
+  );
+  assert(completionsFp !== "go-session-1", "fingerprint must never expose the raw completions key");
+  assert(
+    getPromptCacheKeyFingerprint(completionsPayload, "openai-completions") === completionsFp,
+    "completions fingerprint must be stable for the same key",
+  );
+  assert(
+    getPromptCacheKeyFingerprint({ messages: [] }, "openai-completions") === "none",
+    "absent completions key must fingerprint as none",
+  );
+  assert(
+    getPromptCacheKeyFingerprint(azurePayload, "azure-openai-responses") !== "none",
+    "azure responses fingerprint should be present for a keyed payload",
+  );
+  assert(
+    getPromptCacheKeyFingerprint({ input: [], prompt_cache_key: "openai-key" }, "openai-responses") !==
+      "none",
+    "openai-responses fingerprint must stay present",
+  );
+
+  // Injected prompt_cache_key on an opencode-go completions payload changes no
+  // gate: still manual-only, no automatic timer, family unchanged, and the key
+  // shows only in the redacted fingerprint.
+  const goCompletionsModel = {
+    id: "deepseek-v4-flash",
+    provider: "opencode-go",
+    api: "openai-completions",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  const goCompletionsPayload = {
+    model: "deepseek-v4-flash",
+    messages: [{ role: "user", content: "hi" }],
+    prompt_cache_key: "injected-go-key",
+  };
+  const injectedStrategy = resolveStrategy(goCompletionsModel, DEFAULT_CONFIG, goCompletionsPayload);
+  assert(
+    injectedStrategy.capability.state === "unverified",
+    "injected key must not verify the Go route",
+  );
+  assert(!injectedStrategy.automaticWarm, "injected key must not arm an automatic timer");
+  assert(
+    injectedStrategy.family === "opencode-go-plain",
+    "injected key must not change the Go family",
+  );
+  assert(
+    getPromptCacheKeyFingerprint(goCompletionsPayload, "openai-completions") !== "none",
+    "injected key must appear only in the redacted fingerprint",
+  );
+
+  // bestEffortFamilyLabel truth table: family-driven only, never model-id
+  // driven, and never the collapsed unverified family.
+  assert(bestEffortFamilyLabel("xai-best-effort") === "xAI best-effort", "xai family label");
+  assert(
+    bestEffortFamilyLabel("opencode-go-long-marker") === "OpenCode Go best-effort",
+    "Go long-marker family label",
+  );
+  assert(
+    bestEffortFamilyLabel("opencode-go-short-marker") === "OpenCode Go best-effort",
+    "Go short-marker family label",
+  );
+  assert(
+    bestEffortFamilyLabel("opencode-go-plain") === "OpenCode Go best-effort",
+    "Go plain family label",
+  );
+  assert(bestEffortFamilyLabel("opencode-go-retained") === null, "retained never labels");
+  assert(bestEffortFamilyLabel("anthropic-short") === null, "anthropic never labels");
+  assert(bestEffortFamilyLabel("openai-implicit") === null, "openai never labels");
+  assert(bestEffortFamilyLabel("unverified") === null, "collapsed family never labels");
+  assert(bestEffortFamilyLabel(undefined) === null, "missing family never labels");
+
+  // Capture-path fingerprint audit: capturePayload stores the redacted 8-hex
+  // fingerprint for first-party OpenAI completions and opencode-go completions,
+  // and neither status nor the JSONL mirror ever leaks the raw key.
+  const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-slice6-"));
+  const makeWarmCtx = (sessionId: string, model: any) =>
+    ({
+      cwd,
+      model,
+      hasUI: false,
+      ui: {
+        theme: { fg: (_color: string, text: string) => text },
+        setStatus: () => undefined,
+        setWidget: () => undefined,
+      },
+      thinkingLevel: "off",
+      isIdle: () => true,
+      sessionManager: { getSessionId: () => sessionId },
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
+      },
+    }) as any;
+  const readWarmEvents = (): Array<Record<string, unknown>> =>
+    readFileSync(join(cwd, ".pi", "warm-cache.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  const rotationHarness = (
+    sessionId: string,
+    model: any,
+    payloads: Array<Record<string, unknown>>,
+  ) => {
+    const ctx = makeWarmCtx(sessionId, model);
+    const warmer = new SessionWarmer(
+      { getThinkingLevel: () => "off" } as any,
+      async (): Promise<any> => ({ stopReason: "stop", usage: {} }),
+    );
+    warmer.bindContext(ctx);
+    warmer.setConfig({ ...DEFAULT_CONFIG, logToFile: true, minCachedTokens: 10 });
+    for (const payload of payloads) warmer.capturePayload(payload, ctx);
+    const events = readWarmEvents();
+    const rawKeys = payloads
+      .map((payload) => payload.prompt_cache_key)
+      .filter((key): key is string => typeof key === "string");
+    const jsonl = readFileSync(join(cwd, ".pi", "warm-cache.jsonl"), "utf8");
+    assert(
+      rawKeys.every((key) => !jsonl.includes(key)),
+      "the JSONL mirror must never contain a raw cache key",
+    );
+    const status = warmer.getStatusText();
+    assert(
+      rawKeys.every((key) => !status.includes(key)),
+      "status must never contain a raw cache key",
+    );
+    return { warmer, events };
+  };
+
+  const openaiCompletionsModel = {
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-completions",
+    baseUrl: "https://api.openai.com/v1",
+  } as any;
+  const openaiSecret = "openai-rotation-key-abc123";
+  const openaiFp = rotationHarness("openai-fp-session", openaiCompletionsModel, [
+    {
+      model: "gpt-5.6",
+      messages: [{ role: "user", content: "hi" }],
+      prompt_cache_key: openaiSecret,
+    },
+  ]);
+  assert(
+    /^[0-9a-f]{8}$/.test((openaiFp.warmer as any).anchor.cacheKeyFingerprint),
+    "first-party OpenAI completions capture must store the redacted fingerprint",
+  );
+  assert(
+    (openaiFp.warmer as any).anchor.cacheKeyFingerprint !== openaiSecret,
+    "the OpenAI anchor must never store the raw completions key",
+  );
+  const goSecret = "go-rotation-key-xyz789";
+  const goFp = rotationHarness("go-fp-session", goCompletionsModel, [
+    { ...goCompletionsPayload, prompt_cache_key: goSecret },
+  ]);
+  assert(
+    /^[0-9a-f]{8}$/.test((goFp.warmer as any).anchor.cacheKeyFingerprint),
+    "opencode-go completions capture must store the redacted fingerprint",
+  );
+  assert(
+    (goFp.warmer as any).anchor.cacheKeyFingerprint !== goSecret,
+    "the Go anchor must never store the raw completions key",
+  );
+
+  // xAI key-change gating pins. The gate requires provider === "xai" &&
+  // api === "openai-responses": xai responses rotation uses the xAI reason;
+  // xai completions rotation and opencode-go responses rotation use the
+  // generic "prefix changed" re-anchor with cacheKeyChanged=false.
+  const xaiResponsesModel = {
+    id: "grok-4.5",
+    provider: "xai",
+    api: "openai-responses",
+    baseUrl: "https://api.x.ai/v1",
+    compat: { sessionAffinityFormat: "openai", supportsLongCacheRetention: false },
+  } as any;
+  const xaiResponsesRotation = rotationHarness("xai-responses-rotation", xaiResponsesModel, [
+    {
+      model: "grok-4.5",
+      input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      prompt_cache_key: "xai-responses-key-alpha",
+    },
+    {
+      model: "grok-4.5",
+      input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      prompt_cache_key: "xai-responses-key-beta",
+    },
+  ]);
+  assert(
+    xaiResponsesRotation.warmer.getLatestRealTurnObservation()?.reason ===
+      "xAI best-effort prompt_cache_key changed",
+    "xai responses rotation must use the xAI reason",
+  );
+  const xaiCaptures = xaiResponsesRotation.events.filter((event) => event.event === "capture");
+  assert(
+    (xaiCaptures.at(-1) as any)?.cacheKeyChanged === true,
+    "xai responses rotation must set cacheKeyChanged=true",
+  );
+  assert(
+    (xaiCaptures.at(-1) as any)?.prefixChanged === true,
+    "xai responses rotation must re-anchor on the changed key",
+  );
+
+  const xaiCompletionsModel = {
+    id: "grok-4.5",
+    provider: "xai",
+    api: "openai-completions",
+    baseUrl: "https://api.x.ai/v1",
+  } as any;
+  const xaiCompletionsRotation = rotationHarness("xai-completions-rotation", xaiCompletionsModel, [
+    {
+      model: "grok-4.5",
+      messages: [{ role: "user", content: "hi" }],
+      prompt_cache_key: "xai-completions-key-alpha",
+    },
+    {
+      model: "grok-4.5",
+      messages: [{ role: "user", content: "hi" }],
+      prompt_cache_key: "xai-completions-key-beta",
+    },
+  ]);
+  assert(
+    xaiCompletionsRotation.warmer.getLatestRealTurnObservation()?.reason === "prefix changed",
+    "xai completions rotation must use the generic prefix-changed reason",
+  );
+  const xaiCompletionsCaptures = xaiCompletionsRotation.events.filter(
+    (event) => event.event === "capture",
+  );
+  assert(
+    (xaiCompletionsCaptures.at(-1) as any)?.cacheKeyChanged === false,
+    "xai completions rotation must keep cacheKeyChanged=false",
+  );
+  assert(
+    (xaiCompletionsCaptures.at(-1) as any)?.prefixChanged === true,
+    "xai completions rotation must still re-anchor via the generic path",
+  );
+
+  const goResponsesModel = {
+    id: "deepseek-v4-flash",
+    provider: "opencode-go",
+    api: "openai-responses",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  const goResponsesRotation = rotationHarness("go-responses-rotation", goResponsesModel, [
+    {
+      model: "deepseek-v4-flash",
+      input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      prompt_cache_key: "go-responses-key-alpha",
+    },
+    {
+      model: "deepseek-v4-flash",
+      input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      prompt_cache_key: "go-responses-key-beta",
+    },
+  ]);
+  assert(
+    goResponsesRotation.warmer.getLatestRealTurnObservation()?.reason === "prefix changed",
+    "opencode-go responses rotation must use the generic prefix-changed reason",
+  );
+  const goResponsesCaptures = goResponsesRotation.events.filter(
+    (event) => event.event === "capture",
+  );
+  assert(
+    (goResponsesCaptures.at(-1) as any)?.cacheKeyChanged === false,
+    "opencode-go responses rotation must keep cacheKeyChanged=false",
+  );
+  assert(
+    (goResponsesCaptures.at(-1) as any)?.prefixChanged === true,
+    "opencode-go responses rotation must re-anchor via the generic path",
+  );
+
+  // isXaiRoute() stays provider-keyed: an opencode-go grok-4.5 route is not
+  // xAI even when the model id matches a direct xAI best-effort model.
+  const goGrokCtx = makeWarmCtx("go-grok-route", {
+    provider: "opencode-go",
+    id: "grok-4.5",
+    api: "openai-responses",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  });
+  const goGrokWarmer = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    async (): Promise<any> => ({ stopReason: "stop", usage: {} }),
+  );
+  goGrokWarmer.bindContext(goGrokCtx);
+  assert(!goGrokWarmer.isXaiRoute(), "an opencode-go grok-4.5 route must not be xAI-keyed");
+  const xaiGrokCtx = makeWarmCtx("xai-grok-route", xaiResponsesModel);
+  const xaiGrokWarmer = new SessionWarmer(
+    { getThinkingLevel: () => "off" } as any,
+    async (): Promise<any> => ({ stopReason: "stop", usage: {} }),
+  );
+  xaiGrokWarmer.bindContext(xaiGrokCtx);
+  assert(xaiGrokWarmer.isXaiRoute(), "a direct xai grok-4.5 route must be xAI-keyed");
+
+  // Label-driven UI copy: Go best-effort waiting/hit lines render the Go label
+  // and never xAI; the " session" join and the title-case difference are
+  // snapshot-pinned. A past nextDueAt pins the wait label to the plan interval.
+  const goUiCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  const goUiCtx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, value: unknown) => goUiCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value: unknown) => goUiCalls.push({ kind: "status", value }),
+    },
+  } as any;
+  const goAnchor = {
+    cachedTokens: 128_000,
+    promptTokens: 128_000,
+    probeHitCount: 2,
+    probeMissCount: 0,
+    savingsKnown: true,
+    estimatedSavingsUsd: 0.12,
+    capability: { state: "verified" },
+    provider: "opencode-go",
+  } as any;
+  const goPlan = {
+    family: "opencode-go-plain",
+    intervalMs: 240_000,
+    ttlLabel: "best-effort probe cadence (~4m)",
+    waitLabel: "4m",
+    automaticWarm: true,
+    manualProbe: false,
+    cacheRetention: "short",
+  } as any;
+  renderWaitingUi(goUiCtx, { ...DEFAULT_CONFIG, showWidget: true }, goAnchor, goPlan, Date.now() - 60_000);
+  renderWarmHitUi(goUiCtx, { ...DEFAULT_CONFIG, showWidget: true }, goAnchor, goPlan, 128_000);
+  const goWidgets = goUiCalls
+    .filter((call) => call.kind === "widget")
+    .map((call) => call.value as string[]);
+  assert(
+    goWidgets[0]![0] === "⚡ OpenCode Go best-effort cache-warm wait · extension probe in 4m",
+    "Go waiting L1 must use the Go label with lowercase cache-warm",
+  );
+  assert(
+    goWidgets[0]![1] === "OpenCode Go best-effort cadence · ~128k prefix",
+    "Go waiting L2 must use the Go label cadence line",
+  );
+  assert(
+    goWidgets[0]![2].includes("OpenCode Go best-effort session est. $0.12 saved"),
+    "Go savings prefix must join the label with ' session'",
+  );
+  assert(
+    goWidgets[1]![0] === "⚡ OpenCode Go best-effort cache warm · extension probe hit · ~128k",
+    "Go hit L1 must use the Go label",
+  );
+  assert(
+    goWidgets[1]![1] === "Next extension probe in 4m · no fixed cache lifetime promised.",
+    "Go hit L2 must avoid the xAI lifetime wording",
+  );
+  const goUiText = goUiCalls
+    .flatMap((call) => (Array.isArray(call.value) ? call.value : [String(call.value)]))
+    .map(String)
+    .join(" ");
+  assert(!goUiText.includes("xAI"), "Go UI must never render the xAI label");
+  const goStatus = goUiCalls
+    .filter((call) => call.kind === "status")
+    .map((call) => String(call.value));
+  assert(
+    goStatus.some((status) => status.startsWith("OpenCode Go best-effort warm 4m ·")),
+    "Go status must carry the Go label prefix",
+  );
+
+  // xAI waiting/hit lines stay byte-identical when the same renderers compute
+  // the label from an xai-best-effort family.
+  const xaiPinCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  const xaiPinCtx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, value: unknown) => xaiPinCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value: unknown) => xaiPinCalls.push({ kind: "status", value }),
+    },
+  } as any;
+  const xaiPinAnchor = { ...goAnchor, provider: "xai" } as any;
+  const xaiPinPlan = {
+    ...goPlan,
+    family: "xai-best-effort",
+    ttlLabel: "xAI best-effort probe cadence",
+  } as any;
+  renderWaitingUi(xaiPinCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiPinAnchor, xaiPinPlan, Date.now() - 60_000);
+  renderWarmHitUi(xaiPinCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiPinAnchor, xaiPinPlan, 128_000);
+  const xaiPinWidgets = xaiPinCalls
+    .filter((call) => call.kind === "widget")
+    .map((call) => call.value as string[]);
+  assert(
+    xaiPinWidgets[0]![0] === "⚡ xAI best-effort cache-warm wait · extension probe in 4m",
+    "xai waiting L1 must stay byte-identical",
+  );
+  assert(
+    xaiPinWidgets[0]![1] === "xAI best-effort cadence · ~128k prefix",
+    "xai waiting L2 must stay byte-identical",
+  );
+  assert(
+    xaiPinWidgets[0]![2].includes("xAI best-effort session est. $0.12 saved"),
+    "xai savings prefix must stay byte-identical",
+  );
+  assert(
+    xaiPinWidgets[1]![0] === "⚡ xAI best-effort cache warm · extension probe hit · ~128k",
+    "xai hit L1 must stay byte-identical",
+  );
+  assert(
+    xaiPinWidgets[1]![1] === "Next extension probe in 4m · no fixed xAI cache lifetime promised.",
+    "xai hit L2 must keep its exact wording",
+  );
+  const xaiPinStatus = xaiPinCalls
+    .filter((call) => call.kind === "status")
+    .map((call) => String(call.value));
+  assert(
+    xaiPinStatus.some((status) => status.startsWith("xAI best-effort warm 4m ·")),
+    "xai status must stay byte-identical",
+  );
+
+  // An explicit non-xai label wins over "xai" in detail text (the
+  // post-promotion conflation path: a Go gateway error containing xai must not
+  // label the widget as xAI). Without a label, the sniff still applies.
+  const labelWinCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  const labelWinCtx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, value: unknown) => labelWinCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value: unknown) => labelWinCalls.push({ kind: "status", value }),
+    },
+  } as any;
+  renderFailureUi(
+    labelWinCtx,
+    { ...DEFAULT_CONFIG, showWidget: true },
+    "probe miss",
+    "gateway xai error: timeout",
+    undefined,
+    "OpenCode Go best-effort",
+  );
+  const labelWinText = labelWinCalls
+    .flatMap((call) => (Array.isArray(call.value) ? call.value : [String(call.value)]))
+    .map(String)
+    .join(" ");
+  assert(
+    !labelWinText.includes("xAI best-effort"),
+    "an explicit non-xai label must beat xai in detail text",
+  );
+  const sniffCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  const sniffCtx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, value: unknown) => sniffCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value: unknown) => sniffCalls.push({ kind: "status", value }),
+    },
+  } as any;
+  renderFailureUi(
+    sniffCtx,
+    { ...DEFAULT_CONFIG, showWidget: true },
+    "probe miss",
+    "gateway xai error: timeout",
+  );
+  const sniffText = sniffCalls
+    .flatMap((call) => (Array.isArray(call.value) ? call.value : [String(call.value)]))
+    .map(String)
+    .join(" ");
+  assert(
+    sniffText.includes("xAI best-effort"),
+    "the xai sniff must still apply when no label is given",
+  );
+
+  // Budget-dollar savings framing: the marker keys on the billing identity
+  // (provider === "opencode-go"), never on payload instrumentation.
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0.23,
+      savingsKnown: true,
+      pricingSource: "model",
+      provider: "opencode-go",
+      capability: {
+        state: "verified",
+        reason: "fixture",
+        automaticWarm: true,
+        manualProbe: false,
+      },
+    }) === "est. $0.23 saved (subscription budget-dollars)",
+    "Go positive savings must carry the budget-dollars phrase",
+  );
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: -0.0023,
+      savingsKnown: true,
+      pricingSource: "model",
+      provider: "opencode-go",
+    }).includes("(subscription budget-dollars)"),
+    "Go negative-net savings must carry the budget-dollars phrase",
+  );
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0.23,
+      savingsKnown: true,
+      pricingSource: "model",
+      provider: "openai",
+    }) === "est. $0.23 saved",
+    "non-Go routes must stay byte-identical",
+  );
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0,
+      savingsKnown: false,
+      pricingSource: "unknown",
+      provider: "opencode-go",
+    }) === "n/a (no model pricing)",
+    "n/a branches never carry the budget-dollars phrase",
+  );
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0,
+      savingsKnown: false,
+      pricingSource: "unknown",
+      capability: {
+        state: "unverified",
+        reason: "fixture",
+        automaticWarm: false,
+        manualProbe: true,
+      },
+      provider: "opencode-go",
+    }) === "n/a (unverified route)",
+    "unverified n/a branch never carries the budget-dollars phrase",
+  );
+  assert(
+    formatSavingsSummary({
+      probeHitCount: 2,
+      probeMissCount: 1,
+      totalEstimatedSavedUsd: 0.0045,
+      totalProbeCostUsd: 0.01,
+      savingsKnown: true,
+      pricingSource: "model",
+      provider: "opencode-go",
+    }) ===
+      "probeHits=2 probeMisses=1 totalEstimatedSaved=$0.0045 totalProbeCost=$0.01 net=-$0.0055 pricingSource=model savingsUnit=budget-dollars",
+    "Go summary must append savingsUnit=budget-dollars as the last field",
+  );
+  assert(
+    formatSavingsSummary({
+      probeHitCount: 2,
+      probeMissCount: 1,
+      totalEstimatedSavedUsd: 0.0045,
+      totalProbeCostUsd: 0.01,
+      savingsKnown: true,
+      pricingSource: "model",
+      provider: "openai",
+    }) ===
+      "probeHits=2 probeMisses=1 totalEstimatedSaved=$0.0045 totalProbeCost=$0.01 net=-$0.0055 pricingSource=model",
+    "non-Go summary must stay byte-identical",
+  );
+  assert(
+    formatSavingsSummary({
+      probeHitCount: 2,
+      probeMissCount: 1,
+      totalEstimatedSavedUsd: 0.0045,
+      totalProbeCostUsd: 0.01,
+      savingsKnown: true,
+      pricingSource: "model",
+    }) ===
+      "probeHits=2 probeMisses=1 totalEstimatedSaved=$0.0045 totalProbeCost=$0.01 net=-$0.0055 pricingSource=model",
+    "missing provider must emit no savingsUnit marker",
+  );
+
   rmSync(cwd, { recursive: true, force: true });
 }
 
