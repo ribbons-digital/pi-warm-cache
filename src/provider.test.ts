@@ -1774,6 +1774,93 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   warmer.dispose();
 }
 
+// 11a) Foreign-instrumentation refusal survives the prefix-change re-anchor
+// path: a clean opencode-go completions turn followed by a turn carrying
+// injected cache_control must keep the refusal on the new anchor, so /warm now
+// refuses to replay the tampered body and never calls the provider.
+{
+  const notifications: Array<{ message: string; level: string }> = [];
+  const calls: unknown[] = [];
+  const completeStub = async (args: unknown): Promise<any> => {
+    calls.push(args);
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const goModel = {
+    id: "deepseek-v4-flash",
+    provider: "opencode-go",
+    api: "openai-completions",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model: goModel,
+    hasUI: true,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "go-session" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({
+    ...DEFAULT_CONFIG,
+    minCachedTokens: 10,
+    intervalMs: 60_000,
+    maxConsecutiveFailures: 3,
+  });
+
+  warmer.capturePayload(
+    { model: "deepseek-v4-flash", messages: [{ role: "user", content: "hello" }] },
+    ctx,
+  );
+  assert(warmer.getLifecycleState() === "anchored", "a clean Go completions turn should anchor");
+
+  // The rewriter injects cache_control into the next turn. The refusal must
+  // survive the prefix-change re-anchor and disable the manual probe.
+  warmer.capturePayload(
+    {
+      model: "deepseek-v4-flash",
+      messages: [
+        { role: "user", content: "hello" },
+        {
+          role: "user",
+          content: [{ type: "text", text: "injected", cache_control: { type: "ephemeral" } }],
+        },
+      ],
+    },
+    ctx,
+  );
+  const refusedCapability = warmer.getCapability();
+  assert(
+    refusedCapability.reason.includes("foreign instrumentation"),
+    "the re-anchored capability must keep the refusal reason",
+  );
+  assert(
+    !refusedCapability.manualProbe,
+    "a cache_control-carrying completions turn must keep manualProbe disabled",
+  );
+  const refused = await warmer.warmNow(ctx);
+  assert(refused.unavailable === true, "a refused Go completions payload must not probe");
+  assert(
+    refused.capabilityReason?.includes("cache_control"),
+    "the refusal reason must be exposed on the /warm now result",
+  );
+  assert(calls.length === 0, "a refused Go completions payload must never reach the provider");
+  warmer.dispose();
+}
+
 // 12) Unverified routes remain manual-only: no timer, no verified savings, one safe probe.
 {
   let calls = 0;
