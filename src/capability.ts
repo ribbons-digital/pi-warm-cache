@@ -297,14 +297,26 @@ function resolveProxyRouteCapability(
     return capability("unverified", foreignReason);
   }
 
+  // The Go family is payload-driven. The retained family never probes:
+  // manualProbe stays false so /warm now cannot fire against a payload that
+  // already requests 24h retention on the wire. The plan and the warmer both
+  // derive manual gating from this flag, so they agree with this decision.
+  const goFamily =
+    model.provider === "opencode-go" ? classifyOpencodeGoFamily(payload) : null;
+  if (goFamily === "opencode-go-retained") {
+    return capability(
+      "unverified",
+      `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route); the captured payload requests 24h retention on the wire, so no keepalive or manual probe is scheduled`,
+    );
+  }
+
   // The plain family carries a degraded hint steering the user onto the keyed
   // 24h retention path where keepalive is not needed. The hint folds into
   // capability.reason, which already renders in the banner and notify paths.
   // Family classification is payload-driven and independent of capability
   // state, so a registered Go route without instrumentation shows the hint.
   const plainHint =
-    model.provider === "opencode-go" &&
-    classifyOpencodeGoFamily(payload) === "opencode-go-plain"
+    goFamily === "opencode-go-plain"
       ? "; set Pi cache retention to long for keyed 24h Go caching"
       : "";
 

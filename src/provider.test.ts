@@ -974,6 +974,44 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       retainedStrategy.ttlLabel.includes("no keepalive scheduled"),
       "retained label must explain that no keepalive is scheduled",
     );
+    const retainedCapability = resolveProviderCapability(goAnthropicFamilyModel, {
+      model: "qwen3.7-max",
+      prompt_cache_retention: "24h",
+      messages: [],
+      system: [],
+    });
+    assert(
+      !retainedCapability.manualProbe,
+      "the retained family must disable the manual probe while unverified",
+    );
+    assert(
+      !supportsManualProbe(goAnthropicFamilyModel, {
+        model: "qwen3.7-max",
+        prompt_cache_retention: "24h",
+        messages: [],
+        system: [],
+      }),
+      "supportsManualProbe must refuse a retained payload",
+    );
+    assert(
+      retainedStrategy.manualProbe === false,
+      "the retained strategy must not permit a manual probe",
+    );
+    assert(
+      resolveProviderCapability(goAnthropicFamilyModel, {
+        model: "qwen3.7-max",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } },
+            ],
+          },
+        ],
+        system: [],
+      }).manualProbe,
+      "marker families must keep the manual probe escape hatch",
+    );
 
     // Marker and plain families surface their cadence label even while
     // unverified. No Go family renders a numeric lifetime, and no timer is
@@ -2248,6 +2286,75 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     JSON.stringify(shaped.messages) === JSON.stringify(captured.messages),
     "the probe must preserve the exact captured prefix",
   );
+  warmer.dispose();
+}
+
+// 11c) The retained family never probes end to end: /warm now on a payload
+// carrying prompt_cache_retention "24h" is refused before any provider request,
+// and the plan and the warmer agree because both derive manual gating from
+// capability.manualProbe.
+{
+  let calls = 0;
+  const goModel = {
+    id: "qwen3.7-max",
+    provider: "opencode-go",
+    api: "anthropic-messages",
+    baseUrl: "https://opencode.ai/zen/go",
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: () => undefined,
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model: goModel,
+    hasUI: false,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "go-retained-session" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const completeStub = async (): Promise<any> => {
+    calls += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
+  warmer.capturePayload(
+    {
+      model: "qwen3.7-max",
+      prompt_cache_retention: "24h",
+      system: [{ type: "text", text: "sys" }],
+      messages: [{ role: "user", content: "hi" }],
+    },
+    ctx,
+  );
+  const retainedCapability = warmer.getCapability();
+  assert(
+    retainedCapability.state === "unverified" && !retainedCapability.manualProbe,
+    "the retained family must disable the manual probe while unverified",
+  );
+  const retainedPlan = (warmer as any).plan as { family: string; manualProbe: boolean };
+  assert(
+    retainedPlan.family === "opencode-go-retained" && retainedPlan.manualProbe === false,
+    "the retained plan must agree that no manual probe is available",
+  );
+  const retainedResult = await warmer.warmNow(ctx);
+  assert(retainedResult.unavailable === true, "retained must refuse /warm now");
+  assert(
+    String(retainedResult.error).includes("never probes"),
+    "the retained refusal must explain that the family never probes",
+  );
+  assert(calls === 0, "retained must never reach the provider");
   warmer.dispose();
 }
 

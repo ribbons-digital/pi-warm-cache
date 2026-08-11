@@ -1460,7 +1460,10 @@ export class SessionWarmer {
     }
 
     if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
-      const detail = "captured payload shape is not safe for an unverified manual probe";
+      const detail =
+        anchor.cacheFamily === "opencode-go-retained"
+          ? "the retained OpenCode Go family never probes; the captured payload requests 24h retention on the wire"
+          : "captured payload shape is not safe for an unverified manual probe";
       this.recordAttempt(reason, false, detail);
       this.clearCapabilityUi(ctx);
       return buildWarmResult({

@@ -72,7 +72,7 @@ The `anthropic-messages` transport carries `cache_control` by design and is neve
 
 OpenCode Go cache families are payload-driven.
 The extension classifies each captured payload by the cache instrumentation actually observed on it, independent of capability state, so an unverified Go route still surfaces its family, cadence label, and hints in diagnostics.
-`prompt_cache_retention: "24h"` on the wire selects the retained family, which never schedules a probe.
+`prompt_cache_retention: "24h"` on the wire selects the retained family, which never schedules a probe and also disables the manual probe: a payload that already requests 24h retention on the wire is never probed, because keepalive is not needed.
 `cache_control` with `ttl: "1h"` selects long-marker; any other `cache_control` selects short-marker; no instrumentation selects plain.
 When retention and markers co-occur, retention wins because it is the stronger lifetime signal.
 A keyed-but-unretained payload (`prompt_cache_key` without `prompt_cache_retention`) is not a separate family and behaves like plain.
@@ -97,7 +97,7 @@ Routes without an explicit registered capability are rejected before the provide
 
 - It does not warm a prefix below `minCachedTokens` or make a small prompt more valuable to cache.
 - It does not enable automatic warming for unsupported, proxy, or unverified routes.
-- Manual-only routes can use one safe `/warm now` probe, but they do not receive a timer or a verified savings claim.
+- Manual-only routes can use one safe `/warm now` probe (except the retained OpenCode Go family, which never probes), but they do not receive a timer or a verified savings claim.
 - Registered OpenRouter and OpenCode Go routes remain unverified even when their proxy payload reports cache usage.
 - xAI best-effort warming does not promise a provider TTL, a cache hit, or a fixed saving amount.
 - It does not preserve an old anchor after compaction, model or thinking-level changes, branch changes, or other prefix drift.
@@ -346,7 +346,7 @@ interface WarmCacheConfig {
 13. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
 14. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 15. **Foreign instrumentation on an OpenCode Go completions payload** - refuse replay when `cache_control` appears without `cacheControlFormat: "anthropic"` compat, because the route cannot legally carry it.
-16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family never probes and stays unverified; the plain family carries the degraded retention hint in its reason.
+16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family never probes (including `/warm now`) and stays unverified; the plain family carries the degraded retention hint in its reason.
 
 ## Package layout
 
