@@ -59,7 +59,7 @@ Repeated no-read/no-write probes stop warming and request a new real-turn anchor
 Other direct xAI models on the first-party xAI endpoint can use one clearly labelled manual probe when their captured payload is safe to replay.
 They do not receive an automatic timer or a verified savings claim.
 
-Selected OpenRouter and OpenCode Go routes are also manual-only.
+Selected OpenRouter routes and the unverified OpenCode Go families are manual-only; the verified OpenCode Go families resolve verified with the probe behavior in the verification table below.
 Each route must match its per-api registration in the proxy route registry: the registered API transport, the exact registered baseUrl path, and (for OpenRouter) compatible `sessionAffinityFormat: "openrouter"` routing metadata.
 OpenCode Go registers three API shapes with exact endpoints: `anthropic-messages` at `https://opencode.ai/zen/go`, and `openai-completions` and `openai-responses` at `https://opencode.ai/zen/go/v1`.
 A longer path never matches a shorter registered path.
@@ -72,12 +72,12 @@ The `anthropic-messages` transport carries `cache_control` by design and is neve
 
 OpenCode Go cache families are payload-driven.
 The extension classifies each captured payload by the cache instrumentation actually observed on it, independent of capability state, so an unverified Go route still surfaces its family, cadence label, and hints in diagnostics.
-`prompt_cache_retention: "24h"` on the wire selects the retained family, which never schedules a probe and also disables the manual probe: a payload that already requests 24h retention on the wire is never probed, because keepalive is not needed.
+`prompt_cache_retention: "24h"` on the wire selects the retained family, which is verified as no-keepalive: it never schedules a probe and also disables the manual probe, because a payload that already requests 24h retention on the wire never needs keepalive.
 `cache_control` with `ttl: "1h"` selects long-marker; any other `cache_control` selects short-marker; no instrumentation selects plain.
 When retention and markers co-occur, retention wins because it is the stronger lifetime signal.
 A keyed-but-unretained payload (`prompt_cache_key` without `prompt_cache_retention`) is not a separate family and behaves like plain.
-The plain family carries a degraded hint in its status line to set Pi cache retention to long.
-No OpenCode Go family renders a numeric lifetime; only best-effort probe cadence wording is used until an e2e evidence record exists.
+The plain family carries a degraded hint in its status line to set Pi cache retention to long while the pair is unverified.
+No OpenCode Go family renders a numeric lifetime; the cadences are best-effort probe cadences, not provider TTL claims.
 
 ### Unsupported routes
 
@@ -96,9 +96,10 @@ Routes without an explicit registered capability are rejected before the provide
 ### When this does not help
 
 - It does not warm a prefix below `minCachedTokens` or make a small prompt more valuable to cache.
-- It does not enable automatic warming for unsupported, proxy, or unverified routes.
-- Manual-only routes can use one safe `/warm now` probe (except the retained OpenCode Go family, which never probes), but they do not receive a timer or a verified savings claim.
-- Registered OpenRouter and OpenCode Go routes remain unverified even when their proxy payload reports cache usage.
+- It does not enable automatic warming for unsupported or unverified routes.
+- Unverified manual-only routes can use one safe `/warm now` probe, but they do not receive a timer or a verified savings claim.
+- The verified no-keepalive OpenCode Go families (retained, and completions plain) never arm a timer: the retained family refuses `/warm now` entirely, while completions plain keeps it for cold-cache protection and TTL uncertainty.
+- Registered OpenRouter routes stay unverified. OpenCode Go families with a recorded e2e evidence record are verified; families without a record (anthropic long-marker and plain-fallback) stay unverified.
 - xAI best-effort warming does not promise a provider TTL, a cache hit, or a fixed saving amount.
 - It does not preserve an old anchor after compaction, model or thinking-level changes, branch changes, or other prefix drift.
 - It does not invent a savings amount when the active model has no usable pricing data.
@@ -261,17 +262,34 @@ A provider error is reported as an error and does not increment `probeMisses`.
 
 ## Keepalive strategies
 
-| Strategy | Cache behavior | Default interval | Cache retention |
-|---|---|---:|---|
-| `anthropic-short` | 5-minute sliding cache window | about 4 minutes | `short` |
-| `anthropic-long` | 1-hour cache markers already present on the wire | about 48 minutes | `long` |
-| `openai-explicit` | 30-minute explicit prompt-cache mode | about 24 minutes | `short` |
-| `openai-implicit` | older in-memory idle window | about 6.4 minutes | `short` |
-| `xai-best-effort` | no fixed provider TTL claim | 4-minute heuristic | `short` plus captured key |
-| `opencode-go-retained` | 24h retention requested on the wire | no keepalive scheduled | `none` |
-| `opencode-go-long-marker` | anthropic-style `cache_control` with `ttl: "1h"` | about 48 minutes (best-effort) | `long` |
-| `opencode-go-short-marker` | `cache_control` ephemeral without ttl | about 4 minutes (best-effort) | `short` |
-| `opencode-go-plain` | no cache instrumentation | about 4 minutes (best-effort) | `short` |
+| Strategy | Cache behavior | Default interval | Cache retention | State |
+|---|---|---:|---|---|---|
+| `anthropic-short` | 5-minute sliding cache window | about 4 minutes | `short` | verified |
+| `anthropic-long` | 1-hour cache markers already present on the wire | about 48 minutes | `long` | verified |
+| `openai-explicit` | 30-minute explicit prompt-cache mode | about 24 minutes | `short` | verified |
+| `openai-implicit` | older in-memory idle window | about 6.4 minutes | `short` | verified |
+| `xai-best-effort` | no fixed provider TTL claim | 4-minute heuristic | `short` plus captured key | verified |
+| `opencode-go-retained` | 24h retention requested on the wire | no keepalive scheduled | `none` | verified (no-keepalive) |
+| `opencode-go-long-marker` | anthropic-style `cache_control` with `ttl: "1h"` | about 48 minutes (best-effort) | `long` | unverified |
+| `opencode-go-short-marker` | `cache_control` ephemeral without ttl | about 4 minutes (best-effort) | `short` | verified |
+| `opencode-go-plain` | no cache instrumentation | about 4 minutes (best-effort) | `short` | verified on completions and responses; unverified on anthropic plain-fallback |
+
+### OpenCode Go verification state
+
+Each promoted (api, family) pair cites its e2e evidence record (pi-ai 0.83.0, campaign date 2026-08-12).
+The records live in `docs/evidence/`.
+
+| (api, family) | Tested model | Verdict | State |
+|---|---|---|---|
+| (anthropic-messages, short-marker) | minimax-m3 | four-part pass, control cacheRead = 0 | verified, probes at ~4m |
+| (anthropic-messages, long-marker) | - | no e2e campaign slot | unverified |
+| (anthropic-messages, plain-fallback) | - | no evidence record | unverified |
+| (openai-completions, plain) | deepseek-v4-flash | parts 1-3 pass; part 4 not satisfied (native TTL > 130 min) | verified no-keepalive; `/warm now` kept |
+| (openai-completions, retained) | deepseek-v4-flash | retained-wire observation | verified no-keepalive |
+| (openai-responses, plain) | grok-4.5 | four-part pass, control decayed | verified, probes at ~4m, key gate |
+| (openai-responses, retained) | grok-4.5 | retained-wire observation | verified no-keepalive |
+
+Evidence pointers: `docs/evidence/anthropic-messages-short-marker.md`, `docs/evidence/openai-completions-plain.md`, `docs/evidence/openai-responses-plain-keyed.md`, `docs/evidence/retained-wire.md`.
 
 ### Spend guardrails
 
@@ -284,10 +302,10 @@ The `spend=` token extends the ceiling to any provider; `spend=0` disables it fo
 Raising or disabling the ceiling resumes a soft-blocked session immediately; lowering it keeps the block until the next real turn.
 A real turn resets the campaign ledger; both guards are scoped to timer fires only, so `/warm now` always bypasses them.
 
-The OpenCode Go families resolve from the captured payload, not from model metadata, and never render a numeric lifetime until an e2e evidence record exists.
-All four families start unverified and manual-only, so no Go route arms a timer today; the listed cadences describe what each family would do after promotion to verified.
-Their intervals are best-effort probe cadences, not provider TTL claims.
-The retained family never probes and stays unverified, so its row lists no keepalive.
+The OpenCode Go families resolve from the captured payload, not from model metadata, and never render a numeric lifetime; the intervals are best-effort probe cadences, not provider TTL claims.
+Families with a recorded e2e evidence record are verified: (anthropic-messages, short-marker) and (openai-responses, plain) probe at ~4m, and (openai-completions, plain) plus the retained family are verified no-keepalive (no timer; `/warm now` stays available on completions plain for cold-cache protection and TTL uncertainty).
+Families without a record (anthropic long-marker and plain-fallback) stay unverified and manual-only.
+The retained family never probes, so its row lists no keepalive.
 
 The existing `interval` configuration overrides the default interval for every strategy, including xAI best-effort probes.
 
@@ -365,7 +383,7 @@ interface WarmCacheConfig {
 13. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
 14. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 15. **Foreign instrumentation on an OpenCode Go completions payload** - refuse replay when `cache_control` appears without `cacheControlFormat: "anthropic"` compat, because the route cannot legally carry it.
-16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family never probes (including `/warm now`) and stays unverified; the plain family carries the degraded retention hint in its reason.
+16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family is verified as no-keepalive and never probes (including `/warm now`); the verified completions-plain pair is also no-keepalive but keeps `/warm now`; the plain family carries the degraded retention hint in its reason only while its pair is unverified.
 17. **Interleaved sessions and the shared spend ledger** - the probe-spend ledger is module-level and keyed per provider, so when one session on the same provider takes real turns while another session idles, the shared campaign counter never accumulates for the idle session. The idle cutoff still bounds the idle session's probes, and the per-instance soft block stops it once its own probes trip the ceiling. Revisit before Slice 8.
 
 ## Package layout

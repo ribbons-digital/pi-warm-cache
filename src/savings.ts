@@ -85,6 +85,12 @@ export type SavingsLabelInput = Pick<
 export function formatSavingsLabel(anchor: SavingsLabelInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
+  // Verified-no-probe families (opencode-go retained, and the verified
+  // completions-plain no-keepalive treatment) perform no keepalive and claim
+  // no savings, even when a manual probe happens to hit.
+  if (anchor.capability?.state === "verified" && !anchor.capability.automaticWarm) {
+    return "n/a (no keepalive scheduled)";
+  }
   if (!anchor.savingsKnown) return "n/a (no model pricing)";
   const budgetDollars = anchor.provider === "opencode-go";
   const suffix = budgetDollars ? " (subscription budget-dollars)" : "";
@@ -121,6 +127,9 @@ export type SavingsSummaryInput = Pick<
 export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
+  if (anchor.capability?.state === "verified" && !anchor.capability.automaticWarm) {
+    return "n/a (no keepalive scheduled)";
+  }
 
   const amount = (value: number): string =>
     anchor.savingsKnown ? formatUsd(value) : "n/a";

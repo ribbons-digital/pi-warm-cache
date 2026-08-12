@@ -6,7 +6,8 @@ The override never ships as a verified path and is removed after the campaign.
 Status: executed 2026-08-12 with the live Go account and pi-ai 0.83.0.
 Verdicts: (anthropic-messages, short-marker) and (openai-responses, plain with key gate) pass all four parts; (openai-completions, plain) passes parts 1-3 and part 4 is not satisfied because the native completions cache TTL exceeds 130 min, so keepalive causality is not demonstrated on that route.
 
-The verification-mode override is still in the code (uncommitted, branch slice7-verification-campaign) and must be removed after the campaign per the spec.
+The temporary verification-mode override was removed from the code after the campaign per the spec and never ships as a verified path (the code contains no verification-mode override today).
+Slice 8 promotes the recorded pairs to verified as data changes citing these records.
 
 ## Evidence gate (four parts, per pair)
 

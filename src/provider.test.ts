@@ -38,6 +38,7 @@ import {
   OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
   payloadHasAnthropicLongTtl,
   payloadHasCacheControl,
+  PROXY_ROUTE_REGISTRY,
   supportsManualProbe,
   XAI_BEST_EFFORT_INTERVAL_MS,
   resolveCacheFamily,
@@ -594,17 +595,60 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     for (const model of goModels) {
       goApiCounts[model.api] = (goApiCounts[model.api] ?? 0) + 1;
       const capability = resolveProviderCapability(model);
-      assert(
-        capability.state === "unverified",
-        `opencode-go ${model.api}/${model.id} should use the manual-only tier, got ${capability.state}`,
-      );
-      assert(!capability.automaticWarm, `opencode-go ${model.id} must never auto-warm`);
-      assert(capability.manualProbe, `opencode-go ${model.id} should permit manual probes`);
-      assert(
-        capability.reason.includes("manual-only") &&
-          capability.reason.includes("savings are n/a"),
-        `opencode-go ${model.id} reason must explain the safety and savings limits`,
-      );
+      if (model.api === "anthropic-messages") {
+        // (anthropic-messages, plain-fallback) has no e2e evidence record and
+        // stays unverified with the degraded retention hint.
+        assert(
+          capability.state === "unverified",
+          `opencode-go ${model.api}/${model.id} should stay unverified (plain-fallback), got ${capability.state}`,
+        );
+        assert(!capability.automaticWarm, `opencode-go ${model.id} must never auto-warm`);
+        assert(capability.manualProbe, `opencode-go ${model.id} should permit manual probes`);
+        assert(
+          capability.reason.includes("manual-only") &&
+            capability.reason.includes("savings are n/a"),
+          `opencode-go ${model.id} reason must explain the safety and savings limits`,
+        );
+      } else if (model.api === "openai-completions") {
+        // (openai-completions, plain) is verified as no-keepalive: the e2e
+        // control showed the native completions cache TTL exceeds 130 min,
+        // so the timer adds no measurable benefit within the envelope.
+        assert(
+          capability.state === "verified",
+          `opencode-go ${model.api}/${model.id} should resolve verified (completions plain), got ${capability.state}`,
+        );
+        assert(
+          !capability.automaticWarm,
+          `opencode-go ${model.id} verified no-keepalive must not auto-warm`,
+        );
+        assert(
+          !capability.manualProbe,
+          `opencode-go ${model.id} verified routes do not use the unverified manual-probe flag`,
+        );
+        assert(
+          capability.reason.includes("verified") &&
+            capability.reason.includes("keepalive is not needed"),
+          `opencode-go ${model.id} reason must state the verified no-keepalive claim`,
+        );
+      } else {
+        // (openai-responses, plain) is verified with probing at ~4m cadence.
+        assert(
+          capability.state === "verified",
+          `opencode-go ${model.api}/${model.id} should resolve verified (responses plain), got ${capability.state}`,
+        );
+        assert(
+          capability.automaticWarm,
+          `opencode-go ${model.id} verified responses route should auto-warm`,
+        );
+        assert(
+          !capability.manualProbe,
+          `opencode-go ${model.id} verified routes do not use the unverified manual-probe flag`,
+        );
+        assert(
+          capability.reason.includes("verified"),
+          `opencode-go ${model.id} reason must state the verified claim`,
+        );
+      }
       const expectedPath = model.api === "anthropic-messages" ? "/zen/go" : "/zen/go/v1";
       assert(
         model.baseUrl === `https://opencode.ai${expectedPath}`,
@@ -626,12 +670,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       compat: { sessionAffinityFormat: "openai-nosession" },
     } as any;
     assert(
-      resolveProviderCapability(goGrok).state === "unverified",
-      "the responses model must resolve through its registered path",
+      resolveProviderCapability(goGrok).state === "verified",
+      "the responses model must resolve verified through its registered path",
     );
     const goGrokTrailingSlash = { ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/" } as any;
     assert(
-      resolveProviderCapability(goGrokTrailingSlash).state === "unverified",
+      resolveProviderCapability(goGrokTrailingSlash).state === "verified",
       "a trailing slash must normalize to the registered path",
     );
     const goGrokExtraPath = { ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/extra" } as any;
@@ -747,13 +791,35 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       model: "deepseek-v4-flash",
       messages: [{ role: "user", content: "hi" }],
     };
+    // A clean completions payload is verified as no-keepalive: capability and
+    // plan agree that no timer arms. Verified routes do not need the
+    // unverified manual-probe escape hatch; /warm now is the probe path.
+    const cleanCompletionsCapability = resolveProviderCapability(goCompletions, goCompletionsClean);
     assert(
-      canManualProbe(goCompletions, goCompletionsClean),
-      "a clean completions payload still permits a manual probe",
+      cleanCompletionsCapability.state === "verified" &&
+        !cleanCompletionsCapability.automaticWarm &&
+        !cleanCompletionsCapability.manualProbe,
+      "a clean completions payload must resolve verified-no-keepalive",
+    );
+    const cleanCompletionsStrategy = resolveStrategy(
+      goCompletions,
+      DEFAULT_CONFIG,
+      goCompletionsClean,
     );
     assert(
-      supportsManualProbe(goCompletions),
-      "supportsManualProbe without a payload must stay permissive for a registered manual-only route",
+      cleanCompletionsStrategy.family === "opencode-go-plain" &&
+        cleanCompletionsStrategy.intervalMs === null &&
+        !cleanCompletionsStrategy.automaticWarm &&
+        !cleanCompletionsStrategy.manualProbe,
+      "the verified completions-plain plan must agree with the capability: no timer",
+    );
+    assert(
+      !canManualProbe(goCompletions, goCompletionsClean),
+      "verified routes do not use the unverified manual-probe escape hatch; /warm now is the probe path",
+    );
+    assert(
+      !supportsManualProbe(goCompletions),
+      "supportsManualProbe is the unverified-route escape hatch only",
     );
 
     // Nested markers deep in a completions payload are refused: the deep-walk
@@ -962,7 +1028,8 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     );
 
     // The retained family never schedules a probe: intervalMs null and no
-    // automatic warming from day one, independent of capability state.
+    // automatic warming even while verified. Verified no-probe is legal only
+    // through the explicit automaticWarm override on capability().
     const retainedStrategy = resolveStrategy(
       goAnthropicFamilyModel,
       DEFAULT_CONFIG,
@@ -970,13 +1037,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     );
     assert(
       retainedStrategy.family === "opencode-go-retained",
-      "a retained payload must resolve the retained family even while unverified",
+      "a retained payload must resolve the retained family",
     );
     assert(retainedStrategy.intervalMs === null, "retained must never schedule a probe");
     assert(!retainedStrategy.automaticWarm, "retained must never auto-warm");
     assert(
-      retainedStrategy.ttlLabel.includes("no keepalive scheduled"),
-      "retained label must explain that no keepalive is scheduled",
+      retainedStrategy.ttlLabel.includes("keepalive not needed"),
+      "retained label must state that keepalive is not needed",
     );
     const retainedCapability = resolveProviderCapability(goAnthropicFamilyModel, {
       model: "qwen3.7-max",
@@ -985,8 +1052,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       system: [],
     });
     assert(
+      retainedCapability.state === "verified" && !retainedCapability.automaticWarm,
+      "the retained family must resolve verified-no-probe",
+    );
+    assert(
       !retainedCapability.manualProbe,
-      "the retained family must disable the manual probe while unverified",
+      "the retained family must disable the manual probe even while verified",
     );
     assert(
       !supportsManualProbe(goAnthropicFamilyModel, {
@@ -1063,7 +1134,16 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       shortMarkerStrategy.family === "opencode-go-short-marker",
       "short-marker family must resolve",
     );
-    assert(shortMarkerStrategy.intervalMs === null, "unverified short-marker must not arm a timer");
+    // (anthropic-messages, short-marker) is verified by e2e evidence, so the
+    // strategy arms the ~4m best-effort cadence.
+    assert(
+      shortMarkerStrategy.intervalMs === 4 * 60_000,
+      "verified short-marker must arm the ~4m best-effort cadence",
+    );
+    assert(
+      shortMarkerStrategy.automaticWarm,
+      "verified short-marker must auto-warm",
+    );
     assert(
       shortMarkerStrategy.ttlLabel.includes("best-effort probe cadence (~4m)"),
       "short-marker must show the best-effort cadence label",
@@ -1141,6 +1221,183 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       !hasStableResponsesCacheKey({ model: "grok-4.5", input: [{ role: "user", content: "hi" }] }),
       "a responses payload without a key must fail the generalized key predicate",
     );
+  }
+
+  // Slice 8: promoted (api, family) pairs. The per-pair verification flips
+  // the auditable registry entries (evidence pointer + date); the resolved
+  // capability and the plan must stay in agreement with those entries.
+  {
+    const goAnthropicFamilyModel = {
+      id: "qwen3.7-max",
+      provider: "opencode-go",
+      api: "anthropic-messages",
+      baseUrl: "https://opencode.ai/zen/go",
+    } as any;
+
+    // (anthropic-messages, short-marker) is verified with probing at ~4m.
+    const shortMarkerCapability = resolveProviderCapability(goAnthropicFamilyModel, {
+      model: "qwen3.7-max",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+        },
+      ],
+      system: [],
+    });
+    assert(
+      shortMarkerCapability.state === "verified" &&
+        shortMarkerCapability.automaticWarm &&
+        !shortMarkerCapability.manualProbe,
+      "verified short-marker must auto-warm with no unverified manual-probe flag",
+    );
+    assert(
+      shortMarkerCapability.reason.includes("four-part pass"),
+      "the verified short-marker reason must cite the e2e verdict",
+    );
+
+    // (openai-responses, plain) is verified, and the automatic-eligibility
+    // key gate still blocks an unkeyed payload at the plan level.
+    const goResponsesModel = {
+      id: "grok-4.5",
+      provider: "opencode-go",
+      api: "openai-responses",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    } as any;
+    const unkeyedResponses = { model: "grok-4.5", input: [{ role: "user", content: "hi" }] };
+    const keyedResponses = {
+      model: "grok-4.5",
+      input: [{ role: "user", content: "hi" }],
+      prompt_cache_key: "go-session-1",
+    };
+    const responsesCapability = resolveProviderCapability(goResponsesModel, keyedResponses);
+    assert(
+      responsesCapability.state === "verified" && responsesCapability.automaticWarm,
+      "verified responses-plain must auto-warm",
+    );
+    const keyedResponsesStrategy = resolveStrategy(goResponsesModel, DEFAULT_CONFIG, keyedResponses);
+    assert(
+      keyedResponsesStrategy.intervalMs === 4 * 60_000 && keyedResponsesStrategy.automaticWarm,
+      "a keyed responses payload must arm the ~4m cadence",
+    );
+    const unkeyedResponsesStrategy = resolveStrategy(
+      goResponsesModel,
+      DEFAULT_CONFIG,
+      unkeyedResponses,
+    );
+    assert(
+      unkeyedResponsesStrategy.intervalMs === null && !unkeyedResponsesStrategy.automaticWarm,
+      "the responses key gate must still block an unkeyed payload",
+    );
+
+    // (openai-completions, plain) is verified as no-keepalive: capability and
+    // plan agree that no timer arms, and the manual /warm now probe path is
+    // covered by the end-to-end block 11d below.
+    const goCompletionsModel = {
+      id: "deepseek-v4-flash",
+      provider: "opencode-go",
+      api: "openai-completions",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    } as any;
+    const completionsCapability = resolveProviderCapability(goCompletionsModel, {
+      model: "deepseek-v4-flash",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert(
+      completionsCapability.state === "verified" &&
+        !completionsCapability.automaticWarm &&
+        !completionsCapability.manualProbe,
+      "verified completions-plain must be no-keepalive with no unverified manual-probe flag",
+    );
+    assert(
+      completionsCapability.reason.includes("part 4 not satisfied"),
+      "the verified completions-plain reason must state part 4 honestly",
+    );
+    const completionsStrategy = resolveStrategy(goCompletionsModel, DEFAULT_CONFIG, {
+      model: "deepseek-v4-flash",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert(
+      completionsStrategy.intervalMs === null &&
+        !completionsStrategy.automaticWarm &&
+        completionsStrategy.manualProbe === false,
+      "the verified completions-plain plan must agree with the capability: no timer",
+    );
+
+    // Registry agreement audit: iterate the auditable registry itself. Every
+    // entry's resolved capability state must match the entry, and every
+    // verified entry must carry an evidence pointer. The key-to-family map and
+    // the payload/model helpers are test-local; the registry entries are the
+    // single source of truth.
+    const keyToFamily: Record<string, string> = {
+      "short-marker": "opencode-go-short-marker",
+      "long-marker": "opencode-go-long-marker",
+      "plain-fallback": "opencode-go-plain",
+      plain: "opencode-go-plain",
+      retained: "opencode-go-retained",
+    };
+    const pairPayload = (api: string, family: string): Record<string, unknown> => {
+      if (family === "opencode-go-retained") {
+        return api === "openai-responses"
+          ? { model: "grok-4.5", input: [], prompt_cache_retention: "24h" }
+          : { model: "deepseek-v4-flash", messages: [], prompt_cache_retention: "24h" };
+      }
+      if (family === "opencode-go-short-marker" || family === "opencode-go-long-marker") {
+        return {
+          model: "qwen3.7-max",
+          system: [],
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: "hi",
+                  cache_control:
+                    family === "opencode-go-long-marker"
+                      ? { type: "ephemeral", ttl: "1h" }
+                      : { type: "ephemeral" },
+                },
+              ],
+            },
+          ],
+        };
+      }
+      return api === "openai-responses"
+        ? { model: "grok-4.5", input: [], prompt_cache_key: "go-session-1" }
+        : { model: "deepseek-v4-flash", messages: [] };
+    };
+    const pairModel = (api: string) =>
+      ({
+        id: "pair-model",
+        provider: "opencode-go",
+        api,
+        baseUrl:
+          api === "anthropic-messages"
+            ? "https://opencode.ai/zen/go"
+            : "https://opencode.ai/zen/go/v1",
+      }) as any;
+    for (const registration of PROXY_ROUTE_REGISTRY) {
+      if (registration.provider !== "opencode-go") continue;
+      for (const [key, familyState] of Object.entries(registration.families)) {
+        const family = keyToFamily[key];
+        assert(family !== undefined, `registry key ${key} must map to a family`);
+        const capability = resolveProviderCapability(
+          pairModel(registration.api),
+          pairPayload(registration.api, family),
+        );
+        assert(
+          capability.state === familyState.state,
+          `resolved capability (${registration.api}, ${key}) must agree with the registry: ${familyState.state}, got ${capability.state}`,
+        );
+        if (familyState.state === "verified") {
+          assert(
+            familyState.evidence !== null && familyState.evidence.length > 0,
+            `verified entry (${registration.api}, ${key}) must carry an evidence pointer`,
+          );
+        }
+      }
+    }
   }
 
   const unknownResponses = {
@@ -1449,6 +1706,56 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       pricingSource: "model",
     }).includes("net cost"),
     "negative net must not look like savings",
+  );
+
+  // Verified-no-probe families (opencode-go retained, and the verified
+  // completions-plain no-keepalive treatment) claim no savings, even when
+  // model pricing exists.
+  const noProbeCapability = {
+    state: "verified",
+    reason: "test",
+    manualProbe: false,
+    automaticWarm: false,
+  } as const;
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0.12,
+      savingsKnown: true,
+      pricingSource: "model",
+      capability: noProbeCapability,
+      provider: "opencode-go",
+    }) === "n/a (no keepalive scheduled)",
+    "a verified no-keepalive route must render savings as n/a (no keepalive scheduled)",
+  );
+  assert(
+    formatSavingsSummary({
+      probeHitCount: 1,
+      probeMissCount: 0,
+      totalEstimatedSavedUsd: 0.12,
+      totalProbeCostUsd: 0.01,
+      savingsKnown: true,
+      pricingSource: "model",
+      capability: noProbeCapability,
+      provider: "opencode-go",
+    }) === "n/a (no keepalive scheduled)",
+    "a verified no-keepalive route must summarize savings as n/a",
+  );
+  // A verified probing route keeps dollar savings (the fixture above pins the
+  // "est. $0.23 saved" phrase with automaticWarm undefined, which is treated
+  // as probing); an explicit automaticWarm true is the same path.
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0.23,
+      savingsKnown: true,
+      pricingSource: "model",
+      capability: {
+        state: "verified",
+        reason: "test",
+        manualProbe: false,
+        automaticWarm: true,
+      },
+    }) === "est. $0.23 saved",
+    "a verified probing route must keep the dollar savings phrase",
   );
 }
 
@@ -2344,8 +2651,10 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   );
   const retainedCapability = warmer.getCapability();
   assert(
-    retainedCapability.state === "unverified" && !retainedCapability.manualProbe,
-    "the retained family must disable the manual probe while unverified",
+    retainedCapability.state === "verified" &&
+      !retainedCapability.automaticWarm &&
+      !retainedCapability.manualProbe,
+    "the retained family must resolve verified-no-probe with the manual probe disabled",
   );
   const retainedPlan = (warmer as any).plan as { family: string; manualProbe: boolean };
   assert(
@@ -2359,6 +2668,79 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "the retained refusal must explain that the family never probes",
   );
   assert(calls === 0, "retained must never reach the provider");
+  warmer.dispose();
+}
+
+// 11d) The verified (openai-completions, plain) no-keepalive treatment keeps
+// /warm now: capability and plan agree that no timer arms (automaticWarm
+// false, intervalMs null) and a manual probe fires exactly once for cold-cache
+// protection and TTL uncertainty.
+{
+  let calls = 0;
+  const goModel = {
+    id: "deepseek-v4-flash",
+    provider: "opencode-go",
+    api: "openai-completions",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: () => undefined,
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model: goModel,
+    hasUI: false,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "go-completions-plain-session" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const completeStub = async (): Promise<any> => {
+    calls += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+    };
+  };
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
+  warmer.capturePayload(
+    {
+      model: "deepseek-v4-flash",
+      messages: [{ role: "user", content: "hi" }],
+    },
+    ctx,
+  );
+  const completionsCapability = warmer.getCapability();
+  assert(
+    completionsCapability.state === "verified" &&
+      !completionsCapability.automaticWarm &&
+      !completionsCapability.manualProbe,
+    "the verified completions-plain route must be no-keepalive",
+  );
+  const completionsPlan = (warmer as any).plan as {
+    family: string;
+    automaticWarm: boolean;
+    intervalMs: number | null;
+    manualProbe: boolean;
+  };
+  assert(
+    completionsPlan.family === "opencode-go-plain" &&
+      completionsPlan.automaticWarm === false &&
+      completionsPlan.intervalMs === null &&
+      completionsPlan.manualProbe === false,
+    "the completions-plain plan must agree with the capability: no timer",
+  );
+  const result = await warmer.warmNow(ctx);
+  assert(result.ok === true, "the verified completions-plain route must allow /warm now");
+  assert(calls === 1, "the manual probe must fire exactly once on the verified route");
   warmer.dispose();
 }
 
@@ -2683,7 +3065,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     probeMissCount: 0,
     savingsKnown: true,
     estimatedSavingsUsd: 0.12,
-    capability: { state: "verified" },
+    capability: { state: "verified", automaticWarm: true },
   } as any;
   const plan = {
     family: "openai-implicit",
@@ -2760,7 +3142,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       setStatus: (_id: string, value: unknown) => xaiCalls.push({ kind: "status", value }),
     },
   } as any;
-  const xaiAnchor = { ...anchor, capability: { state: "verified" } } as any;
+  const xaiAnchor = { ...anchor, capability: { state: "verified", automaticWarm: true } } as any;
   const xaiPlan = {
     ...plan,
     family: "xai-best-effort",
@@ -3658,8 +4040,8 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   );
 
   // Injected prompt_cache_key on an opencode-go completions payload changes no
-  // gate: still manual-only, no automatic timer, family unchanged, and the key
-  // shows only in the redacted fingerprint.
+  // gate: the route stays verified no-keepalive (no automatic timer), the
+  // family is unchanged, and the key shows only in the redacted fingerprint.
   const goCompletionsModel = {
     id: "deepseek-v4-flash",
     provider: "opencode-go",
@@ -3673,8 +4055,9 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   };
   const injectedStrategy = resolveStrategy(goCompletionsModel, DEFAULT_CONFIG, goCompletionsPayload);
   assert(
-    injectedStrategy.capability.state === "unverified",
-    "injected key must not verify the Go route",
+    injectedStrategy.capability.state === "verified" &&
+      !injectedStrategy.capability.automaticWarm,
+    "injected key must not change the verified no-keepalive completions route",
   );
   assert(!injectedStrategy.automaticWarm, "injected key must not arm an automatic timer");
   assert(
@@ -3946,7 +4329,8 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     probeMissCount: 0,
     savingsKnown: true,
     estimatedSavingsUsd: 0.12,
-    capability: { state: "verified" },
+    // A verified probing route: automaticWarm true, so savings render.
+    capability: { state: "verified", automaticWarm: true },
     provider: "opencode-go",
   } as any;
   const goPlan = {

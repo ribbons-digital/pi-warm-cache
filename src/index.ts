@@ -61,7 +61,12 @@ export default function piWarmCache(pi: ExtensionAPI) {
         if (event.reason === "startup") {
           ctx.ui.setStatus(
             "pi-warm-cache",
-            ctx.ui.theme.fg("dim", "warm ready · waiting for first cached turn"),
+            ctx.ui.theme.fg(
+              "dim",
+              capability.automaticWarm
+                ? "warm ready · waiting for first cached turn"
+                : "verified · keepalive not needed",
+            ),
           );
         }
       } else {

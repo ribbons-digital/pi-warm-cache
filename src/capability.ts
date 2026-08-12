@@ -32,6 +32,15 @@ function unverifiedFamily(): ProxyRouteFamilyState {
 }
 
 /**
+ * A promoted (api, family) pair. The evidence pointer cites the e2e record
+ * with the pi-ai version, the tested model, and the campaign date; a pair
+ * whose record does not satisfy all four parts says so in the pointer.
+ */
+function verifiedFamily(evidence: string): ProxyRouteFamilyState {
+  return { state: "verified", evidence };
+}
+
+/**
  * One registered manual-only proxy route, keyed on (provider, api).
  *
  * The per-api eligibility gate is the registration itself: the API transport
@@ -72,8 +81,13 @@ type ProxyRouteRegistration = {
  * Provider identity, API transport, exact proxy endpoint path, and (where the
  * entry declares one) the adapter's routing format must all match before a
  * captured payload can be probed.
+ *
+ * The per-family verification state is the auditable promotion record: a
+ * promotion flips an entry to verified and cites its e2e evidence pointer.
+ * The registry is exported read-only so the test suite can iterate the real
+ * entries and assert the resolved capability agrees with them.
  */
-const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
+export const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
   // OpenRouter: both OpenAI transports at /api/v1 with the routing-format gate
   // unchanged from the previous registration. No per-family verification state
   // applies; the family registry below belongs to OpenCode Go transports.
@@ -108,7 +122,9 @@ const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
     baseUrlPath: "/zen/go",
     payloadEligibility: "messages-and-system",
     families: {
-      "short-marker": unverifiedFamily(),
+      "short-marker": verifiedFamily(
+        "docs/evidence/anthropic-messages-short-marker.md (pi-ai 0.83.0, minimax-m3, 2026-08-12, four-part pass)",
+      ),
       "long-marker": unverifiedFamily(),
       "plain-fallback": unverifiedFamily(),
     },
@@ -121,8 +137,12 @@ const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
     baseUrlPath: "/zen/go/v1",
     payloadEligibility: "messages",
     families: {
-      plain: unverifiedFamily(),
-      retained: unverifiedFamily(),
+      plain: verifiedFamily(
+        "docs/evidence/openai-completions-plain.md (pi-ai 0.83.0, deepseek-v4-flash, 2026-08-12, parts 1-3 pass, part 4 not satisfied: native TTL exceeds 130 min)",
+      ),
+      retained: verifiedFamily(
+        "docs/evidence/retained-wire.md (pi-ai 0.83.0, deepseek-v4-flash, 2026-08-12)",
+      ),
     },
   },
   {
@@ -133,8 +153,12 @@ const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
     baseUrlPath: "/zen/go/v1",
     payloadEligibility: "input",
     families: {
-      plain: unverifiedFamily(),
-      retained: unverifiedFamily(),
+      plain: verifiedFamily(
+        "docs/evidence/openai-responses-plain-keyed.md (pi-ai 0.83.0, grok-4.5, 2026-08-12, four-part pass)",
+      ),
+      retained: verifiedFamily(
+        "docs/evidence/retained-wire.md (pi-ai 0.83.0, deepseek-v4-flash, 2026-08-12)",
+      ),
     },
   },
 ];
@@ -297,34 +321,89 @@ function resolveProxyRouteCapability(
     return capability("unverified", foreignReason);
   }
 
-  // The Go family is payload-driven. The retained family never probes:
-  // manualProbe stays false so /warm now cannot fire against a payload that
-  // already requests 24h retention on the wire. The plan and the warmer both
-  // derive manual gating from this flag, so they agree with this decision.
+  // The Go family is payload-driven. Verification is per (api, family) with
+  // the auditable entries in PROXY_ROUTE_REGISTRY.families; the resolved
+  // capability stays in agreement with those entries (asserted by test).
   const goFamily =
     model.provider === "opencode-go" ? classifyOpencodeGoFamily(payload) : null;
+
+  // The retained family never probes: automaticWarm stays false even though
+  // the route is verified, because the wire already requests 24h retention
+  // and keepalive is not needed. The plan and the warmer both derive manual
+  // gating from this flag, so they agree with this decision. Verified
+  // no-probe is legal only through the explicit automaticWarm override.
   if (goFamily === "opencode-go-retained") {
     return capability(
-      "unverified",
-      `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route); the captured payload requests 24h retention on the wire, so no keepalive or manual probe is scheduled`,
+      "verified",
+      `${label} route is verified; the captured payload requests 24h retention on the wire, so keepalive is not needed; automatic warming is disabled and manual probes stay disabled for the retained family; savings n/a (no keepalive scheduled)`,
+      false,
+      { automaticWarm: false },
     );
   }
 
-  // The plain family carries a degraded hint steering the user onto the keyed
-  // 24h retention path where keepalive is not needed. The hint folds into
-  // capability.reason, which already renders in the banner and notify paths.
-  // Family classification is payload-driven and independent of capability
-  // state, so a registered Go route without instrumentation shows the hint.
-  const plainHint =
-    goFamily === "opencode-go-plain"
-      ? "; set Pi cache retention to long for keyed 24h Go caching"
-      : "";
-
-  return capability(
-    "unverified",
-    `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)${plainHint}`,
-    true,
-  );
+  // Verified pairs promote only with a recorded e2e evidence record (the
+  // per-family registry entries above). (anthropic-messages, long-marker) has
+  // no e2e campaign slot and (anthropic-messages, plain-fallback) has no
+  // evidence record, so both stay unverified with the manual-probe escape
+  // hatch. The verified no-keepalive families (retained above, and
+  // completions plain below, where the native TTL exceeds 130 min) never arm
+  // a timer; the completions-plain route keeps /warm now for cold-cache
+  // protection and TTL uncertainty, which works because verified routes
+  // bypass the unverified manual-probe gate.
+  switch (goFamily) {
+    case "opencode-go-short-marker":
+      // (anthropic-messages, short-marker) is verified by e2e evidence. The
+      // family is payload-driven and transport-agnostic, so a short-marker
+      // payload on another transport (completions with compat-declared
+      // cache_control, per the compat-conditional allow rule) has no
+      // evidence record and stays unverified.
+      if (model.api !== "anthropic-messages") {
+        return capability(
+          "unverified",
+          `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)`,
+          true,
+        );
+      }
+      return capability(
+        "verified",
+        `${label} anthropic-messages route is verified (e2e evidence: four-part pass); best-effort keepalive probing at ~4m cadence`,
+      );
+    case "opencode-go-plain":
+      if (model.api === "openai-completions") {
+        return capability(
+          "verified",
+          `${label} route is verified; the native completions cache TTL exceeds 130 min (e2e evidence: parts 1-3 pass, part 4 not satisfied), so keepalive is not needed within the measured envelope; automatic warming is disabled; /warm now remains available for cold-cache protection and TTL uncertainty; savings n/a (no keepalive scheduled)`,
+          false,
+          { automaticWarm: false },
+        );
+      }
+      if (model.api === "openai-responses") {
+        return capability(
+          "verified",
+          `${label} responses route is verified (e2e evidence: four-part pass); best-effort keepalive probing at ~4m cadence on a stable prompt-cache key`,
+        );
+      }
+      // (anthropic-messages, plain-fallback) stays unverified. The plain
+      // family carries a degraded hint steering the user onto the keyed 24h
+      // retention path where keepalive is not needed. The hint folds into
+      // capability.reason, which already renders in the banner and notify
+      // paths.
+      return capability(
+        "unverified",
+        `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route); set Pi cache retention to long for keyed 24h Go caching`,
+        true,
+      );
+    default:
+      // long-marker, short-marker on a non-anthropic transport, and any
+      // other family stay unverified. Non-Go registered proxy routes
+      // (OpenRouter) land here too: goFamily is null and the generic
+      // manual-only reason and manual-probe escape hatch are unchanged.
+      return capability(
+        "unverified",
+        `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route)`,
+        true,
+      );
+  }
 }
 
 /**
@@ -491,12 +570,17 @@ function capability(
   state: ProviderCapabilityState,
   reason: string,
   manualProbe = false,
+  overrides: { automaticWarm?: boolean } = {},
 ): ProviderCapability {
   const normalizedReason = reason.trim();
   return {
     state,
     reason: normalizedReason || "capability decision has no reason",
-    automaticWarm: state === "verified",
+    // automaticWarm normally equals state === "verified". The OpenCode Go
+    // retained family (and the verified completions-plain no-keepalive
+    // treatment) are the one deliberate exception: verified with no timer,
+    // legal only through the explicit override below.
+    automaticWarm: overrides.automaticWarm ?? state === "verified",
     // Manual probes are an explicit unverified-route escape hatch. Keep the
     // flags consistent even if a future branch passes an incorrect value.
     manualProbe: state === "unverified" && manualProbe,

@@ -610,7 +610,14 @@ export class SessionWarmer {
 
     const sessionId = ctx.sessionManager.getSessionId();
     const pricing = resolveModelPricing(model);
-    const savingsKnown = this.capability.state === "verified" && pricing.savingsKnown;
+    // Verified-no-probe families (opencode-go retained, and the verified
+    // completions-plain no-keepalive treatment) perform no keepalive and
+    // claim no savings: savingsKnown stays false so neither probes nor real
+    // turns accumulate savings, and the savings renderers show the n/a label.
+    const savingsKnown =
+      this.capability.state === "verified" &&
+      this.capability.automaticWarm &&
+      pricing.savingsKnown;
     const preserveSessionStats = payloadContinuation;
     const realTurn = makeUnknownRealTurnObservation({
       provider: model.provider,
@@ -1666,11 +1673,27 @@ export class SessionWarmer {
       });
     }
 
-    if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
+    // The retained family never probes, even when verified: the wire already
+    // requests 24h retention, so keepalive is not needed. The refusal is
+    // family-specific and independent of capability state, mirroring the xAI
+    // key-safety gate above; a verified retained route bypasses the
+    // unverified manual-probe gate below, so this check must stand alone.
+    if (anchor.cacheFamily === "opencode-go-retained") {
       const detail =
-        anchor.cacheFamily === "opencode-go-retained"
-          ? "the retained OpenCode Go family never probes; the captured payload requests 24h retention on the wire"
-          : "captured payload shape is not safe for an unverified manual probe";
+        "the retained OpenCode Go family never probes; the captured payload requests 24h retention on the wire, so keepalive is not needed";
+      this.clearTimers();
+      this.recordAttempt(reason, false, detail);
+      this.clearCapabilityUi(ctx);
+      return buildWarmResult({
+        fingerprint: anchor.payloadFingerprint,
+        error: detail,
+        unavailable: true,
+        anchor,
+      });
+    }
+
+    if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
+      const detail = "captured payload shape is not safe for an unverified manual probe";
       this.recordAttempt(reason, false, detail);
       this.clearCapabilityUi(ctx);
       return buildWarmResult({
