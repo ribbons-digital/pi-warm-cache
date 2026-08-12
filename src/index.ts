@@ -17,6 +17,37 @@ import { DEFAULT_CONFIG } from "./types.ts";
 import { SessionWarmer } from "./warmer.ts";
 import { clearWarmUi, renderCapabilityNotice } from "./ui.ts";
 
+/**
+ * Resolve the notification level and failure label for a failed /warm now
+ * result. A by-design refusal on a verified no-keepalive route (for example
+ * the retained family, which never probes) is not an error: the route is
+ * healthy and the refusal is the documented behavior, so it renders at
+ * warning level with the refusal explanation. Real failures on verified
+ * routes stay errors, and unverified route refusals keep the warning level.
+ * Returns null for a successful result.
+ */
+export function resolveWarmNowFailure(args: {
+  ok: boolean;
+  unavailable?: boolean;
+  capabilityState?: string;
+  automaticWarm: boolean;
+  xaiBestEffort: boolean;
+}): { level: "warning" | "error"; failureLabel: string } | null {
+  if (args.ok) return null;
+  const deliberateRefusal =
+    args.unavailable === true &&
+    args.capabilityState === "verified" &&
+    !args.automaticWarm;
+  return {
+    level: deliberateRefusal || args.capabilityState === "unverified" ? "warning" : "error",
+    failureLabel: deliberateRefusal
+      ? "Probe unavailable"
+      : args.unavailable || args.capabilityState === "unsupported"
+        ? `${args.xaiBestEffort ? "xAI best-effort probe" : "Probe"} unavailable`
+        : `${args.xaiBestEffort ? "xAI best-effort probe" : "Probe"} failed`,
+  };
+}
+
 export default function piWarmCache(pi: ExtensionAPI) {
   const warmer = new SessionWarmer(pi);
   let config = { ...DEFAULT_CONFIG };
@@ -204,22 +235,16 @@ export default function piWarmCache(pi: ExtensionAPI) {
           return;
         }
         if (!result.ok) {
-          // A by-design refusal on a verified no-keepalive route (for example
-          // the retained family, which never probes) is not an error: the
-          // route is healthy and the refusal is the documented behavior, so
-          // it renders at warning level with the refusal explanation.
-          const deliberateRefusal =
-            result.unavailable &&
-            result.capabilityState === "verified" &&
-            !warmer.getCapability().automaticWarm;
-          const failureLabel = deliberateRefusal
-            ? "Probe unavailable"
-            : result.unavailable || result.capabilityState === "unsupported"
-              ? `${xaiBestEffort ? "xAI best-effort probe" : "Probe"} unavailable`
-              : `${xaiBestEffort ? "xAI best-effort probe" : "Probe"} failed`;
+          const refusal = resolveWarmNowFailure({
+            ok: result.ok,
+            unavailable: result.unavailable,
+            capabilityState: result.capabilityState,
+            automaticWarm: warmer.getCapability().automaticWarm,
+            xaiBestEffort,
+          });
           ctx.ui.notify(
-            `${manualOnlyWarning}${failureLabel}: ${result.error} (${diagnostics})`,
-            deliberateRefusal || result.capabilityState === "unverified" ? "warning" : "error",
+            `${manualOnlyWarning}${refusal?.failureLabel ?? "Probe failed"}: ${result.error} (${diagnostics})`,
+            refusal?.level ?? "error",
           );
           return;
         }

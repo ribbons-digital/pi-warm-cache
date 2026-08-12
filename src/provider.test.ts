@@ -69,6 +69,7 @@ import {
   renderWaitingUi,
   renderWarmHitUi,
 } from "./ui.ts";
+import { resolveWarmNowFailure } from "./index.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -1823,6 +1824,66 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     }) === "est. $0.23 saved",
     "a verified probing route must keep the dollar savings phrase",
   );
+
+  // Devin Review fix pin: the /warm now failure notification level is chosen
+  // by the pure resolveWarmNowFailure helper. A by-design refusal on a
+  // verified no-keepalive route (the retained family) renders at warning
+  // level with the refusal label, not as a red error toast; real failures on
+  // verified routes stay errors; unverified refusals keep the warning level.
+  const retainedRefusal = resolveWarmNowFailure({
+    ok: false,
+    unavailable: true,
+    capabilityState: "verified",
+    automaticWarm: false,
+    xaiBestEffort: false,
+  });
+  assert(
+    retainedRefusal?.level === "warning" &&
+      retainedRefusal.failureLabel === "Probe unavailable",
+    "a verified no-keepalive refusal must render at warning level, not error",
+  );
+  const realFailure = resolveWarmNowFailure({
+    ok: false,
+    unavailable: false,
+    capabilityState: "verified",
+    automaticWarm: true,
+    xaiBestEffort: false,
+  });
+  assert(
+    realFailure?.level === "error" && realFailure.failureLabel === "Probe failed",
+    "a real probe failure on a verified route must stay an error",
+  );
+  const unverifiedRefusal = resolveWarmNowFailure({
+    ok: false,
+    unavailable: true,
+    capabilityState: "unverified",
+    automaticWarm: false,
+    xaiBestEffort: false,
+  });
+  assert(
+    unverifiedRefusal?.level === "warning" &&
+      unverifiedRefusal.failureLabel === "Probe unavailable",
+    "an unverified route refusal must keep the warning level",
+  );
+  const xaiRefusal = resolveWarmNowFailure({
+    ok: false,
+    unavailable: true,
+    capabilityState: "unverified",
+    automaticWarm: false,
+    xaiBestEffort: true,
+  });
+  assert(
+    xaiRefusal?.failureLabel === "xAI best-effort probe unavailable",
+    "xAI routes must keep the xAI failure label",
+  );
+  const success = resolveWarmNowFailure({
+    ok: true,
+    unavailable: false,
+    capabilityState: "verified",
+    automaticWarm: true,
+    xaiBestEffort: false,
+  });
+  assert(success === null, "a successful result must not produce a failure notification");
 }
 
 // 9) Cumulative savings summaries preserve hits, costs, pricing state, and net losses.
