@@ -156,9 +156,10 @@ export const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
       plain: verifiedFamily(
         "docs/evidence/openai-responses-plain-keyed.md (pi-ai 0.83.0, grok-4.5, 2026-08-12, four-part pass)",
       ),
-      retained: verifiedFamily(
-        "docs/evidence/retained-wire.md (pi-ai 0.83.0, deepseek-v4-flash, 2026-08-12)",
-      ),
+      // No retained-wire observation exists for the openai-responses
+      // transport: retained-wire.md measured the completions transport only,
+      // so the responses retained pair stays unverified.
+      retained: unverifiedFamily(),
     },
   },
 ];
@@ -333,18 +334,18 @@ function resolveProxyRouteCapability(
   // gating from this flag, so they agree with this decision. Verified
   // no-probe is legal only through the explicit automaticWarm override.
   //
-  // The promotion is per (api, family): the registry records a `retained`
-  // entry with an evidence pointer only for the two OpenAI transports. The
-  // anthropic-messages transport has no retained entry and no evidence
-  // record (the adapter emits cache_control ttl "1h", never
-  // prompt_cache_retention), so an anthropic retained payload stays
+  // The promotion is per (api, family): only the openai-completions transport
+  // has a registered `retained` entry backed by a recorded wire observation
+  // (retained-wire.md measured the completions transport with deepseek-v4-
+  // flash). The anthropic-messages and openai-responses transports have no
+  // retained evidence record, so a retained payload on either stays
   // unverified; it still never probes, because manualProbe stays false for
   // the retained family on every transport.
   if (goFamily === "opencode-go-retained") {
-    if (model.api === "anthropic-messages") {
+    if (model.api !== "openai-completions") {
       return capability(
         "unverified",
-        `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route); the captured payload requests 24h retention on the wire, but the anthropic-messages transport has no recorded retained evidence, so the retained pair is not promoted; no keepalive or manual probe is scheduled`,
+        `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route); the captured payload requests 24h retention on the wire, but the ${model.api === "anthropic-messages" ? "anthropic-messages" : "openai-responses"} transport has no recorded retained evidence, so the retained pair is not promoted; no keepalive or manual probe is scheduled`,
       );
     }
     return capability(

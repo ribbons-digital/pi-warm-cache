@@ -1105,6 +1105,31 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       }),
       "supportsManualProbe must refuse an anthropic retained payload",
     );
+
+    // Negative case: (openai-responses, retained) is also not promoted,
+    // because retained-wire.md measured the completions transport only.
+    const goResponsesRetainedModel = {
+      id: "grok-4.5",
+      provider: "opencode-go",
+      api: "openai-responses",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    } as any;
+    const responsesRetainedCapability = resolveProviderCapability(goResponsesRetainedModel, {
+      model: "grok-4.5",
+      prompt_cache_retention: "24h",
+      input: [],
+    });
+    assert(
+      responsesRetainedCapability.state === "unverified" &&
+        !responsesRetainedCapability.automaticWarm &&
+        !responsesRetainedCapability.manualProbe,
+      "the responses retained pair must stay unverified (no responses-transport evidence)",
+    );
+    assert(
+      responsesRetainedCapability.reason.includes("openai-responses") &&
+        responsesRetainedCapability.reason.includes("no recorded retained evidence"),
+      "the responses retained reason must name the transport and the missing evidence",
+    );
     assert(
       resolveProviderCapability(goAnthropicFamilyModel, {
         model: "qwen3.7-max",
