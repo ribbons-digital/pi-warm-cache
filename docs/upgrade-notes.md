@@ -1,7 +1,6 @@
-# Diagnostics and upgrade notes
+# Diagnostics reference
 
 This page documents the lifecycle, `/warm` status, savings summary, and JSONL diagnostics used by pi-warm-cache.
-It describes the behavior delivered by the first four upgrade PRs.
 
 ## Safety rules and scope
 
@@ -25,7 +24,6 @@ Cache warming is useful when all of the following are true:
 - The route is verified and has an automatic keepalive strategy.
 - The real provider payload contains a large prefix that is worth retaining.
 - The session will be idle long enough for the provider cache to expire without a probe.
-- The provider route can be tested with the [canonical real-provider procedure](e2e-idle-test.md).
 
 A real turn must capture the anchor before the timer can start.
 The first real-turn observation can remain `unknown` until Pi reports assistant usage.
@@ -211,10 +209,7 @@ To compare a real turn with its following probe, correlate `sessionId`, `payload
 Use `source=real_turn` for Pi assistant usage and `source=warm_probe` for extension requests.
 Do not treat an `attempt` event as evidence of a cache hit without checking its `probeOutcome` and usage fields.
 
-## Canonical verification
+## Diagnostics verification
 
-The [idle-past-TTL procedure](e2e-idle-test.md) is the canonical real-provider verification method.
-It checks the exact route, a manual probe, multiple timer ticks, the post-idle real turn, and a warming-off control.
-
-A unit test or a `/warm` status snapshot can verify diagnostics.
-Only the real-provider procedure can verify that a provider route preserves the intended cache across an idle gap.
+A `/warm` status snapshot can verify diagnostics behavior.
+Only a real provider session can verify that a provider route preserves the intended cache across an idle gap.
