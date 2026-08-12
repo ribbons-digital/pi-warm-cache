@@ -67,7 +67,7 @@ The extension classifies each captured payload by the cache instrumentation actu
 | `openai-completions`, default retention | native cache outlives idle gaps, so no keepalive is scheduled; `/warm now` stays available | Keepalive not needed |
 | `openai-completions`, 24h retention on the wire | keepalive is not needed; never probes | Keepalive not needed |
 | `openai-responses`, stable prompt-cache key | keepalive probe about every 4 minutes | Automatic keepalive |
-| `openai-responses`, 24h retention on the wire | keepalive is not needed; never probes | Keepalive not needed |
+| `openai-responses`, 24h retention on the wire | never probes; 24h retention is not yet verified on this transport | Never probes |
 
 The default configuration of every OpenCode Go model is covered.
 The manual-only paths are the non-default retention settings and a marker-less Anthropic payload; they may gain automatic keepalive in a future release.
