@@ -2915,6 +2915,103 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   warmer.dispose();
 }
 
+// 11e) A continuing keyed responses session preserves its accumulated savings
+// tally across captures: carry-over follows route and pricing continuity, so
+// the running total survives and resumes. The flip side is also pinned: a
+// turn whose key changes is not a continuation, so it re-anchors with fresh
+// stats by design. This is the regression guard for the savings carry-over
+// being decoupled from the per-payload plan gate.
+{
+  let probeIndex = 0;
+  const goResponsesModel = {
+    id: "grok-4.5",
+    provider: "opencode-go",
+    api: "openai-responses",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+    cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
+  } as any;
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: () => undefined,
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    model: goResponsesModel,
+    hasUI: false,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "go-responses-continuation-session" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
+    },
+  } as any;
+  const completeStub = async (): Promise<any> => {
+    probeIndex += 1;
+    return {
+      stopReason: "stop",
+      usage: { input: 10, output: 1, cacheRead: 50_000, cacheWrite: 0, cost: { total: 0.02 } },
+    };
+  };
+  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
+  warmer.capturePayload(
+    {
+      model: "grok-4.5",
+      input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      prompt_cache_key: "go-session-1",
+    },
+    ctx,
+  );
+  const hit = await warmer.warmNow(ctx);
+  assert(hit.cacheHit === true, "the keyed responses manual probe must hit");
+  let anchor = (warmer as any).anchor;
+  assert(anchor.savingsKnown === true, "a keyed responses route must claim savings");
+  const savedBefore = anchor.totalEstimatedSavedUsd;
+  assert(savedBefore > 0, "the probe hit must accumulate savings");
+  // Continuing keyed turn: same key, grew prefix. The tally must survive.
+  warmer.capturePayload(
+    {
+      model: "grok-4.5",
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "hi" }] },
+        { role: "user", content: [{ type: "input_text", text: "second turn" }] },
+      ],
+      prompt_cache_key: "go-session-1",
+    },
+    ctx,
+  );
+  anchor = (warmer as any).anchor;
+  assert(
+    anchor.totalEstimatedSavedUsd === savedBefore,
+    "a continuing keyed turn must preserve the accumulated savings tally",
+  );
+  assert(anchor.savingsKnown === true, "the continuing keyed turn must keep claiming savings");
+  // A turn whose key changes is not a continuation: it re-anchors with fresh
+  // stats by design, so the key-gated state never inherits a prior tally.
+  warmer.capturePayload(
+    {
+      model: "grok-4.5",
+      input: [{ role: "user", content: [{ type: "input_text", text: "no key turn" }] }],
+    },
+    ctx,
+  );
+  anchor = (warmer as any).anchor;
+  const keylessPlan = (warmer as any).plan as { automaticWarm: boolean; intervalMs: number | null };
+  assert(
+    anchor.totalEstimatedSavedUsd === 0 && anchor.savingsKnown === false,
+    "a key change must re-anchor with fresh stats and no savings claim",
+  );
+  assert(
+    keylessPlan.automaticWarm === false && keylessPlan.intervalMs === null,
+    "the key-gated turn must not arm a timer",
+  );
+  warmer.dispose();
+}
+
 // 12) Unverified routes remain manual-only: no timer, no verified savings, one safe probe.
 {
   let calls = 0;

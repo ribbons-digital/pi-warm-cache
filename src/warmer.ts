@@ -616,7 +616,18 @@ export class SessionWarmer {
     // completions-plain treatment) resolves automaticWarm false, and a
     // payload-level gate can disable the timer on a verified route (the
     // responses key gate). The plan is the authoritative result after those
-    // gates, so savingsKnown follows plan.automaticWarm.
+    // gates, so the active savings flag follows plan.automaticWarm.
+    //
+    // Carry-over of a continuing session's accumulated totals follows route
+    // and pricing continuity only: a temporarily gated turn (for example a
+    // responses turn whose payload fails the key gate) suppresses new savings
+    // claims but must not wipe the prior tally, so the next ungated turn
+    // resumes it. Today the plan gate is constant within any continuation
+    // (the key is a payload-continuity field), which makes the two predicates
+    // equal there; the split keeps them correct by construction if a future
+    // gate ever trips without breaking continuity.
+    const routeSavingsKnown =
+      this.capability.state === "verified" && pricing.savingsKnown;
     const savingsKnown =
       this.capability.state === "verified" &&
       this.plan?.automaticWarm === true &&
@@ -659,9 +670,9 @@ export class SessionWarmer {
       // changed prefix starts a new anchor and must not inherit old evidence.
       lastProbeAt: preserveSessionStats ? (prev?.lastProbeAt ?? null) : null,
       estimatedSavingsUsd:
-        savingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
+        routeSavingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
       totalEstimatedSavedUsd:
-        savingsKnown && preserveSessionStats ? (prev?.totalEstimatedSavedUsd ?? 0) : 0,
+        routeSavingsKnown && preserveSessionStats ? (prev?.totalEstimatedSavedUsd ?? 0) : 0,
       totalProbeCostUsd: preserveSessionStats ? (prev?.totalProbeCostUsd ?? 0) : 0,
       probeCount: preserveSessionStats ? (prev?.probeCount ?? 0) : 0,
       probeHitCount: preserveSessionStats ? (prev?.probeHitCount ?? 0) : 0,
