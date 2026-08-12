@@ -194,7 +194,7 @@ interface WarmCacheConfig {
 | `openai-explicit` | 30-minute explicit prompt-cache mode | about 24 minutes | `short` | verified |
 | `openai-implicit` | older in-memory idle window | about 6.4 minutes | `short` | verified |
 | `xai-best-effort` | no fixed provider TTL claim | 4-minute heuristic | `short` plus captured key | verified |
-| `opencode-go-retained` | 24h retention requested on the wire | no keepalive scheduled | `none` | verified on completions; manual elsewhere |
+| `opencode-go-retained` | 24h retention requested on the wire | no keepalive scheduled | `none` | verified on completions; never probes on any transport |
 | `opencode-go-long-marker` | anthropic-style `cache_control` with `ttl: "1h"` | about 48 minutes (best-effort) | `long` | manual only |
 | `opencode-go-short-marker` | `cache_control` ephemeral without ttl | about 4 minutes (best-effort) | `short` | verified on anthropic-messages |
 | `opencode-go-plain` | no cache instrumentation | about 4 minutes (best-effort) | `short` | verified on completions and responses; manual on anthropic plain-fallback |
