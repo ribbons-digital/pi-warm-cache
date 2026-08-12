@@ -95,8 +95,11 @@ def main() -> int:
     log(f"spawning pi session {name}: model={model} family={family} mode={mode}")
     pid, fd = pty.fork()
     if pid == 0:
-        os.chdir(session_dir)
-        os.execvpe("pi", args, env)
+        try:
+            os.chdir(session_dir)
+            os.execvpe("pi", args, env)
+        except BaseException:
+            os._exit(127)
 
     def drain(timeout: float = 1.0) -> str:
         out = b""
