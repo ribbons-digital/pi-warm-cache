@@ -72,7 +72,7 @@ The `anthropic-messages` transport carries `cache_control` by design and is neve
 
 OpenCode Go cache families are payload-driven.
 The extension classifies each captured payload by the cache instrumentation actually observed on it, independent of capability state, so an unverified Go route still surfaces its family, cadence label, and hints in diagnostics.
-`prompt_cache_retention: "24h"` on the wire selects the retained family, which is verified as no-keepalive: it never schedules a probe and also disables the manual probe, because a payload that already requests 24h retention on the wire never needs keepalive.
+`prompt_cache_retention: "24h"` on the wire selects the retained family, which is verified as no-keepalive on the OpenAI transports (the anthropic-messages transport has no retained evidence record and stays unverified): it never schedules a probe and also disables the manual probe, because a payload that already requests 24h retention on the wire never needs keepalive.
 `cache_control` with `ttl: "1h"` selects long-marker; any other `cache_control` selects short-marker; no instrumentation selects plain.
 When retention and markers co-occur, retention wins because it is the stronger lifetime signal.
 A keyed-but-unretained payload (`prompt_cache_key` without `prompt_cache_retention`) is not a separate family and behaves like plain.
@@ -287,7 +287,7 @@ The records live in `docs/evidence/`.
 | (openai-completions, plain) | deepseek-v4-flash | parts 1-3 pass; part 4 not satisfied (native TTL > 130 min) | verified no-keepalive; `/warm now` kept |
 | (openai-completions, retained) | deepseek-v4-flash | retained-wire observation | verified no-keepalive |
 | (openai-responses, plain) | grok-4.5 | four-part pass, control decayed | verified, probes at ~4m, key gate |
-| (openai-responses, retained) | grok-4.5 | retained-wire observation | verified no-keepalive |
+| (openai-responses, retained) | deepseek-v4-flash | retained-wire observation | verified no-keepalive |
 
 Evidence pointers: `docs/evidence/anthropic-messages-short-marker.md`, `docs/evidence/openai-completions-plain.md`, `docs/evidence/openai-responses-plain-keyed.md`, `docs/evidence/retained-wire.md`.
 
@@ -303,7 +303,8 @@ Raising or disabling the ceiling resumes a soft-blocked session immediately; low
 A real turn resets the campaign ledger; both guards are scoped to timer fires only, so `/warm now` always bypasses them.
 
 The OpenCode Go families resolve from the captured payload, not from model metadata, and never render a numeric lifetime; the intervals are best-effort probe cadences, not provider TTL claims.
-Families with a recorded e2e evidence record are verified: (anthropic-messages, short-marker) and (openai-responses, plain) probe at ~4m, and (openai-completions, plain) plus the retained family are verified no-keepalive (no timer; `/warm now` stays available on completions plain for cold-cache protection and TTL uncertainty).
+Families with a recorded e2e evidence record are verified: (anthropic-messages, short-marker) and (openai-responses, plain) probe at ~4m, and (openai-completions, plain) plus the retained family on the two OpenAI transports are verified no-keepalive (no timer; `/warm now` stays available on completions plain for cold-cache protection and TTL uncertainty).
+The anthropic-messages transport has no retained evidence record, so an anthropic retained payload stays unverified and still never probes.
 Families without a record (anthropic long-marker and plain-fallback) stay unverified and manual-only.
 The retained family never probes, so its row lists no keepalive.
 
@@ -383,7 +384,7 @@ interface WarmCacheConfig {
 13. **xAI no-read/no-write probes** - retry within the configured failure budget, then stop and request a new real-turn anchor with a best-effort explanation.
 14. **Shutdown or disable** - clear timers and abort in-flight `complete()` calls.
 15. **Foreign instrumentation on an OpenCode Go completions payload** - refuse replay when `cache_control` appears without `cacheControlFormat: "anthropic"` compat, because the route cannot legally carry it.
-16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family is verified as no-keepalive and never probes (including `/warm now`); the verified completions-plain pair is also no-keepalive but keeps `/warm now`; the plain family carries the degraded retention hint in its reason only while its pair is unverified.
+16. **OpenCode Go family classification** - the family is payload-driven and independent of capability state; the retained family is verified as no-keepalive on the OpenAI transports and never probes (including `/warm now`), while an anthropic-messages retained payload stays unverified (no evidence record) and still never probes; the verified completions-plain pair is also no-keepalive but keeps `/warm now`; the plain family carries the degraded retention hint in its reason only while its pair is unverified.
 17. **Interleaved sessions and the shared spend ledger** - the probe-spend ledger is module-level and keyed per provider, so when one session on the same provider takes real turns while another session idles, the shared campaign counter never accumulates for the idle session. The idle cutoff still bounds the idle session's probes, and the per-instance soft block stops it once its own probes trip the ceiling. Revisit before Slice 8.
 
 ## Package layout

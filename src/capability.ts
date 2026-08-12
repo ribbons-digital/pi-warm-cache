@@ -332,7 +332,21 @@ function resolveProxyRouteCapability(
   // and keepalive is not needed. The plan and the warmer both derive manual
   // gating from this flag, so they agree with this decision. Verified
   // no-probe is legal only through the explicit automaticWarm override.
+  //
+  // The promotion is per (api, family): the registry records a `retained`
+  // entry with an evidence pointer only for the two OpenAI transports. The
+  // anthropic-messages transport has no retained entry and no evidence
+  // record (the adapter emits cache_control ttl "1h", never
+  // prompt_cache_retention), so an anthropic retained payload stays
+  // unverified; it still never probes, because manualProbe stays false for
+  // the retained family on every transport.
   if (goFamily === "opencode-go-retained") {
+    if (model.api === "anthropic-messages") {
+      return capability(
+        "unverified",
+        `${label} route is explicitly registered for manual-only probing; automatic warming is disabled and savings are n/a (unverified route); the captured payload requests 24h retention on the wire, but the anthropic-messages transport has no recorded retained evidence, so the retained pair is not promoted; no keepalive or manual probe is scheduled`,
+      );
+    }
     return capability(
       "verified",
       `${label} route is verified; the captured payload requests 24h retention on the wire, so keepalive is not needed; automatic warming is disabled and manual probes stay disabled for the retained family; savings n/a (no keepalive scheduled)`,

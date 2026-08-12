@@ -85,13 +85,15 @@ export type SavingsLabelInput = Pick<
 export function formatSavingsLabel(anchor: SavingsLabelInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
-  // Verified-no-probe families (opencode-go retained, and the verified
-  // completions-plain no-keepalive treatment) perform no keepalive and claim
-  // no savings, even when a manual probe happens to hit.
-  if (anchor.capability?.state === "verified" && !anchor.capability.automaticWarm) {
-    return "n/a (no keepalive scheduled)";
+  if (!anchor.savingsKnown) {
+    // A verified route with usable pricing but no active keepalive timer
+    // (the verified no-probe families, or a timer gated by a pending cache
+    // key) is not missing pricing: say why no savings are claimed. Only
+    // routes without usable model cost data get the no-pricing label.
+    return anchor.pricingSource === "model"
+      ? "n/a (no keepalive scheduled)"
+      : "n/a (no model pricing)";
   }
-  if (!anchor.savingsKnown) return "n/a (no model pricing)";
   const budgetDollars = anchor.provider === "opencode-go";
   const suffix = budgetDollars ? " (subscription budget-dollars)" : "";
   const n = anchor.estimatedSavingsUsd;
@@ -127,7 +129,12 @@ export type SavingsSummaryInput = Pick<
 export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
-  if (anchor.capability?.state === "verified" && !anchor.capability.automaticWarm) {
+  // The genuine no-probe families (opencode-go retained, and the verified
+  // completions-plain treatment) never probe, so there is no telemetry to
+  // show. Key-gated verified routes (a pending cache key disables the timer
+  // but /warm now probes can still run) fall through so the cumulative probe
+  // counts stay visible with n/a amounts.
+  if (anchor.capability?.state === "verified" && anchor.capability.automaticWarm === false) {
     return "n/a (no keepalive scheduled)";
   }
 

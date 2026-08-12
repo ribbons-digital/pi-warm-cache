@@ -1028,13 +1028,37 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     );
 
     // The retained family never schedules a probe: intervalMs null and no
-    // automatic warming even while verified. Verified no-probe is legal only
-    // through the explicit automaticWarm override on capability().
-    const retainedStrategy = resolveStrategy(
-      goAnthropicFamilyModel,
-      DEFAULT_CONFIG,
-      { model: "qwen3.7-max", prompt_cache_retention: "24h", messages: [], system: [] },
+    // automatic warming. The promotion is per (api, family): retained is
+    // verified only on the two OpenAI transports (which carry a registry
+    // evidence pointer); the anthropic-messages transport has no retained
+    // evidence record, so an anthropic retained payload stays unverified
+    // while still never probing.
+
+    // Positive case: (openai-completions, retained) is verified no-probe.
+    const goRetainedCompletionsModel = {
+      id: "deepseek-v4-flash",
+      provider: "opencode-go",
+      api: "openai-completions",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    } as any;
+    const retainedCompletionsCapability = resolveProviderCapability(
+      goRetainedCompletionsModel,
+      { model: "deepseek-v4-flash", prompt_cache_retention: "24h", messages: [] },
     );
+    assert(
+      retainedCompletionsCapability.state === "verified" &&
+        !retainedCompletionsCapability.automaticWarm,
+      "the completions retained family must resolve verified-no-probe",
+    );
+    assert(
+      !retainedCompletionsCapability.manualProbe,
+      "the retained family must disable the manual probe even while verified",
+    );
+    const retainedStrategy = resolveStrategy(goRetainedCompletionsModel, DEFAULT_CONFIG, {
+      model: "deepseek-v4-flash",
+      prompt_cache_retention: "24h",
+      messages: [],
+    });
     assert(
       retainedStrategy.family === "opencode-go-retained",
       "a retained payload must resolve the retained family",
@@ -1045,19 +1069,31 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       retainedStrategy.ttlLabel.includes("keepalive not needed"),
       "retained label must state that keepalive is not needed",
     );
-    const retainedCapability = resolveProviderCapability(goAnthropicFamilyModel, {
+    assert(
+      retainedStrategy.manualProbe === false,
+      "the retained strategy must not permit a manual probe",
+    );
+
+    // Negative case: (anthropic-messages, retained) is not promoted because
+    // no evidence record exists for it; the family still never probes.
+    const anthropicRetainedCapability = resolveProviderCapability(goAnthropicFamilyModel, {
       model: "qwen3.7-max",
       prompt_cache_retention: "24h",
       messages: [],
       system: [],
     });
     assert(
-      retainedCapability.state === "verified" && !retainedCapability.automaticWarm,
-      "the retained family must resolve verified-no-probe",
+      anthropicRetainedCapability.state === "unverified" &&
+        !anthropicRetainedCapability.automaticWarm,
+      "the anthropic retained pair must stay unverified (no evidence record)",
     );
     assert(
-      !retainedCapability.manualProbe,
-      "the retained family must disable the manual probe even while verified",
+      !anthropicRetainedCapability.manualProbe,
+      "the retained family must disable the manual probe on every transport",
+    );
+    assert(
+      anthropicRetainedCapability.reason.includes("no recorded retained evidence"),
+      "the anthropic retained reason must explain why the pair is not promoted",
     );
     assert(
       !supportsManualProbe(goAnthropicFamilyModel, {
@@ -1066,11 +1102,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
         messages: [],
         system: [],
       }),
-      "supportsManualProbe must refuse a retained payload",
-    );
-    assert(
-      retainedStrategy.manualProbe === false,
-      "the retained strategy must not permit a manual probe",
+      "supportsManualProbe must refuse an anthropic retained payload",
     );
     assert(
       resolveProviderCapability(goAnthropicFamilyModel, {
@@ -1709,8 +1741,9 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   );
 
   // Verified-no-probe families (opencode-go retained, and the verified
-  // completions-plain no-keepalive treatment) claim no savings, even when
-  // model pricing exists.
+  // completions-plain no-keepalive treatment) claim no savings: the anchor
+  // derives savingsKnown from the plan timer, so a no-probe route carries
+  // savingsKnown false even when model pricing exists.
   const noProbeCapability = {
     state: "verified",
     reason: "test",
@@ -1720,7 +1753,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(
     formatSavingsLabel({
       estimatedSavingsUsd: 0.12,
-      savingsKnown: true,
+      savingsKnown: false,
       pricingSource: "model",
       capability: noProbeCapability,
       provider: "opencode-go",
@@ -1733,12 +1766,45 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       probeMissCount: 0,
       totalEstimatedSavedUsd: 0.12,
       totalProbeCostUsd: 0.01,
-      savingsKnown: true,
+      savingsKnown: false,
       pricingSource: "model",
       capability: noProbeCapability,
       provider: "opencode-go",
     }) === "n/a (no keepalive scheduled)",
     "a verified no-keepalive route must summarize savings as n/a",
+  );
+  // A key-gated verified route (a pending cache key disables the timer while
+  // /warm now probes can still run) gets the terse chip label, but the
+  // cumulative summary keeps the probe counts with n/a amounts.
+  const keyGatedCapability = {
+    state: "verified",
+    reason: "test",
+    manualProbe: false,
+    automaticWarm: true,
+  } as const;
+  assert(
+    formatSavingsLabel({
+      estimatedSavingsUsd: 0.12,
+      savingsKnown: false,
+      pricingSource: "model",
+      capability: keyGatedCapability,
+      provider: "opencode-go",
+    }) === "n/a (no keepalive scheduled)",
+    "a key-gated verified route must not claim the no-pricing label",
+  );
+  assert(
+    formatSavingsSummary({
+      probeHitCount: 1,
+      probeMissCount: 0,
+      totalEstimatedSavedUsd: 0.12,
+      totalProbeCostUsd: 0.01,
+      savingsKnown: false,
+      pricingSource: "model",
+      capability: keyGatedCapability,
+      provider: "opencode-go",
+    }) ===
+      "probeHits=1 probeMisses=0 totalEstimatedSaved=n/a totalProbeCost=n/a net=n/a pricingSource=model savingsUnit=budget-dollars",
+    "a key-gated verified route must keep cumulative probe telemetry with n/a amounts",
   );
   // A verified probing route keeps dollar savings (the fixture above pins the
   // "est. $0.23 saved" phrase with automaticWarm undefined, which is treated
@@ -2603,14 +2669,15 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 // 11c) The retained family never probes end to end: /warm now on a payload
 // carrying prompt_cache_retention "24h" is refused before any provider request,
 // and the plan and the warmer agree because both derive manual gating from
-// capability.manualProbe.
+// capability.manualProbe. Uses the completions transport, where retained is
+// verified no-probe (the promoted pair).
 {
   let calls = 0;
   const goModel = {
-    id: "qwen3.7-max",
+    id: "deepseek-v4-flash",
     provider: "opencode-go",
-    api: "anthropic-messages",
-    baseUrl: "https://opencode.ai/zen/go",
+    api: "openai-completions",
+    baseUrl: "https://opencode.ai/zen/go/v1",
   } as any;
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
@@ -2642,9 +2709,8 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
   warmer.capturePayload(
     {
-      model: "qwen3.7-max",
+      model: "deepseek-v4-flash",
       prompt_cache_retention: "24h",
-      system: [{ type: "text", text: "sys" }],
       messages: [{ role: "user", content: "hi" }],
     },
     ctx,

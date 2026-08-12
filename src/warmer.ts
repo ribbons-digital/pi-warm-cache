@@ -610,13 +610,16 @@ export class SessionWarmer {
 
     const sessionId = ctx.sessionManager.getSessionId();
     const pricing = resolveModelPricing(model);
-    // Verified-no-probe families (opencode-go retained, and the verified
-    // completions-plain no-keepalive treatment) perform no keepalive and
-    // claim no savings: savingsKnown stays false so neither probes nor real
-    // turns accumulate savings, and the savings renderers show the n/a label.
+    // Savings are claimed only when the resolved plan actually runs a
+    // keepalive timer. The capability alone is not enough: a verified
+    // no-keepalive family (opencode-go retained, and the verified
+    // completions-plain treatment) resolves automaticWarm false, and a
+    // payload-level gate can disable the timer on a verified route (the
+    // responses key gate). The plan is the authoritative result after those
+    // gates, so savingsKnown follows plan.automaticWarm.
     const savingsKnown =
       this.capability.state === "verified" &&
-      this.capability.automaticWarm &&
+      this.plan?.automaticWarm === true &&
       pricing.savingsKnown;
     const preserveSessionStats = payloadContinuation;
     const realTurn = makeUnknownRealTurnObservation({

@@ -204,13 +204,22 @@ export default function piWarmCache(pi: ExtensionAPI) {
           return;
         }
         if (!result.ok) {
-          const failureLabel =
-            result.unavailable || result.capabilityState === "unsupported"
+          // A by-design refusal on a verified no-keepalive route (for example
+          // the retained family, which never probes) is not an error: the
+          // route is healthy and the refusal is the documented behavior, so
+          // it renders at warning level with the refusal explanation.
+          const deliberateRefusal =
+            result.unavailable &&
+            result.capabilityState === "verified" &&
+            !warmer.getCapability().automaticWarm;
+          const failureLabel = deliberateRefusal
+            ? "Probe unavailable"
+            : result.unavailable || result.capabilityState === "unsupported"
               ? `${xaiBestEffort ? "xAI best-effort probe" : "Probe"} unavailable`
               : `${xaiBestEffort ? "xAI best-effort probe" : "Probe"} failed`;
           ctx.ui.notify(
             `${manualOnlyWarning}${failureLabel}: ${result.error} (${diagnostics})`,
-            result.capabilityState === "unverified" ? "warning" : "error",
+            deliberateRefusal || result.capabilityState === "unverified" ? "warning" : "error",
           );
           return;
         }
