@@ -263,7 +263,7 @@ A provider error is reported as an error and does not increment `probeMisses`.
 ## Keepalive strategies
 
 | Strategy | Cache behavior | Default interval | Cache retention | State |
-|---|---|---:|---|---|---|
+|---|---|---:|---|---|
 | `anthropic-short` | 5-minute sliding cache window | about 4 minutes | `short` | verified |
 | `anthropic-long` | 1-hour cache markers already present on the wire | about 48 minutes | `long` | verified |
 | `openai-explicit` | 30-minute explicit prompt-cache mode | about 24 minutes | `short` | verified |
