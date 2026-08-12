@@ -9,8 +9,11 @@
  * All cold writes happen at t=0; each trial replays once at its own W.
  * A hit at W means TTL > W for that entry; a miss means TTL <= W.
  *
- * Usage: node scripts/ttl-finder.mjs <model-id> <W1,W2,W3,...>
- *   e.g. node scripts/ttl-finder.mjs deepseek-v4-flash 20,40,60,90,120
+ * Usage: node scripts/ttl-finder.mjs <model-id> <W1,W2,W3,...> [prefix-file]
+ *   e.g. node scripts/ttl-finder.mjs deepseek-v4-flash 20,40,60,90,120 \
+ *        /tmp/pi-warm-cache-campaign-test/bigprefix-control.txt
+ * The prefix file is required: each trial embeds a nonce into it, so any
+ * text file works, but it must exist (clear error otherwise).
  */
 
 import { readFileSync } from "node:fs";
@@ -26,10 +29,19 @@ const trialWs = (process.argv[3] ?? "20,40,60,90,120")
   .filter((n) => Number.isFinite(n) && n > 0)
   .sort((a, b) => a - b);
 
-const BASE_PREFIX = readFileSync(
-  "/tmp/pi-warm-cache-campaign-test/bigprefix-control.txt",
-  "utf8",
-);
+const prefixFile = process.argv[4];
+if (!prefixFile) {
+  console.error("missing required prefix-file argument (see usage)");
+  process.exit(2);
+}
+let basePrefix;
+try {
+  basePrefix = readFileSync(prefixFile, "utf8");
+} catch (err) {
+  console.error(`cannot read prefix file ${prefixFile}: ${err.message}`);
+  process.exit(2);
+}
+const BASE_PREFIX = basePrefix;
 
 const model = Object.values(OPENCODE_GO_MODELS).find(
   (m) => m.provider === "opencode-go" && m.id === modelId,

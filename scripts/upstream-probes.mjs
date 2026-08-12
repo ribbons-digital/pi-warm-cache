@@ -15,6 +15,7 @@
  * Usage: node scripts/upstream-probes.mjs
  */
 
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { complete } from "@earendil-works/pi-ai/compat";

@@ -25,8 +25,8 @@ import signal
 import sys
 import time
 
-REPO = "/Users/shiang/projects/ribbons-digital/pi-warm-cache"
-BASE = "/tmp/pi-warm-cache-campaign"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE = os.environ.get("PI_WARM_CACHE_CAMPAIGN_DIR", "/tmp/pi-warm-cache-campaign")
 INTERACTIVE_READY_S = 20
 POLL_S = 3
 PART1_IDLE_S = 120
