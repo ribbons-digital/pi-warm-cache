@@ -32,6 +32,7 @@ export {
   isStablePromptCacheKey,
   opencodeGoForeignInstrumentationReason,
   payloadHasCacheControl,
+  PROXY_ROUTE_REGISTRY,
   resolveProviderCapability,
 } from "./capability.ts";
 export type { ProviderCapability, ProviderCapabilityState } from "./types.ts";
@@ -294,7 +295,7 @@ function isOpencodeGoFamily(family: CacheFamily): boolean {
 function opencodeGoFamilyCadence(family: CacheFamily): string | null {
   switch (family) {
     case "opencode-go-retained":
-      return "retention requested on the wire; no keepalive scheduled";
+      return "24h retention on the wire; keepalive not needed";
     case "opencode-go-long-marker":
       return "best-effort probe cadence (~48m)";
     case "opencode-go-short-marker":
@@ -450,18 +451,18 @@ export function resolveStrategy(
       ttlLabel = "xAI best-effort probe cadence";
       break;
     case "opencode-go-retained":
-      // The retained family never schedules a probe. intervalMs null and
-      // automaticWarm false are safe under any state; Slice 8 promotion adds
-      // the explicit verified-no-probe automaticWarm override.
+      // The retained family never schedules a probe. The verified capability
+      // carries automaticWarm false via the explicit override, so this plan
+      // (intervalMs null, automaticWarm false) stays in agreement with it.
       return {
         capability,
         family,
         cacheRetention,
         intervalMs: null,
-        ttlLabel: "retention requested on the wire; no keepalive scheduled",
+        ttlLabel: "24h retention on the wire; keepalive not needed",
         waitLabel: null,
         automaticWarm: false,
-        manualProbe: false,
+        manualProbe: capability.manualProbe,
         longTtlDegradedReason: null,
       };
     case "opencode-go-long-marker":
@@ -470,6 +471,26 @@ export function resolveStrategy(
       break;
     case "opencode-go-short-marker":
     case "opencode-go-plain":
+      // (openai-completions, plain) is verified as no-keepalive: the e2e
+      // control showed the native completions cache TTL exceeds 130 min, so
+      // a timer adds no measurable benefit within the measured envelope. The
+      // plan agrees with the verified capability (automaticWarm false,
+      // intervalMs null). /warm now stays available for cold-cache
+      // protection and TTL uncertainty.
+      if (family === "opencode-go-plain" && model?.api === "openai-completions") {
+        return {
+          capability,
+          family,
+          cacheRetention,
+          intervalMs: null,
+          ttlLabel:
+            "native completions TTL exceeds 130m; keepalive not needed within the measured envelope",
+          waitLabel: null,
+          automaticWarm: false,
+          manualProbe: capability.manualProbe,
+          longTtlDegradedReason: null,
+        };
+      }
       ttlMs = ANTHROPIC_SHORT_TTL_MS;
       ttlLabel = "best-effort probe cadence (~4m)";
       break;

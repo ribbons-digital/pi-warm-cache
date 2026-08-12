@@ -85,7 +85,15 @@ export type SavingsLabelInput = Pick<
 export function formatSavingsLabel(anchor: SavingsLabelInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
-  if (!anchor.savingsKnown) return "n/a (no model pricing)";
+  if (!anchor.savingsKnown) {
+    // A verified route with usable pricing but no active keepalive timer
+    // (the verified no-probe families, or a timer gated by a pending cache
+    // key) is not missing pricing: say why no savings are claimed. Only
+    // routes without usable model cost data get the no-pricing label.
+    return anchor.pricingSource === "model"
+      ? "n/a (no keepalive scheduled)"
+      : "n/a (no model pricing)";
+  }
   const budgetDollars = anchor.provider === "opencode-go";
   const suffix = budgetDollars ? " (subscription budget-dollars)" : "";
   const n = anchor.estimatedSavingsUsd;
@@ -121,6 +129,19 @@ export type SavingsSummaryInput = Pick<
 export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
+  // The retained family genuinely never probes, so there is no telemetry to
+  // show and the terse label is right. The verified completions-plain
+  // treatment deliberately keeps /warm now, so a manual probe can run and
+  // accumulate probeHitCount, probeMissCount, and totalProbeCostUsd: once any
+  // probe is recorded, fall through to the cumulative field list with n/a
+  // amounts, mirroring the key-gated case below.
+  if (
+    anchor.capability?.state === "verified" &&
+    anchor.capability.automaticWarm === false &&
+    anchor.probeHitCount + anchor.probeMissCount === 0
+  ) {
+    return "n/a (no keepalive scheduled)";
+  }
 
   const amount = (value: number): string =>
     anchor.savingsKnown ? formatUsd(value) : "n/a";

@@ -610,7 +610,28 @@ export class SessionWarmer {
 
     const sessionId = ctx.sessionManager.getSessionId();
     const pricing = resolveModelPricing(model);
-    const savingsKnown = this.capability.state === "verified" && pricing.savingsKnown;
+    // Savings are claimed only when the resolved plan actually runs a
+    // keepalive timer. The capability alone is not enough: a verified
+    // no-keepalive family (opencode-go retained, and the verified
+    // completions-plain treatment) resolves automaticWarm false, and a
+    // payload-level gate can disable the timer on a verified route (the
+    // responses key gate). The plan is the authoritative result after those
+    // gates, so the active savings flag follows plan.automaticWarm.
+    //
+    // Carry-over of a continuing session's accumulated totals follows route
+    // and pricing continuity only: a temporarily gated turn (for example a
+    // responses turn whose payload fails the key gate) suppresses new savings
+    // claims but must not wipe the prior tally, so the next ungated turn
+    // resumes it. Today the plan gate is constant within any continuation
+    // (the key is a payload-continuity field), which makes the two predicates
+    // equal there; the split keeps them correct by construction if a future
+    // gate ever trips without breaking continuity.
+    const routeSavingsKnown =
+      this.capability.state === "verified" && pricing.savingsKnown;
+    const savingsKnown =
+      this.capability.state === "verified" &&
+      this.plan?.automaticWarm === true &&
+      pricing.savingsKnown;
     const preserveSessionStats = payloadContinuation;
     const realTurn = makeUnknownRealTurnObservation({
       provider: model.provider,
@@ -649,9 +670,9 @@ export class SessionWarmer {
       // changed prefix starts a new anchor and must not inherit old evidence.
       lastProbeAt: preserveSessionStats ? (prev?.lastProbeAt ?? null) : null,
       estimatedSavingsUsd:
-        savingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
+        routeSavingsKnown && preserveSessionStats ? (prev?.estimatedSavingsUsd ?? 0) : 0,
       totalEstimatedSavedUsd:
-        savingsKnown && preserveSessionStats ? (prev?.totalEstimatedSavedUsd ?? 0) : 0,
+        routeSavingsKnown && preserveSessionStats ? (prev?.totalEstimatedSavedUsd ?? 0) : 0,
       totalProbeCostUsd: preserveSessionStats ? (prev?.totalProbeCostUsd ?? 0) : 0,
       probeCount: preserveSessionStats ? (prev?.probeCount ?? 0) : 0,
       probeHitCount: preserveSessionStats ? (prev?.probeHitCount ?? 0) : 0,
@@ -1666,11 +1687,27 @@ export class SessionWarmer {
       });
     }
 
-    if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
+    // The retained family never probes, even when verified: the wire already
+    // requests 24h retention, so keepalive is not needed. The refusal is
+    // family-specific and independent of capability state, mirroring the xAI
+    // key-safety gate above; a verified retained route bypasses the
+    // unverified manual-probe gate below, so this check must stand alone.
+    if (anchor.cacheFamily === "opencode-go-retained") {
       const detail =
-        anchor.cacheFamily === "opencode-go-retained"
-          ? "the retained OpenCode Go family never probes; the captured payload requests 24h retention on the wire"
-          : "captured payload shape is not safe for an unverified manual probe";
+        "the retained OpenCode Go family never probes; the captured payload requests 24h retention on the wire, so keepalive is not needed";
+      this.clearTimers();
+      this.recordAttempt(reason, false, detail);
+      this.clearCapabilityUi(ctx);
+      return buildWarmResult({
+        fingerprint: anchor.payloadFingerprint,
+        error: detail,
+        unavailable: true,
+        anchor,
+      });
+    }
+
+    if (capability.state === "unverified" && !anchor.manualProbeAvailable) {
+      const detail = "captured payload shape is not safe for an unverified manual probe";
       this.recordAttempt(reason, false, detail);
       this.clearCapabilityUi(ctx);
       return buildWarmResult({
