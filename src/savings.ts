@@ -129,12 +129,17 @@ export type SavingsSummaryInput = Pick<
 export function formatSavingsSummary(anchor: SavingsSummaryInput): string {
   if (anchor.capability?.state === "unverified") return "n/a (unverified route)";
   if (anchor.capability?.state === "unsupported") return "n/a (unsupported route)";
-  // The genuine no-probe families (opencode-go retained, and the verified
-  // completions-plain treatment) never probe, so there is no telemetry to
-  // show. Key-gated verified routes (a pending cache key disables the timer
-  // but /warm now probes can still run) fall through so the cumulative probe
-  // counts stay visible with n/a amounts.
-  if (anchor.capability?.state === "verified" && anchor.capability.automaticWarm === false) {
+  // The retained family genuinely never probes, so there is no telemetry to
+  // show and the terse label is right. The verified completions-plain
+  // treatment deliberately keeps /warm now, so a manual probe can run and
+  // accumulate probeHitCount, probeMissCount, and totalProbeCostUsd: once any
+  // probe is recorded, fall through to the cumulative field list with n/a
+  // amounts, mirroring the key-gated case below.
+  if (
+    anchor.capability?.state === "verified" &&
+    anchor.capability.automaticWarm === false &&
+    anchor.probeHitCount + anchor.probeMissCount === 0
+  ) {
     return "n/a (no keepalive scheduled)";
   }
 

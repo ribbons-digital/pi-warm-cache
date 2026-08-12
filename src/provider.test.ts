@@ -1761,6 +1761,24 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     }) === "n/a (no keepalive scheduled)",
     "a verified no-keepalive route must render savings as n/a (no keepalive scheduled)",
   );
+  // The retained family genuinely never probes, so with zero recorded probes
+  // the summary is the terse label.
+  assert(
+    formatSavingsSummary({
+      probeHitCount: 0,
+      probeMissCount: 0,
+      totalEstimatedSavedUsd: 0.12,
+      totalProbeCostUsd: 0.01,
+      savingsKnown: false,
+      pricingSource: "model",
+      capability: noProbeCapability,
+      provider: "opencode-go",
+    }) === "n/a (no keepalive scheduled)",
+    "a no-probe family with no recorded probes must summarize as n/a",
+  );
+  // The verified completions-plain treatment deliberately keeps /warm now, so
+  // a manual probe accumulates telemetry; the summary must show the counts
+  // with n/a amounts instead of the terse label.
   assert(
     formatSavingsSummary({
       probeHitCount: 1,
@@ -1771,8 +1789,9 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       pricingSource: "model",
       capability: noProbeCapability,
       provider: "opencode-go",
-    }) === "n/a (no keepalive scheduled)",
-    "a verified no-keepalive route must summarize savings as n/a",
+    }) ===
+      "probeHits=1 probeMisses=0 totalEstimatedSaved=n/a totalProbeCost=n/a net=n/a pricingSource=model savingsUnit=budget-dollars",
+    "a no-probe family with recorded manual probes must keep the cumulative telemetry",
   );
   // A key-gated verified route (a pending cache key disables the timer while
   // /warm now probes can still run) gets the terse chip label, but the
