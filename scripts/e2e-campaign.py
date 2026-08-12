@@ -304,6 +304,18 @@ def main() -> int:
         except Exception:
             pass
         time.sleep(1)
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            transcript.close()
+        except Exception:
+            pass
     return 0
 
 
