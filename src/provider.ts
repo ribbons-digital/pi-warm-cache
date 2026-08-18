@@ -913,47 +913,53 @@ export function classifyRealTurnObservation(args: {
   };
 }
 
-function cacheControlSignature(payload: unknown): string {
+function cacheControlSignature<Payload>(payload: Payload): string {
   const controls: string[] = [];
-  const visit = (node: unknown): void => {
-    if (!node || typeof node !== "object") return;
+  function visit<Node>(node: Node): void {
     if (Array.isArray(node)) {
       for (const item of node) visit(item);
       return;
     }
-    const record = node as Record<string, unknown>;
-    if (record.cache_control && typeof record.cache_control === "object") {
-      controls.push(JSON.stringify(record.cache_control));
+    const body = payloadObject(node);
+    if (!body) return;
+    if (payloadObject(body.cache_control)) {
+      controls.push(JSON.stringify(body.cache_control));
     }
-    for (const value of Object.values(record)) visit(value);
-  };
+    for (const value of Object.values(body)) visit(value);
+  }
   visit(payload);
   return controls.sort().join("|");
 }
 
-function deepPayloadEqual(a: unknown, b: unknown, ignoreCacheControl = false): boolean {
-  if (Object.is(a, b)) return true;
-  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
-  if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      if (!deepPayloadEqual(a[i], b[i], ignoreCacheControl)) return false;
+function deepPayloadEqual<Actual, Expected>(
+  actual: Actual,
+  expected: Expected,
+  ignoreCacheControl = false,
+): boolean {
+  if (Object.is(actual, expected)) return true;
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    if (!Array.isArray(actual) || !Array.isArray(expected) || actual.length !== expected.length) {
+      return false;
+    }
+    for (let i = 0; i < actual.length; i++) {
+      if (!deepPayloadEqual(actual[i], expected[i], ignoreCacheControl)) return false;
     }
     return true;
   }
 
-  const aRecord = a as Record<string, unknown>;
-  const bRecord = b as Record<string, unknown>;
-  const keys = new Set([...Object.keys(aRecord), ...Object.keys(bRecord)]);
+  const actualBody = payloadObject(actual);
+  const expectedBody = payloadObject(expected);
+  if (!actualBody || !expectedBody) return false;
+  const keys = new Set([...Object.keys(actualBody), ...Object.keys(expectedBody)]);
   for (const key of keys) {
     if (ignoreCacheControl && key === "cache_control") continue;
-    if (!deepPayloadEqual(aRecord[key], bRecord[key], ignoreCacheControl)) return false;
+    if (!deepPayloadEqual(actualBody[key], expectedBody[key], ignoreCacheControl)) return false;
   }
   return true;
 }
 
 /** Fast stable-ish fingerprint for payload identity / logging. */
-export function stableFingerprint(payload: unknown): string {
+export function stableFingerprint<Payload>(payload: Payload): string {
   const json = JSON.stringify(payload);
   let hash = 2166136261;
   for (let i = 0; i < json.length; i++) {
@@ -968,7 +974,7 @@ export function stableFingerprint(payload: unknown): string {
  * Always exactly 8 hex characters (left-padded) or "none".
  * Never include the key itself in status text or diagnostic events.
  */
-export function getPromptCacheKeyFingerprint(payload: unknown, api: string | undefined): string {
+export function getPromptCacheKeyFingerprint<Payload>(payload: Payload, api: string | undefined): string {
   const key = getPromptCacheKey(payload, api);
   return key
     ? stableFingerprint(key).split(":")[0]!.slice(0, 8).padStart(8, "0")
