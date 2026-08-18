@@ -20,6 +20,30 @@ type PromptCachePayload = {
   prompt_cache_key?: PromptCacheKeyCandidate;
 };
 
+type PayloadValue =
+  | string
+  | number
+  | boolean
+  | bigint
+  | symbol
+  | null
+  | undefined
+  | PayloadValue[]
+  | { [key: string]: PayloadValue };
+
+type PayloadObject = { [key: string]: PayloadValue };
+
+function payloadObject<Value>(value: Value): PayloadObject | null {
+  if (
+    !value ||
+    value !== Object(value) ||
+    Array.isArray(value) ||
+    Object.prototype.toString.call(value).endsWith("Function]")
+  ) return null;
+  // SAFETY: Primitive, array, and callable values are excluded before property access.
+  return value as PayloadObject;
+}
+
 const OPENAI_COMPAT_APIS = new Set(["openai-responses", "openai-completions"]);
 const XAI_PROBE_APIS = new Set(["openai-responses", "openai-completions"]);
 const XAI_BEST_EFFORT_MODEL_IDS = new Set(["grok-4.5"]);
@@ -539,21 +563,22 @@ export function isSafeXaiReplayPayload<Payload>(payload: Payload): boolean {
  * Key presence counts regardless of value: a rewriter writes the key, so even
  * a null or empty value is evidence of mutation.
  */
-export function payloadHasCacheControl(payload: unknown): boolean {
+export function payloadHasCacheControl<Payload>(payload: Payload): boolean {
   let found = false;
-  const visit = (node: unknown): void => {
-    if (found || !node || typeof node !== "object") return;
+  function visit<Node>(node: Node): void {
+    if (found) return;
     if (Array.isArray(node)) {
       for (const item of node) visit(item);
       return;
     }
-    const obj = node as Record<string, unknown>;
-    if (Object.prototype.hasOwnProperty.call(obj, "cache_control")) {
+    const body = payloadObject(node);
+    if (!body) return;
+    if (Object.prototype.hasOwnProperty.call(body, "cache_control")) {
       found = true;
       return;
     }
-    for (const value of Object.values(obj)) visit(value);
-  };
+    for (const value of Object.values(body)) visit(value);
+  }
   visit(payload);
   return found;
 }
@@ -563,24 +588,23 @@ export function payloadHasCacheControl(payload: unknown): boolean {
  * the payload tree. Deep-walks nested objects and arrays, matching the
  * `payloadHasCacheControl` precedent.
  */
-function payloadHasCacheControlTtl(payload: unknown, ttl: string): boolean {
+function payloadHasCacheControlTtl<Payload>(payload: Payload, ttl: string): boolean {
   let found = false;
-  const visit = (node: unknown): void => {
-    if (found || !node || typeof node !== "object") return;
+  function visit<Node>(node: Node): void {
+    if (found) return;
     if (Array.isArray(node)) {
       for (const item of node) visit(item);
       return;
     }
-    const obj = node as Record<string, unknown>;
-    if (obj.cache_control && typeof obj.cache_control === "object") {
-      const cc = obj.cache_control as Record<string, unknown>;
-      if (cc.ttl === ttl) {
-        found = true;
-        return;
-      }
+    const body = payloadObject(node);
+    if (!body) return;
+    const cacheControl = payloadObject(body.cache_control);
+    if (cacheControl?.ttl === ttl) {
+      found = true;
+      return;
     }
-    for (const value of Object.values(obj)) visit(value);
-  };
+    for (const value of Object.values(body)) visit(value);
+  }
   visit(payload);
   return found;
 }
@@ -603,9 +627,9 @@ function payloadHasCacheControlTtl(payload: unknown, ttl: string): boolean {
  * `prompt_cache_retention`) is not a separate family and behaves like plain,
  * because the gateway in-memory TTL is still the default.
  */
-export function classifyOpencodeGoFamily(payload?: unknown): CacheFamily {
-  if (!payload || typeof payload !== "object") return "opencode-go-plain";
-  const body = payload as Record<string, unknown>;
+export function classifyOpencodeGoFamily<Payload>(payload?: Payload): CacheFamily {
+  const body = payloadObject(payload);
+  if (!body) return "opencode-go-plain";
   if (body.prompt_cache_retention === "24h") return "opencode-go-retained";
   if (payloadHasCacheControlTtl(payload, "1h")) return "opencode-go-long-marker";
   if (payloadHasCacheControl(payload)) return "opencode-go-short-marker";
@@ -633,11 +657,8 @@ function capability(
   };
 }
 
-function directXaiPayloadRejectionReason(payload: unknown): string | null {
-  const rawKey =
-    payload && typeof payload === "object"
-      ? (payload as Record<string, unknown>).prompt_cache_key
-      : undefined;
+function directXaiPayloadRejectionReason<Payload>(payload: Payload): string | null {
+  const rawKey = payloadObject(payload)?.prompt_cache_key;
   if (!isStablePromptCacheKey(rawKey)) {
     const detail = rawKey === undefined ? "is missing" : "is not a stable string";
     return `direct xAI Grok 4.5 best-effort route has no stable prompt-cache key (prompt_cache_key ${detail}) in the captured payload; automatic warming is disabled`;
@@ -656,9 +677,9 @@ function directXaiPayloadRejectionReason(payload: unknown): string | null {
  * When a captured payload is supplied, payload-dependent cache identity is
  * verified at the same gate as the provider route.
  */
-export function resolveProviderCapability(
+export function resolveProviderCapability<Payload = undefined>(
   model: Model<any> | undefined,
-  payload?: unknown,
+  payload?: Payload,
 ): ProviderCapability {
   if (!model) {
     return capability("unsupported", "no active model route; select a model before warming");
@@ -800,9 +821,9 @@ export function resolveProviderCapability(
  * Check whether an exact captured payload has a known replay shape for a
  * one-shot unverified probe.
  */
-export function isSafeReplayPayload(payload: unknown, api: string | undefined): boolean {
-  if (!payload || typeof payload !== "object") return false;
-  const body = payload as Record<string, unknown>;
+export function isSafeReplayPayload<Payload>(payload: Payload, api: string | undefined): boolean {
+  const body = payloadObject(payload);
+  if (!body) return false;
 
   if (api === "openai-responses" || api === "azure-openai-responses") {
     return Array.isArray(body.input);
@@ -815,7 +836,7 @@ export function isSafeReplayPayload(payload: unknown, api: string | undefined): 
   }
   if (api === "openai-codex-responses") {
     return (
-      typeof body.instructions === "string" &&
+      isStablePromptCacheKey(body.instructions) &&
       Array.isArray(body.input) &&
       body.store === false &&
       isStablePromptCacheKey(body.prompt_cache_key)
@@ -825,9 +846,9 @@ export function isSafeReplayPayload(payload: unknown, api: string | undefined): 
 }
 
 /** True when a route can accept a manual replay after payload-shape checks. */
-export function canManualProbe(
+export function canManualProbe<Payload>(
   model: Model<any> | undefined,
-  payload: unknown,
+  payload: Payload,
 ): boolean {
   const resolved = resolveProviderCapability(model, payload);
   return resolved.manualProbe && isSafeReplayPayload(payload, model?.api);
