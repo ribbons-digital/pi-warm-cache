@@ -72,7 +72,13 @@ import {
   renderWarmHitUi,
 } from "./ui.ts";
 import { resolveWarmNowFailure } from "./index.ts";
-import { DEFAULT_CONFIG, type ProviderCapability } from "./types.ts";
+import {
+  DEFAULT_CONFIG,
+  type CacheAnchor,
+  type ProviderCapability,
+  type StrategyPlan,
+  type WarmResult,
+} from "./types.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type WarmComplete = NonNullable<ConstructorParameters<typeof SessionWarmer>[1]>;
@@ -108,6 +114,66 @@ function contextFixture<Fixture>(ctx: Fixture): ExtensionContext {
 function completeFixture<Fn>(fn: Fn): WarmComplete {
   // SAFETY: Warmer tests return only the complete() fields SessionWarmer reads.
   return fn as WarmComplete;
+}
+
+function cacheAnchorFixture<Fixture>(anchor: Fixture): CacheAnchor {
+  // SAFETY: UI tests provide only the anchor fields the renderer reads.
+  return anchor as CacheAnchor;
+}
+
+function strategyPlanFixture<Fixture>(plan: Fixture): StrategyPlan {
+  // SAFETY: UI tests provide only the plan fields the renderer reads.
+  return plan as StrategyPlan;
+}
+
+function timerWarmerFixture<Warmer>(warmer: Warmer): {
+  runWarm: (reason: "timer") => Promise<WarmResult>;
+} {
+  // SAFETY: Tests fire the private timer path; SessionWarmer has no public timer hook.
+  return warmer as { runWarm: (reason: "timer") => Promise<WarmResult> };
+}
+
+function runTimerWarm(warmer: SessionWarmer): Promise<WarmResult> {
+  return timerWarmerFixture(warmer).runWarm("timer");
+}
+
+type ProbeReply = {
+  stopReason: "stop";
+  usage: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost?: { total: number };
+  };
+};
+
+type FirstProbeHooks = {
+  release?: (value: ProbeReply) => void;
+  started?: () => void;
+};
+
+function logNumber<Value>(value: Value): number | null {
+  if (value !== Object(value) && Object.prototype.toString.call(value) === "[object Number]" && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  return null;
+}
+
+function deferredLog(line: string): {
+  reason: string | null;
+  activeWarmSessions: number | null;
+  maxConcurrentWarmSessions: number | null;
+  providerRequest: boolean | null;
+} | null {
+  const body = payloadObject(JSON.parse(line));
+  if (!body || body.event !== "warm_deferred") return null;
+  return {
+    reason: logString(body.reason),
+    activeWarmSessions: logNumber(body.activeWarmSessions),
+    maxConcurrentWarmSessions: logNumber(body.maxConcurrentWarmSessions),
+    providerRequest: body.providerRequest === true ? true : body.providerRequest === false ? false : null,
+  };
 }
 
 function nextDueAtMs(status: string): number | null {
@@ -3236,25 +3302,24 @@ function deepEqualExcept<Actual, Expected>(
 // 14) Process-wide concurrency observability defers without sending an extra probe.
 {
   const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-concurrency-"));
-  const model = {
+  const model = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     baseUrl: "https://api.openai.com/v1",
     cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
-  } as any;
-  let calls = 0;
-  let releaseFirst: ((value: any) => void) | null = null;
-  let signalFirstStarted: (() => void) | null = null;
-  const firstStarted = new Promise<void>((resolve) => {
-    signalFirstStarted = resolve;
   });
-  const completeStub = async (): Promise<any> => {
+  let calls = 0;
+  const firstProbe: FirstProbeHooks = {};
+  const firstStarted = new Promise<void>((resolve) => {
+    firstProbe.started = resolve;
+  });
+  const completeStub = completeFixture(async () => {
     calls += 1;
     if (calls === 1) {
-      signalFirstStarted?.();
-      return new Promise((resolve) => {
-        releaseFirst = resolve;
+      firstProbe.started?.();
+      return new Promise<ProbeReply>((resolve) => {
+        firstProbe.release = resolve;
       });
     }
     return {
@@ -3267,7 +3332,7 @@ function deepEqualExcept<Actual, Expected>(
         cost: { total: 0.01 },
       },
     };
-  };
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
     notify: () => undefined,
@@ -3275,7 +3340,7 @@ function deepEqualExcept<Actual, Expected>(
     setWidget: () => undefined,
   };
   const makeContext = (sessionId: string) =>
-    ({
+    contextFixture({
       cwd,
       model,
       hasUI: false,
@@ -3286,14 +3351,14 @@ function deepEqualExcept<Actual, Expected>(
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
       },
-    }) as any;
+    });
   const payload = (sessionId: string) => ({
     model: model.id,
     input: [{ role: "user", content: [{ type: "input_text", text: "concurrency" }] }],
     prompt_cache_key: sessionId,
   });
-  const warmerA = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
-  const warmerB = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  const warmerA = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
+  const warmerB = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   const ctxA = makeContext("concurrency-a");
   const ctxB = makeContext("concurrency-b");
 
@@ -3337,15 +3402,28 @@ function deepEqualExcept<Actual, Expected>(
     .trim()
     .split("\n")
     .filter(Boolean)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
-  const gateEvent = events.find((event) => event.event === "warm_deferred" && event.reason === "concurrency limit");
+    .map(deferredLog);
+  let gateEvent:
+    | {
+        reason: string | null;
+        activeWarmSessions: number | null;
+        maxConcurrentWarmSessions: number | null;
+        providerRequest: boolean | null;
+      }
+    | undefined;
+  for (const event of events) {
+    if (event && event.reason === "concurrency limit") {
+      gateEvent = event;
+      break;
+    }
+  }
   assert(gateEvent !== undefined, "concurrency deferral should emit a JSONL event");
-  assert(gateEvent?.activeWarmSessions === 1, "JSONL deferral should record active warm sessions");
-  assert(gateEvent?.maxConcurrentWarmSessions === 1, "JSONL deferral should record the configured limit");
-  assert(gateEvent?.providerRequest === false, "deferred JSONL event must state that no provider request was sent");
+  assert(gateEvent.activeWarmSessions === 1, "JSONL deferral should record active warm sessions");
+  assert(gateEvent.maxConcurrentWarmSessions === 1, "JSONL deferral should record the configured limit");
+  assert(gateEvent.providerRequest === false, "deferred JSONL event must state that no provider request was sent");
 
-  const release = releaseFirst as unknown as (value: any) => void;
-  release({
+  if (!firstProbe.release) throw new Error("the first probe must expose a release hook");
+  firstProbe.release({
     stopReason: "stop",
     usage: {
       input: 1,
@@ -3372,18 +3450,18 @@ function deepEqualExcept<Actual, Expected>(
 // 15) Agent-busy timer ticks retain an explicit deferral reason.
 {
   const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-busy-"));
-  const model = {
+  const model = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     baseUrl: "https://api.openai.com/v1",
-  } as any;
+  });
   let calls = 0;
-  const completeStub = async (): Promise<any> => {
+  const completeStub = completeFixture(async () => {
     calls += 1;
     return { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0 } };
-  };
-  const ctx = {
+  });
+  const ctx = contextFixture({
     cwd,
     model,
     hasUI: false,
@@ -3394,8 +3472,8 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
     },
-  } as any;
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000, logToFile: true });
   warmer.capturePayload(
@@ -3408,7 +3486,7 @@ function deepEqualExcept<Actual, Expected>(
   );
   warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
 
-  const result = await (warmer as any).runWarm("timer");
+  const result = await runTimerWarm(warmer);
   assert(result.deferred?.reason === "agent busy", "a busy timer tick should be marked deferred");
   assert(calls === 0, "a busy timer tick must not call the provider");
   assert(warmer.getStatusText().includes("deferred=agent busy"), "status should expose the busy deferral reason");
@@ -3418,14 +3496,19 @@ function deepEqualExcept<Actual, Expected>(
 
 // 16) UI surfaces stay concise, distinguish re-anchoring, and hide the widget cleanly.
 {
-  const calls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
+  type UiCall = {
+    kind: "widget" | "status" | "notify";
+    value: string | string[] | undefined;
+    level?: NotifyLevel;
+  };
+  const calls: UiCall[] = [];
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
-    setWidget: (_id: string, value: unknown) => calls.push({ kind: "widget", value }),
-    setStatus: (_id: string, value: unknown) => calls.push({ kind: "status", value }),
+    setWidget: (_id: string, value?: string[]) => calls.push({ kind: "widget", value }),
+    setStatus: (_id: string, value?: string) => calls.push({ kind: "status", value }),
   };
-  const ctx = { hasUI: true, ui } as any;
-  const anchor = {
+  const ctx = contextFixture({ hasUI: true, ui });
+  const anchor = cacheAnchorFixture({
     cachedTokens: 128_000,
     promptTokens: 128_000,
     probeHitCount: 2,
@@ -3433,8 +3516,8 @@ function deepEqualExcept<Actual, Expected>(
     savingsKnown: true,
     estimatedSavingsUsd: 0.12,
     capability: { state: "verified", automaticWarm: true },
-  } as any;
-  const plan = {
+  });
+  const plan = strategyPlanFixture({
     family: "openai-implicit",
     intervalMs: 240_000,
     ttlLabel: "~8m idle cache window",
@@ -3442,7 +3525,7 @@ function deepEqualExcept<Actual, Expected>(
     automaticWarm: true,
     manualProbe: false,
     cacheRetention: "short",
-  } as any;
+  });
 
   renderWaitingUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, anchor, plan, Date.now() + 180_000);
   renderWarmHitUi(ctx, { ...DEFAULT_CONFIG, showWidget: true }, anchor, plan, 128_000);
@@ -3459,7 +3542,7 @@ function deepEqualExcept<Actual, Expected>(
   );
   assert(
     widgets.some((call) =>
-      (call.value as string[]).some((line) => line.includes("re-anchoring after compaction")),
+      Array.isArray(call.value) && call.value.some((line) => line.includes("re-anchoring after compaction")),
     ),
     "re-anchoring needs a distinct non-alarming widget message",
   );
@@ -3500,21 +3583,21 @@ function deepEqualExcept<Actual, Expected>(
     "waiting status should show the gate deferral and occupied slots",
   );
 
-  const xaiCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
-  const xaiCtx = {
+  const xaiCalls: UiCall[] = [];
+  const xaiCtx = contextFixture({
     hasUI: true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      setWidget: (_id: string, value: unknown) => xaiCalls.push({ kind: "widget", value }),
-      setStatus: (_id: string, value: unknown) => xaiCalls.push({ kind: "status", value }),
+      setWidget: (_id: string, value?: string[]) => xaiCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value?: string) => xaiCalls.push({ kind: "status", value }),
     },
-  } as any;
-  const xaiAnchor = { ...anchor, capability: { state: "verified", automaticWarm: true } } as any;
-  const xaiPlan = {
+  });
+  const xaiAnchor = cacheAnchorFixture({ ...anchor, capability: { state: "verified", automaticWarm: true } });
+  const xaiPlan = strategyPlanFixture({
     ...plan,
     family: "xai-best-effort",
     ttlLabel: "xAI best-effort probe cadence",
-  } as any;
+  });
   renderWaitingUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiAnchor, xaiPlan, Date.now() + 180_000);
   renderWarmHitUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiAnchor, xaiPlan, 128_000);
   renderReanchorUi(xaiCtx, { ...DEFAULT_CONFIG, showWidget: true }, "prompt_cache_key changed", "xAI best-effort");
@@ -3528,16 +3611,16 @@ function deepEqualExcept<Actual, Expected>(
   assert(xaiUiText.includes("xAI best-effort"), "xAI UI should label the best-effort policy");
   assert(!xaiUiText.includes("xAI best-effort cache warm · xAI best-effort extension probe hit"), "xAI hit UI should avoid redundant policy labels");
 
-  const capabilityCalls: Array<{ kind: "widget" | "status" | "notify"; value: unknown; level?: string }> = [];
-  const capabilityCtx = {
+  const capabilityCalls: UiCall[] = [];
+  const capabilityCtx = contextFixture({
     hasUI: true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      setWidget: (_id: string, value: unknown) => capabilityCalls.push({ kind: "widget", value }),
-      setStatus: (_id: string, value: unknown) => capabilityCalls.push({ kind: "status", value }),
-      notify: (value: string, level: string) => capabilityCalls.push({ kind: "notify", value, level }),
+      setWidget: (_id: string, value?: string[]) => capabilityCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value?: string) => capabilityCalls.push({ kind: "status", value }),
+      notify: (value: string, level: NotifyLevel = "info") => capabilityCalls.push({ kind: "notify", value, level }),
     },
-  } as any;
+  });
   renderCapabilityNotice(capabilityCtx, {
     state: "unverified",
     reason: "direct xAI route has no verified automatic keepalive strategy",
@@ -3586,15 +3669,15 @@ function deepEqualExcept<Actual, Expected>(
   const unsupportedNotice = capabilityCalls.filter((call) => call.kind === "notify").at(-1);
   assert(unsupportedNotice?.level === "info", "unsupported route notice should not be warning-level noise");
 
-  const hiddenCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
-  const hiddenCtx = {
+  const hiddenCalls: UiCall[] = [];
+  const hiddenCtx = contextFixture({
     hasUI: true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      setWidget: (_id: string, value: unknown) => hiddenCalls.push({ kind: "widget", value }),
-      setStatus: (_id: string, value: unknown) => hiddenCalls.push({ kind: "status", value }),
+      setWidget: (_id: string, value?: string[]) => hiddenCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value?: string) => hiddenCalls.push({ kind: "status", value }),
     },
-  } as any;
+  });
   const hiddenConfig = { ...DEFAULT_CONFIG, showWidget: false };
   renderWaitingUi(hiddenCtx, hiddenConfig, anchor, plan, Date.now() + 180_000);
   renderWarmHitUi(hiddenCtx, hiddenConfig, anchor, plan, 128_000);
