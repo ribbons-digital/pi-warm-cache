@@ -20,7 +20,7 @@ type PromptCachePayload = {
   prompt_cache_key?: PromptCacheKeyCandidate;
 };
 
-type PayloadValue =
+export type PayloadValue =
   | string
   | number
   | boolean
@@ -31,9 +31,9 @@ type PayloadValue =
   | PayloadValue[]
   | { [key: string]: PayloadValue };
 
-type PayloadObject = { [key: string]: PayloadValue };
+export type PayloadObject = { [key: string]: PayloadValue };
 
-function payloadObject<Value>(value: Value): PayloadObject | null {
+export function payloadObject<Value>(value: Value): PayloadObject | null {
   if (
     !value ||
     value !== Object(value) ||
