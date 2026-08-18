@@ -16,6 +16,7 @@ import {
   isBestEffortNoWriteFamily,
   isPayloadContinuation,
   isSafeReplayPayload,
+  payloadObject,
   isSafeXaiReplayPayload,
   resolveMaxIdleWarmMs,
   resolveProviderCapability,
@@ -44,7 +45,6 @@ import {
 import type { StrategyResolution } from "./provider.ts";
 import type {
   CacheAnchor,
-  CacheFamily,
   ProbeObservation,
   ProbeOutcome,
   ProviderCapability,
@@ -475,9 +475,8 @@ export class SessionWarmer {
   }
 
   /** Capture the exact provider payload from a real agent turn. Read-only. */
-  capturePayload(payload: unknown, ctx: ExtensionContext): void {
-    if (this.warming) return;
-    if (!payload || typeof payload !== "object") return;
+  capturePayload<Payload>(payload: Payload, ctx: ExtensionContext): void {
+    if (this.warming || !payloadObject(payload)) return;
 
     this.ctx = ctx;
     this.logFile = warmLogPath(ctx.cwd);
@@ -1134,7 +1133,7 @@ export class SessionWarmer {
     this.clearTimers();
 
     let delay: number;
-    if (typeof options.delayMs === "number") {
+    if (options.delayMs !== undefined) {
       delay = Math.max(1_000, options.delayMs);
     } else {
       const elapsed = Date.now() - anchor.lastActivityAt;
@@ -1433,12 +1432,12 @@ export class SessionWarmer {
     });
   }
 
-  private log(event: Omit<WarmLogEvent, "ts">): void {
+  private log(event: Omit<WarmLogEvent, "ts"> & { event: string }): void {
     if (!this.config.logToFile) return;
     const { event: eventName, ...fields } = event;
     const logEvent: WarmLogEvent = {
       ts: new Date().toISOString(),
-      event: eventName as string,
+      event: eventName,
       ...fields,
     };
     const path = appendWarmLog(this.ctx?.cwd, logEvent);
@@ -1930,13 +1929,13 @@ export class SessionWarmer {
             const cloned = structuredClone(payload);
             const codex = model.api === "openai-codex-responses";
             const xaiBestEffort = anchor.cacheFamily === "xai-best-effort";
-            const shaped = codex
+            const warmPayload = codex
               ? appendWarmUserTurn(cloned, this.config.warmSuffix, model.api)
               : cloned;
             return xaiBestEffort
-              ? applyXaiWarmOutputLimit(shaped, this.config.maxOutputTokens)
+              ? applyXaiWarmOutputLimit(warmPayload, this.config.maxOutputTokens)
               : applyWarmOutputLimit(
-                  shaped,
+                  warmPayload,
                   this.config.maxOutputTokens,
                   model.api,
                   getModelCompat(model),
@@ -2218,6 +2217,5 @@ function compactDiagnostic(value: string): string {
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>): void {
-  const t = timer as { unref?: () => void };
-  if (typeof t.unref === "function") t.unref();
+  timer.unref();
 }
