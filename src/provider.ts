@@ -1,5 +1,6 @@
 import type { CacheRetention, Model } from "@earendil-works/pi-ai";
 import { formatDurationShort } from "./config.ts";
+import type { PayloadObject } from "./capability.ts";
 import {
   classifyOpencodeGoFamily,
   getPromptCacheKey,
@@ -600,6 +601,11 @@ export const CODEX_WARM_OUTPUT_ABORT_TOKENS = 256;
 
 export type CodexOversizedDecision = "ok" | "soft-skip" | "sticky-block";
 
+export type CodexOversizedAction = {
+  decision: CodexOversizedDecision;
+  consecutiveAfter: number;
+};
+
 /**
  * Pure policy for Codex oversized warm ticks.
  * - under threshold: reset streak, continue normally
@@ -610,7 +616,7 @@ export function decideCodexOversizedAction(
   outputTokens: number,
   consecutiveOversizedBefore: number,
   threshold: number = CODEX_WARM_OUTPUT_ABORT_TOKENS,
-): { decision: CodexOversizedDecision; consecutiveAfter: number } {
+): CodexOversizedAction {
   if (outputTokens < threshold) {
     return { decision: "ok", consecutiveAfter: 0 };
   }
@@ -621,14 +627,23 @@ export function decideCodexOversizedAction(
   return { decision: "sticky-block", consecutiveAfter };
 }
 
+function isPrimitiveString<Value>(value: Value): value is Value & string {
+  return (
+    value !== Object(value) &&
+    Object.prototype.toString.call(value) === "[object String]"
+  );
+}
+
 /** Detect ChatGPT Codex request bodies (no max_output_tokens support). */
-export function isCodexPayload(payload: Record<string, unknown>): boolean {
+export function isCodexPayload<Payload>(payload: Payload): boolean {
+  const body = payloadObject(payload);
+  if (!body) return false;
   // Codex bodies use instructions + input + store:false and never ship max_output_tokens.
   return (
-    typeof payload.instructions === "string" &&
-    Array.isArray(payload.input) &&
-    payload.store === false &&
-    typeof payload.prompt_cache_key === "string"
+    isPrimitiveString(body.instructions) &&
+    Array.isArray(body.input) &&
+    body.store === false &&
+    isPrimitiveString(body.prompt_cache_key)
   );
 }
 
@@ -642,15 +657,14 @@ export function appendWarmUserTurn<Payload>(
   text: string,
   api?: string,
 ): Payload {
-  if (!payload || typeof payload !== "object") return payload;
-  if (!text || !text.trim()) return payload;
-  const p = payload as Record<string, unknown>;
+  const body = payloadObject(payload);
+  if (!body || !text || !text.trim()) return payload;
   const content = text.trim();
 
-  if (Array.isArray(p.input)) {
+  if (Array.isArray(body.input)) {
     // OpenAI Responses / Codex shape
-    p.input = [
-      ...(p.input as unknown[]),
+    body.input = [
+      ...body.input,
       {
         role: "user",
         content: [{ type: "input_text", text: content }],
@@ -659,13 +673,13 @@ export function appendWarmUserTurn<Payload>(
     return payload;
   }
 
-  if (Array.isArray(p.messages)) {
+  if (Array.isArray(body.messages)) {
     // Anthropic Messages / Chat Completions shape
     const anthropic =
       api === "anthropic-messages" ||
-      (Array.isArray(p.system) && typeof p.model === "string");
-    p.messages = [
-      ...(p.messages as unknown[]),
+      (Array.isArray(body.system) && isPrimitiveString(body.model));
+    body.messages = [
+      ...body.messages,
       anthropic
         ? { role: "user", content: [{ type: "text", text: content }] }
         : { role: "user", content },
@@ -701,50 +715,50 @@ export function applyWarmOutputLimit<Payload>(
   api?: string,
   compat?: ModelCompat,
 ): Payload {
-  if (!payload || typeof payload !== "object") return payload;
-  const p = payload as Record<string, unknown>;
+  const body = payloadObject(payload);
+  if (!body) return payload;
 
-  const codex = api === "openai-codex-responses" || isCodexPayload(p);
+  const codex = api === "openai-codex-responses" || isCodexPayload(body);
   if (codex) {
     // Codex rejects hard output caps. Strip if a caller injected them.
-    delete p.max_output_tokens;
-    delete p.max_tokens;
-    delete p.max_completion_tokens;
+    delete body.max_output_tokens;
+    delete body.max_tokens;
+    delete body.max_completion_tokens;
     // Leave reasoning.effort / tool_choice identical (no same-session proof yet).
     return payload;
   }
 
-  let floor = minimumOutputTokensForPayload(p, maxOutputTokens);
+  let floor = minimumOutputTokensForPayload(body, maxOutputTokens);
   const openAiResponses =
     api === "openai-responses" ||
     api === "azure-openai-responses" ||
-    ("max_output_tokens" in p && Array.isArray(p.input));
+    ("max_output_tokens" in body && Array.isArray(body.input));
   if (openAiResponses) {
     floor = Math.max(floor, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS);
   }
 
   let touched = false;
-  if ("max_output_tokens" in p) {
-    p.max_output_tokens = floor;
+  if ("max_output_tokens" in body) {
+    body.max_output_tokens = floor;
     touched = true;
   }
-  if ("max_completion_tokens" in p) {
-    p.max_completion_tokens = floor;
+  if ("max_completion_tokens" in body) {
+    body.max_completion_tokens = floor;
     touched = true;
   }
-  if ("max_tokens" in p) {
-    p.max_tokens = floor;
+  if ("max_tokens" in body) {
+    body.max_tokens = floor;
     touched = true;
   }
 
   // Only add a cap when we know the API and the original body had none.
   if (!touched) {
     if (api === "anthropic-messages") {
-      p.max_tokens = floor;
+      body.max_tokens = floor;
     } else if (api === "openai-responses" || api === "azure-openai-responses") {
-      p.max_output_tokens = floor;
+      body.max_output_tokens = floor;
     } else if (api === "openai-completions") {
-      p[compat?.maxTokensField ?? "max_completion_tokens"] = floor;
+      body[compat?.maxTokensField ?? "max_completion_tokens"] = floor;
     }
     // Unknown API shapes: leave unchanged rather than guess a rejected field.
   }
@@ -758,9 +772,9 @@ export function applyWarmOutputLimit<Payload>(
  * fields, and leave reasoning/tool/cache-routing fields untouched.
  */
 export function applyXaiWarmOutputLimit<Payload>(payload: Payload, preferred: number): Payload {
-  if (!payload || typeof payload !== "object") return payload;
-  const p = payload as Record<string, unknown>;
-  p.max_output_tokens = Math.max(
+  const body = payloadObject(payload);
+  if (!body) return payload;
+  body.max_output_tokens = Math.max(
     OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
     Math.max(1, preferred),
   );
@@ -769,17 +783,23 @@ export function applyXaiWarmOutputLimit<Payload>(payload: Payload, preferred: nu
 
 /** Lowest legal output cap that still satisfies thinking-budget constraints. */
 export function minimumOutputTokensForPayload(
-  payload: Record<string, unknown>,
+  payload: PayloadObject,
   preferred: number,
 ): number {
   let floor = Math.max(1, preferred);
 
   const thinking = payload.thinking;
-  if (thinking && typeof thinking === "object") {
-    const t = thinking as Record<string, unknown>;
-    if (t.type === "enabled" && typeof t.budget_tokens === "number" && t.budget_tokens >= 0) {
+  const thinkingBody = payloadObject(thinking);
+  if (thinkingBody) {
+    const budget = thinkingBody.budget_tokens;
+    if (
+      thinkingBody.type === "enabled" &&
+      budget !== Object(budget) &&
+      Object.prototype.toString.call(budget) === "[object Number]" &&
+      Number(budget) >= 0
+    ) {
       // Anthropic: max_tokens must be greater than budget_tokens.
-      floor = Math.max(floor, Math.floor(t.budget_tokens) + 1);
+      floor = Math.max(floor, Math.floor(Number(budget)) + 1);
     }
   }
 
@@ -807,17 +827,14 @@ export const WARM_MUTABLE_PAYLOAD_KEYS = new Set([
  * if any non-conversation field changes, the next real-turn classification is
  * unknown instead of claiming a miss caused by the provider.
  */
-export function isPayloadContinuation(
-  previous: unknown,
-  current: unknown,
+export function isPayloadContinuation<Previous, Current>(
+  previous: Previous,
+  current: Current,
   api: string | undefined,
 ): boolean {
-  if (!previous || typeof previous !== "object" || !current || typeof current !== "object") {
-    return false;
-  }
-
-  const previousBody = previous as Record<string, unknown>;
-  const currentBody = current as Record<string, unknown>;
+  const previousBody = payloadObject(previous);
+  const currentBody = payloadObject(current);
+  if (!previousBody || !currentBody) return false;
   const conversationKey =
     api === "anthropic-messages" || api === "openai-completions" ? "messages" : "input";
   const previousItems = previousBody[conversationKey];
