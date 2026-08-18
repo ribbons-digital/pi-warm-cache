@@ -70,13 +70,14 @@ export default function piWarmCache(pi: ExtensionAPI) {
     }
 
     const flag = pi.getFlag("warm-cache");
-    if (typeof flag === "string") {
-      if (flag === "false" || flag === "0" || flag === "off") {
+    if (Object.prototype.toString.call(flag) === "[object String]") {
+      const value = String(flag);
+      if (value === "false" || value === "0" || value === "off") {
         config = { ...config, enabled: false };
-      } else if (flag === "true" || flag === "1" || flag === "on") {
+      } else if (value === "true" || value === "1" || value === "on") {
         config = { ...config, enabled: true };
       } else {
-        config = parseConfigArgs(flag, config);
+        config = parseConfigArgs(value, config);
       }
     }
 
@@ -159,14 +160,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
 
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
-    const usage = (event.message as {
-      usage?: {
-        input?: number;
-        output?: number;
-        cacheRead?: number;
-        cacheWrite?: number;
-      };
-    }).usage;
+    const usage = event.message.usage;
     if (!usage) return;
     warmer.noteAssistantUsage(ctx, usage);
   });

@@ -1,6 +1,17 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import type { ModelCost } from "@earendil-works/pi-ai";
 import type { ProbeOutcome } from "./types.ts";
+
+type WarmLogValue =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | ModelCost
+  | WarmLogValue[]
+  | { [key: string]: WarmLogValue };
 
 export type WarmLogEvent = {
   ts: string;
@@ -11,7 +22,7 @@ export type WarmLogEvent = {
   detail?: string;
   ok?: boolean;
   reason?: string;
-  [key: string]: unknown;
+  [key: string]: WarmLogValue;
 };
 
 /**

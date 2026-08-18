@@ -40,8 +40,8 @@ function opencodeGoApiKey() {
     const auth = JSON.parse(
       readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf8"),
     );
-    const entry = auth["opencode-go"] ?? auth["opencode"];
-    if (entry && typeof entry.key === "string" && entry.key) return entry.key;
+    const key = (auth["opencode-go"] ?? auth["opencode"])?.key;
+    if (Object.prototype.toString.call(key) === "[object String]" && key.length > 0) return key;
   } catch {
     // fall through
   }
@@ -146,12 +146,12 @@ async function anthropicLongMarkerObservation() {
     );
     const controls = [];
     const visit = (node) => {
-      if (!node || typeof node !== "object") return;
+      if (!node || node !== Object(node)) return;
       if (Array.isArray(node)) {
         node.forEach(visit);
         return;
       }
-      if (node.cache_control && typeof node.cache_control === "object") {
+      if (node.cache_control && node.cache_control === Object(node.cache_control)) {
         controls.push(JSON.stringify(node.cache_control));
       }
       Object.values(node).forEach(visit);
