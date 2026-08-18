@@ -468,6 +468,18 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "callable values must not qualify as payload objects",
   );
   assert(!canManualProbe(directXai, xaiPayload), "verified xAI should not use the unverified probe path");
+  assert(
+    isSafeReplayPayload(
+      {
+        instructions: "Keep this multi-line system prompt.\nPreserve its whitespace.",
+        input: [],
+        store: false,
+        prompt_cache_key: "codex-session-1",
+      },
+      "openai-codex-responses",
+    ),
+    "multi-line Codex instructions must remain safe to replay",
+  );
   const xaiWithoutKey = { ...xaiPayload, prompt_cache_key: undefined };
   const xaiWithoutKeyStrategy = resolveStrategy(directXai, DEFAULT_CONFIG, xaiWithoutKey);
   assert(!xaiWithoutKeyStrategy.automaticWarm, "xAI must fail closed without a cache key");

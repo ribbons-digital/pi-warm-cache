@@ -485,11 +485,15 @@ export function isDirectXaiGrokRoute(model: Model<any> | undefined): boolean {
  * exact format. Keep the check strict about accidental whitespace and control
  * characters without inventing a provider-specific length or character rule.
  */
+function isStringValue<Value>(value: Value): value is Value & string {
+  return (
+    value !== Object(value) &&
+    Object.prototype.toString.call(value) === "[object String]"
+  );
+}
+
 export function isStablePromptCacheKey<Value>(value: Value): value is Value & string {
-  if (
-    value === Object(value) ||
-    Object.prototype.toString.call(value) !== "[object String]"
-  ) return false;
+  if (!isStringValue(value)) return false;
   const text = String(value);
   if (text.length === 0 || text !== text.trim()) return false;
   for (const character of text) {
@@ -836,7 +840,7 @@ export function isSafeReplayPayload<Payload>(payload: Payload, api: string | und
   }
   if (api === "openai-codex-responses") {
     return (
-      isStablePromptCacheKey(body.instructions) &&
+      isStringValue(body.instructions) &&
       Array.isArray(body.input) &&
       body.store === false &&
       isStablePromptCacheKey(body.prompt_cache_key)
