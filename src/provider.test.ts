@@ -2883,19 +2883,19 @@ function deepEqualExcept<Actual, Expected>(
 // verified no-probe (the promoted pair).
 {
   let calls = 0;
-  const goModel = {
+  const goModel = modelFixture({
     id: "deepseek-v4-flash",
     provider: "opencode-go",
     api: "openai-completions",
     baseUrl: "https://opencode.ai/zen/go/v1",
-  } as any;
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
     notify: () => undefined,
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model: goModel,
     hasUI: false,
@@ -2906,15 +2906,15 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
     },
-  } as any;
-  const completeStub = async (): Promise<any> => {
+  });
+  const completeStub = completeFixture(async () => {
     calls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
     };
-  };
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
   warmer.capturePayload(
@@ -2932,9 +2932,9 @@ function deepEqualExcept<Actual, Expected>(
       !retainedCapability.manualProbe,
     "the retained family must resolve verified-no-probe with the manual probe disabled",
   );
-  const retainedPlan = (warmer as any).plan as { family: string; manualProbe: boolean };
+  const retainedStatus = warmer.getStatusText();
   assert(
-    retainedPlan.family === "opencode-go-retained" && retainedPlan.manualProbe === false,
+    retainedStatus.includes("strategy=opencode-go-retained") && retainedStatus.includes("nextDue=none"),
     "the retained plan must agree that no manual probe is available",
   );
   const retainedResult = await warmer.warmNow(ctx);
@@ -2953,19 +2953,19 @@ function deepEqualExcept<Actual, Expected>(
 // protection and TTL uncertainty.
 {
   let calls = 0;
-  const goModel = {
+  const goModel = modelFixture({
     id: "deepseek-v4-flash",
     provider: "opencode-go",
     api: "openai-completions",
     baseUrl: "https://opencode.ai/zen/go/v1",
-  } as any;
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
     notify: () => undefined,
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model: goModel,
     hasUI: false,
@@ -2976,15 +2976,15 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
     },
-  } as any;
-  const completeStub = async (): Promise<any> => {
+  });
+  const completeStub = completeFixture(async () => {
     calls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
     };
-  };
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
   warmer.capturePayload(
@@ -3001,17 +3001,12 @@ function deepEqualExcept<Actual, Expected>(
       !completionsCapability.manualProbe,
     "the verified completions-plain route must be no-keepalive",
   );
-  const completionsPlan = (warmer as any).plan as {
-    family: string;
-    automaticWarm: boolean;
-    intervalMs: number | null;
-    manualProbe: boolean;
-  };
+  const completionsStatus = warmer.getStatusText();
   assert(
-    completionsPlan.family === "opencode-go-plain" &&
-      completionsPlan.automaticWarm === false &&
-      completionsPlan.intervalMs === null &&
-      completionsPlan.manualProbe === false,
+    completionsStatus.includes("strategy=opencode-go-plain") &&
+      completionsStatus.includes("autoWarm=off") &&
+      completionsStatus.includes("intervalMs=none") &&
+      completionsStatus.includes("nextDue=none"),
     "the completions-plain plan must agree with the capability: no timer",
   );
   const result = await warmer.warmNow(ctx);
@@ -3027,21 +3022,20 @@ function deepEqualExcept<Actual, Expected>(
 // stats by design. This is the regression guard for the savings carry-over
 // being decoupled from the per-payload plan gate.
 {
-  let probeIndex = 0;
-  const goResponsesModel = {
+  const goResponsesModel = modelFixture({
     id: "grok-4.5",
     provider: "opencode-go",
     api: "openai-responses",
     baseUrl: "https://opencode.ai/zen/go/v1",
     cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
-  } as any;
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
     notify: () => undefined,
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model: goResponsesModel,
     hasUI: false,
@@ -3052,15 +3046,14 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
     },
-  } as any;
-  const completeStub = async (): Promise<any> => {
-    probeIndex += 1;
+  });
+  const completeStub = completeFixture(async () => {
     return {
       stopReason: "stop",
       usage: { input: 10, output: 1, cacheRead: 50_000, cacheWrite: 0, cost: { total: 0.02 } },
     };
-  };
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
   warmer.capturePayload(
@@ -3073,9 +3066,8 @@ function deepEqualExcept<Actual, Expected>(
   );
   const hit = await warmer.warmNow(ctx);
   assert(hit.cacheHit === true, "the keyed responses manual probe must hit");
-  let anchor = (warmer as any).anchor;
-  assert(anchor.savingsKnown === true, "a keyed responses route must claim savings");
-  const savedBefore = anchor.totalEstimatedSavedUsd;
+  assert(warmer.getStatusText().includes("savings=est. $"), "a keyed responses route must claim savings");
+  const savedBefore = warmer.getSessionWarmStats().totalEstimatedSavedUsd;
   assert(savedBefore > 0, "the probe hit must accumulate savings");
   // Continuing keyed turn: same key, grew prefix. The tally must survive.
   warmer.capturePayload(
@@ -3089,12 +3081,11 @@ function deepEqualExcept<Actual, Expected>(
     },
     ctx,
   );
-  anchor = (warmer as any).anchor;
   assert(
-    anchor.totalEstimatedSavedUsd === savedBefore,
+    warmer.getSessionWarmStats().totalEstimatedSavedUsd === savedBefore,
     "a continuing keyed turn must preserve the accumulated savings tally",
   );
-  assert(anchor.savingsKnown === true, "the continuing keyed turn must keep claiming savings");
+  assert(warmer.getStatusText().includes("savings=est. $"), "the continuing keyed turn must keep claiming savings");
   // A turn whose key changes is not a continuation: it re-anchors with fresh
   // stats by design, so the key-gated state never inherits a prior tally.
   warmer.capturePayload(
@@ -3104,14 +3095,13 @@ function deepEqualExcept<Actual, Expected>(
     },
     ctx,
   );
-  anchor = (warmer as any).anchor;
-  const keylessPlan = (warmer as any).plan as { automaticWarm: boolean; intervalMs: number | null };
+  const keylessStatus = warmer.getStatusText();
   assert(
-    anchor.totalEstimatedSavedUsd === 0 && anchor.savingsKnown === false,
+    warmer.getSessionWarmStats().totalEstimatedSavedUsd === 0 && keylessStatus.includes("n/a"),
     "a key change must re-anchor with fresh stats and no savings claim",
   );
   assert(
-    keylessPlan.automaticWarm === false && keylessPlan.intervalMs === null,
+    keylessStatus.includes("nextDue=none") && keylessStatus.includes("intervalMs=none"),
     "the key-gated turn must not arm a timer",
   );
   warmer.dispose();
@@ -3120,21 +3110,25 @@ function deepEqualExcept<Actual, Expected>(
 // 12) Unverified routes remain manual-only: no timer, no verified savings, one safe probe.
 {
   let calls = 0;
-  const notifications: Array<{ message: string; level: string }> = [];
-  const model = {
+  const notifications: Array<{ message: string; level: NotifyLevel }> = [];
+  const model = modelFixture({
     id: "grok-4.3",
     provider: "xai",
     api: "openai-responses",
     baseUrl: "https://api.x.ai/v1",
     cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
-  } as any;
+  });
   const payload = {
     model: model.id,
     input: [{ role: "user", content: [{ type: "input_text", text: "manual only" }] }],
   };
-  const completeStub = async (_model: any, _context: any, options: any): Promise<any> => {
+  const completeStub = completeFixture(async (
+    _model: Model<any>,
+    _context: WarmCompleteContext,
+    options?: ProbeRequestOptions,
+  ) => {
     calls += 1;
-    options.onPayload?.(structuredClone(payload), model);
+    options?.onPayload?.(structuredClone(payload), model);
     return {
       stopReason: "stop",
       usage: {
@@ -3145,15 +3139,15 @@ function deepEqualExcept<Actual, Expected>(
         cost: { total: 0.01 },
       },
     };
-  };
-  const manualUiCalls: Array<{ kind: "status" | "widget"; value: unknown }> = [];
+  });
+  const manualUiCalls: Array<{ kind: "status" | "widget"; value: string | string[] | undefined }> = [];
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
-    notify: (message: string, level: string) => notifications.push({ message, level }),
-    setStatus: (_id: string, value: unknown) => manualUiCalls.push({ kind: "status", value }),
-    setWidget: (_id: string, value: unknown) => manualUiCalls.push({ kind: "widget", value }),
+    notify: (message: string, level: NotifyLevel = "info") => notifications.push({ message, level }),
+    setStatus: (_id: string, value?: string) => manualUiCalls.push({ kind: "status", value }),
+    setWidget: (_id: string, value?: string[]) => manualUiCalls.push({ kind: "widget", value }),
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model,
     hasUI: true,
@@ -3164,8 +3158,8 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "xai-key", headers: {}, env: {} }),
     },
-  } as any;
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
   warmer.capturePayload(payload, ctx);
@@ -3200,35 +3194,35 @@ function deepEqualExcept<Actual, Expected>(
 
 // 13) /warm now owns one manual-only warning and does not duplicate it.
 {
-  const notifications: Array<{ message: string; level: string }> = [];
-  let warmHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
-  const pi = {
+  const notifications: Array<{ message: string; level: NotifyLevel }> = [];
+  let warmHandler: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  const pi = extensionApiFixture({
     registerFlag: () => undefined,
     getFlag: () => "true",
     on: () => undefined,
-    registerCommand: (_name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => {
+    registerCommand: (_name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
       warmHandler = command.handler;
     },
-  } as any;
+  });
   piWarmCache(pi);
   assert(warmHandler !== undefined, "warm command should be registered");
-  const ctx = {
-    model: {
+  const ctx = contextFixture({
+    model: modelFixture({
       id: "grok-4.3",
       provider: "xai",
       api: "openai-responses",
       baseUrl: "https://api.x.ai/v1",
-    },
+    }),
     hasUI: true,
     isIdle: () => true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      notify: (message: string, level: string) => notifications.push({ message, level }),
+      notify: (message: string, level: NotifyLevel = "info") => notifications.push({ message, level }),
       setStatus: () => undefined,
       setWidget: () => undefined,
     },
-  } as any;
-  await warmHandler!("now", ctx);
+  });
+  await warmHandler("now", ctx);
   assert(notifications.length === 1, "manual-only /warm now should emit exactly one warning");
   assert(notifications[0]!.level === "warning", "manual-only /warm now notice should be warning-level");
   assert(
