@@ -24,7 +24,7 @@ function sha256File(path) {
 
 function fileKey(path) {
   const st = statSync(path);
-  const mtimeNs = typeof st.mtimeNs === "bigint" ? st.mtimeNs.toString() : String(st.mtimeMs);
+  const mtimeNs = String(st.mtimeNs ?? st.mtimeMs);
   return `${mtimeNs}:${st.size}`;
 }
 

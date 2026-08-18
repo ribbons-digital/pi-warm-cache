@@ -57,8 +57,8 @@ function opencodeGoApiKey() {
     const auth = JSON.parse(
       readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf8"),
     );
-    const entry = auth["opencode-go"] ?? auth["opencode"];
-    if (entry && typeof entry.key === "string" && entry.key) return entry.key;
+    const key = (auth["opencode-go"] ?? auth["opencode"])?.key;
+    if (Object.prototype.toString.call(key) === "[object String]" && key.length > 0) return key;
   } catch {
     // fall through
   }

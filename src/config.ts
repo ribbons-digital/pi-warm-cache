@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG, type AnthropicTtlMode, type WarmCacheConfig } from "./types.ts";
+import { DEFAULT_CONFIG, type WarmCacheConfig } from "./types.ts";
 
 export function parseConfigArgs(args: string, base: WarmCacheConfig = DEFAULT_CONFIG): WarmCacheConfig {
   const next = { ...base };
@@ -88,7 +88,7 @@ export function parseConfigArgs(args: string, base: WarmCacheConfig = DEFAULT_CO
     }
     if (key === "ttl") {
       if (value === "5m" || value === "1h" || value === "auto") {
-        next.anthropicTtl = value as AnthropicTtlMode;
+        next.anthropicTtl = value;
       }
       continue;
     }
