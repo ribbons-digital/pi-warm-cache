@@ -272,7 +272,7 @@ export function renderProbeRetryUi(
 
   const xai = label === "xAI best-effort" || (label === null && isXaiText(detail));
   const retryLine =
-    typeof nextDueAt === "number" && nextDueAt > Date.now()
+    nextDueAt !== undefined && nextDueAt > Date.now()
       ? `Next extension probe in ${formatDurationShort(nextDueAt - Date.now())}.`
       : "Retrying the extension probe.";
   if (config.showWidget) {
@@ -307,7 +307,7 @@ export function renderFailureUi(
   const blocked = /blocked/i.test(reason);
   const retryLine = blocked
     ? `${xai ? "xAI best-effort auto-warm stays off" : "Auto-warm stays off"} until /warm resume.`
-    : typeof nextDueAt === "number" && nextDueAt > Date.now()
+    : nextDueAt !== undefined && nextDueAt > Date.now()
       ? `Next extension probe in ${formatDurationShort(nextDueAt - Date.now())}.`
       : "Warming stopped until the next real turn or /warm now.";
   const error = /error|failed|no model/i.test(reason);
@@ -387,5 +387,5 @@ function compactUiText(value: string, max = 72): string {
 }
 
 function isXaiText(value: string | undefined): boolean {
-  return typeof value === "string" && /xai/i.test(value);
+  return value !== undefined && /xai/i.test(value);
 }
