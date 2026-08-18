@@ -468,6 +468,18 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "callable values must not qualify as payload objects",
   );
   assert(!canManualProbe(directXai, xaiPayload), "verified xAI should not use the unverified probe path");
+  assert(
+    isSafeReplayPayload(
+      {
+        instructions: "Keep this multi-line system prompt.\nPreserve its whitespace.",
+        input: [],
+        store: false,
+        prompt_cache_key: "codex-session-1",
+      },
+      "openai-codex-responses",
+    ),
+    "multi-line Codex instructions must remain safe to replay",
+  );
   const xaiWithoutKey = { ...xaiPayload, prompt_cache_key: undefined };
   const xaiWithoutKeyStrategy = resolveStrategy(directXai, DEFAULT_CONFIG, xaiWithoutKey);
   assert(!xaiWithoutKeyStrategy.automaticWarm, "xAI must fail closed without a cache key");
@@ -915,13 +927,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
     // A GLM fixture is refused like any other completions model: there is no
     // model-id denylist, the rule derives purely from the compat declaration.
-    const goGlm = {
+    const goGlm = modelFixture({
       id: "glm-5.1",
       provider: "opencode-go",
       api: "openai-completions",
       baseUrl: "https://opencode.ai/zen/go/v1",
       compat: { maxTokensField: "max_tokens" },
-    } as any;
+    });
     assert(
       opencodeGoForeignInstrumentationReason(goGlm, goCompletionsNestedMarker) !== null,
       "glm-5.1 has no denylist; the refusal is pure compat shape",
@@ -933,12 +945,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
     // Anthropic-messages markers are legal: that transport carries
     // cache_control by design, so the refusal never fires for it.
-    const goAnthropicMarkers = {
+    const goAnthropicMarkers = modelFixture({
       id: "qwen3.7-max",
       provider: "opencode-go",
       api: "anthropic-messages",
       baseUrl: "https://opencode.ai/zen/go",
-    } as any;
+    });
     const goAnthropicMarkerPayload = {
       model: "qwen3.7-max",
       system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }],
@@ -961,12 +973,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     // Payload-driven family classification for every instrumentation state.
     // The family is independent of capability state and comes from the
     // instrumentation actually observed on the captured payload.
-    const goAnthropicFamilyModel = {
+    const goAnthropicFamilyModel = modelFixture({
       id: "qwen3.7-max",
       provider: "opencode-go",
       api: "anthropic-messages",
       baseUrl: "https://opencode.ai/zen/go",
-    } as any;
+    });
     assert(
       classifyOpencodeGoFamily({ model: "qwen3.7-max", messages: [], system: [] }) ===
         "opencode-go-plain",
@@ -1046,12 +1058,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     // while still never probing.
 
     // Positive case: (openai-completions, retained) is verified no-probe.
-    const goRetainedCompletionsModel = {
+    const goRetainedCompletionsModel = modelFixture({
       id: "deepseek-v4-flash",
       provider: "opencode-go",
       api: "openai-completions",
       baseUrl: "https://opencode.ai/zen/go/v1",
-    } as any;
+    });
     const retainedCompletionsCapability = resolveProviderCapability(
       goRetainedCompletionsModel,
       { model: "deepseek-v4-flash", prompt_cache_retention: "24h", messages: [] },
@@ -1118,12 +1130,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
     // Negative case: (openai-responses, retained) is also not promoted,
     // because retained-wire.md measured the completions transport only.
-    const goResponsesRetainedModel = {
+    const goResponsesRetainedModel = modelFixture({
       id: "grok-4.5",
       provider: "opencode-go",
       api: "openai-responses",
       baseUrl: "https://opencode.ai/zen/go/v1",
-    } as any;
+    });
     const responsesRetainedCapability = resolveProviderCapability(goResponsesRetainedModel, {
       model: "grok-4.5",
       prompt_cache_retention: "24h",
@@ -1295,12 +1307,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   // the auditable registry entries (evidence pointer + date); the resolved
   // capability and the plan must stay in agreement with those entries.
   {
-    const goAnthropicFamilyModel = {
+    const goAnthropicFamilyModel = modelFixture({
       id: "qwen3.7-max",
       provider: "opencode-go",
       api: "anthropic-messages",
       baseUrl: "https://opencode.ai/zen/go",
-    } as any;
+    });
 
     // (anthropic-messages, short-marker) is verified with probing at ~4m.
     const shortMarkerCapability = resolveProviderCapability(goAnthropicFamilyModel, {
@@ -1326,12 +1338,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
     // (openai-responses, plain) is verified, and the automatic-eligibility
     // key gate still blocks an unkeyed payload at the plan level.
-    const goResponsesModel = {
+    const goResponsesModel = modelFixture({
       id: "grok-4.5",
       provider: "opencode-go",
       api: "openai-responses",
       baseUrl: "https://opencode.ai/zen/go/v1",
-    } as any;
+    });
     const unkeyedResponses = { model: "grok-4.5", input: [{ role: "user", content: "hi" }] };
     const keyedResponses = {
       model: "grok-4.5",
@@ -1361,12 +1373,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     // (openai-completions, plain) is verified as no-keepalive: capability and
     // plan agree that no timer arms, and the manual /warm now probe path is
     // covered by the end-to-end block 11d below.
-    const goCompletionsModel = {
+    const goCompletionsModel = modelFixture({
       id: "deepseek-v4-flash",
       provider: "opencode-go",
       api: "openai-completions",
       baseUrl: "https://opencode.ai/zen/go/v1",
-    } as any;
+    });
     const completionsCapability = resolveProviderCapability(goCompletionsModel, {
       model: "deepseek-v4-flash",
       messages: [{ role: "user", content: "hi" }],
@@ -1397,14 +1409,14 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     // verified entry must carry an evidence pointer. The key-to-family map and
     // the payload/model helpers are test-local; the registry entries are the
     // single source of truth.
-    const keyToFamily: Record<string, string> = {
-      "short-marker": "opencode-go-short-marker",
-      "long-marker": "opencode-go-long-marker",
-      "plain-fallback": "opencode-go-plain",
-      plain: "opencode-go-plain",
-      retained: "opencode-go-retained",
-    };
-    const pairPayload = (api: string, family: string): Record<string, unknown> => {
+    const keyToFamily = new Map([
+      ["short-marker", "opencode-go-short-marker"],
+      ["long-marker", "opencode-go-long-marker"],
+      ["plain-fallback", "opencode-go-plain"],
+      ["plain", "opencode-go-plain"],
+      ["retained", "opencode-go-retained"],
+    ]);
+    const pairPayload = (api: string, family: string) => {
       if (family === "opencode-go-retained") {
         return api === "openai-responses"
           ? { model: "grok-4.5", input: [], prompt_cache_retention: "24h" }
@@ -1436,7 +1448,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
         : { model: "deepseek-v4-flash", messages: [] };
     };
     const pairModel = (api: string) =>
-      ({
+      modelFixture({
         id: "pair-model",
         provider: "opencode-go",
         api,
@@ -1444,11 +1456,11 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
           api === "anthropic-messages"
             ? "https://opencode.ai/zen/go"
             : "https://opencode.ai/zen/go/v1",
-      }) as any;
+      });
     for (const registration of PROXY_ROUTE_REGISTRY) {
       if (registration.provider !== "opencode-go") continue;
       for (const [key, familyState] of Object.entries(registration.families)) {
-        const family = keyToFamily[key];
+        const family = keyToFamily.get(key);
         assert(family !== undefined, `registry key ${key} must map to a family`);
         const capability = resolveProviderCapability(
           pairModel(registration.api),
@@ -1468,11 +1480,11 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     }
   }
 
-  const unknownResponses = {
+  const unknownResponses = modelFixture({
     id: "gpt-compatible",
     provider: "my-proxy",
     api: "openai-responses",
-  } as any;
+  });
   const unknownCapability = resolveProviderCapability(unknownResponses);
   assert(unknownCapability.state === "unsupported", "unknown OpenAI-compatible routes must be unsupported");
   assert(
