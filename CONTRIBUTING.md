@@ -21,7 +21,6 @@ pnpm lint
 ```
 
 `pnpm lint` uses the local anti-slop plugin in `tools/oxlint/anti-slop/`.
-It is expected to report existing findings during the staged anti-slop cleanup and is not enforced in CI until that cleanup is complete.
 
 ## Changes
 

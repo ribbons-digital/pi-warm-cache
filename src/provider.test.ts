@@ -192,6 +192,31 @@ function deferredLog(line: string): {
   };
 }
 
+function captureLog(line: string): {
+  cacheKeyChanged: boolean | null;
+  prefixChanged: boolean | null;
+} | null {
+  const body = payloadObject(JSON.parse(line));
+  if (!body || body.event !== "capture") return null;
+  return {
+    cacheKeyChanged: body.cacheKeyChanged === true ? true : body.cacheKeyChanged === false ? false : null,
+    prefixChanged: body.prefixChanged === true ? true : body.prefixChanged === false ? false : null,
+  };
+}
+
+type RotationPayload = {
+  model?: string;
+  prompt_cache_key?: string;
+  messages?: Array<{ role: string; content: string }>;
+  input?: Array<{ role: string; content: string | Array<{ type: string; text: string }> }>;
+};
+
+function cacheKeyFromStatus(status: string): string | null {
+  const match = /(?:^|\s)cacheKey=(\S+)/.exec(status);
+  if (!match || match[1] === "none") return null;
+  return match[1];
+}
+
 function nextDueAtMs(status: string): number | null {
   const match = /(?:^|\s)nextDue=(\S+)/.exec(status);
   if (!match || match[1] === "none") return null;
@@ -4333,24 +4358,28 @@ function deepEqualExcept<Actual, Expected>(
   // the awaiting-reanchor window is never counted as a warm-probe failure, so
   // stale misses do not carry into the post-re-anchor session.
   const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-reanchor-budget-"));
-  const model = {
+  const model = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     baseUrl: "https://api.openai.com/v1",
-  } as any;
-  const responses: Array<unknown> = [
+  });
+  const responses = [
     {
-      stopReason: "stop",
+      stopReason: "stop" as const,
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
     },
     {
-      stopReason: "stop",
+      stopReason: "stop" as const,
       usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
     },
   ];
-  const completeStub = async (): Promise<any> => responses.shift();
-  const ctx = {
+  const completeStub = completeFixture(async () => {
+    const next = responses.shift();
+    if (!next) throw new Error("probe stub exhausted");
+    return next;
+  });
+  const ctx = contextFixture({
     cwd,
     model,
     hasUI: false,
@@ -4365,7 +4394,7 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
     },
-  } as any;
+  });
   const oldPayload = {
     model: model.id,
     input: [{ role: "user", content: [{ type: "input_text", text: "old prefix" }] }],
@@ -4376,7 +4405,7 @@ function deepEqualExcept<Actual, Expected>(
     input: [{ role: "user", content: [{ type: "input_text", text: "new prefix" }] }],
     prompt_cache_key: "budget-new",
   };
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, intervalMs: 60_000 });
   warmer.capturePayload(oldPayload, ctx);
@@ -4502,12 +4531,12 @@ function deepEqualExcept<Actual, Expected>(
   // Injected prompt_cache_key on an opencode-go completions payload changes no
   // gate: the route stays verified no-keepalive (no automatic timer), the
   // family is unchanged, and the key shows only in the redacted fingerprint.
-  const goCompletionsModel = {
+  const goCompletionsModel = modelFixture({
     id: "deepseek-v4-flash",
     provider: "opencode-go",
     api: "openai-completions",
     baseUrl: "https://opencode.ai/zen/go/v1",
-  } as any;
+  });
   const goCompletionsPayload = {
     model: "deepseek-v4-flash",
     messages: [{ role: "user", content: "hi" }],
@@ -4554,8 +4583,8 @@ function deepEqualExcept<Actual, Expected>(
   // fingerprint for first-party OpenAI completions and opencode-go completions,
   // and neither status nor the JSONL mirror ever leaks the raw key.
   const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-slice6-"));
-  const makeWarmCtx = (sessionId: string, model: any) =>
-    ({
+  const makeWarmCtx = (sessionId: string, model: Model<any>) =>
+    contextFixture({
       cwd,
       model,
       hasUI: false,
@@ -4570,30 +4599,28 @@ function deepEqualExcept<Actual, Expected>(
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
       },
-    }) as any;
-  const readWarmEvents = (): Array<Record<string, unknown>> =>
-    readFileSync(join(cwd, ".pi", "warm-cache.jsonl"), "utf8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    });
   const rotationHarness = (
     sessionId: string,
-    model: any,
-    payloads: Array<Record<string, unknown>>,
+    model: Model<any>,
+    payloads: RotationPayload[],
   ) => {
     const ctx = makeWarmCtx(sessionId, model);
     const warmer = new SessionWarmer(
-      { getThinkingLevel: () => "off" } as any,
-      async (): Promise<any> => ({ stopReason: "stop", usage: {} }),
+      extensionApiFixture({ getThinkingLevel: () => "off" }),
+      completeFixture(async () => ({ stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
     );
     warmer.bindContext(ctx);
     warmer.setConfig({ ...DEFAULT_CONFIG, logToFile: true, minCachedTokens: 10 });
     for (const payload of payloads) warmer.capturePayload(payload, ctx);
-    const events = readWarmEvents();
+    const events = readFileSync(join(cwd, ".pi", "warm-cache.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map(captureLog);
     const rawKeys = payloads
       .map((payload) => payload.prompt_cache_key)
-      .filter((key): key is string => typeof key === "string");
+      .filter((key) => key !== undefined);
     const jsonl = readFileSync(join(cwd, ".pi", "warm-cache.jsonl"), "utf8");
     assert(
       rawKeys.every((key) => !jsonl.includes(key)),
@@ -4607,12 +4634,12 @@ function deepEqualExcept<Actual, Expected>(
     return { warmer, events };
   };
 
-  const openaiCompletionsModel = {
+  const openaiCompletionsModel = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-completions",
     baseUrl: "https://api.openai.com/v1",
-  } as any;
+  });
   const openaiSecret = "openai-rotation-key-abc123";
   const openaiFp = rotationHarness("openai-fp-session", openaiCompletionsModel, [
     {
@@ -4621,24 +4648,26 @@ function deepEqualExcept<Actual, Expected>(
       prompt_cache_key: openaiSecret,
     },
   ]);
+  const openaiFingerprint = cacheKeyFromStatus(openaiFp.warmer.getStatusText());
   assert(
-    /^[0-9a-f]{8}$/.test((openaiFp.warmer as any).anchor.cacheKeyFingerprint),
+    openaiFingerprint !== null && /^[0-9a-f]{8}$/.test(openaiFingerprint),
     "first-party OpenAI completions capture must store the redacted fingerprint",
   );
   assert(
-    (openaiFp.warmer as any).anchor.cacheKeyFingerprint !== openaiSecret,
+    openaiFingerprint !== openaiSecret,
     "the OpenAI anchor must never store the raw completions key",
   );
   const goSecret = "go-rotation-key-xyz789";
   const goFp = rotationHarness("go-fp-session", goCompletionsModel, [
     { ...goCompletionsPayload, prompt_cache_key: goSecret },
   ]);
+  const goFingerprint = cacheKeyFromStatus(goFp.warmer.getStatusText());
   assert(
-    /^[0-9a-f]{8}$/.test((goFp.warmer as any).anchor.cacheKeyFingerprint),
+    goFingerprint !== null && /^[0-9a-f]{8}$/.test(goFingerprint),
     "opencode-go completions capture must store the redacted fingerprint",
   );
   assert(
-    (goFp.warmer as any).anchor.cacheKeyFingerprint !== goSecret,
+    goFingerprint !== goSecret,
     "the Go anchor must never store the raw completions key",
   );
 
@@ -4646,13 +4675,13 @@ function deepEqualExcept<Actual, Expected>(
   // api === "openai-responses": xai responses rotation uses the xAI reason;
   // xai completions rotation and opencode-go responses rotation use the
   // generic "prefix changed" re-anchor with cacheKeyChanged=false.
-  const xaiResponsesModel = {
+  const xaiResponsesModel = modelFixture({
     id: "grok-4.5",
     provider: "xai",
     api: "openai-responses",
     baseUrl: "https://api.x.ai/v1",
     compat: { sessionAffinityFormat: "openai", supportsLongCacheRetention: false },
-  } as any;
+  });
   const xaiResponsesRotation = rotationHarness("xai-responses-rotation", xaiResponsesModel, [
     {
       model: "grok-4.5",
@@ -4670,22 +4699,22 @@ function deepEqualExcept<Actual, Expected>(
       "xAI best-effort prompt_cache_key changed",
     "xai responses rotation must use the xAI reason",
   );
-  const xaiCaptures = xaiResponsesRotation.events.filter((event) => event.event === "capture");
+  const xaiCaptures = xaiResponsesRotation.events.filter((event) => event !== null);
   assert(
-    (xaiCaptures.at(-1) as any)?.cacheKeyChanged === true,
+    xaiCaptures.at(-1)?.cacheKeyChanged === true,
     "xai responses rotation must set cacheKeyChanged=true",
   );
   assert(
-    (xaiCaptures.at(-1) as any)?.prefixChanged === true,
+    xaiCaptures.at(-1)?.prefixChanged === true,
     "xai responses rotation must re-anchor on the changed key",
   );
 
-  const xaiCompletionsModel = {
+  const xaiCompletionsModel = modelFixture({
     id: "grok-4.5",
     provider: "xai",
     api: "openai-completions",
     baseUrl: "https://api.x.ai/v1",
-  } as any;
+  });
   const xaiCompletionsRotation = rotationHarness("xai-completions-rotation", xaiCompletionsModel, [
     {
       model: "grok-4.5",
@@ -4702,24 +4731,22 @@ function deepEqualExcept<Actual, Expected>(
     xaiCompletionsRotation.warmer.getLatestRealTurnObservation()?.reason === "prefix changed",
     "xai completions rotation must use the generic prefix-changed reason",
   );
-  const xaiCompletionsCaptures = xaiCompletionsRotation.events.filter(
-    (event) => event.event === "capture",
-  );
+  const xaiCompletionsCaptures = xaiCompletionsRotation.events.filter((event) => event !== null);
   assert(
-    (xaiCompletionsCaptures.at(-1) as any)?.cacheKeyChanged === false,
+    xaiCompletionsCaptures.at(-1)?.cacheKeyChanged === false,
     "xai completions rotation must keep cacheKeyChanged=false",
   );
   assert(
-    (xaiCompletionsCaptures.at(-1) as any)?.prefixChanged === true,
+    xaiCompletionsCaptures.at(-1)?.prefixChanged === true,
     "xai completions rotation must still re-anchor via the generic path",
   );
 
-  const goResponsesModel = {
+  const goResponsesModel = modelFixture({
     id: "deepseek-v4-flash",
     provider: "opencode-go",
     api: "openai-responses",
     baseUrl: "https://opencode.ai/zen/go/v1",
-  } as any;
+  });
   const goResponsesRotation = rotationHarness("go-responses-rotation", goResponsesModel, [
     {
       model: "deepseek-v4-flash",
@@ -4736,36 +4763,38 @@ function deepEqualExcept<Actual, Expected>(
     goResponsesRotation.warmer.getLatestRealTurnObservation()?.reason === "prefix changed",
     "opencode-go responses rotation must use the generic prefix-changed reason",
   );
-  const goResponsesCaptures = goResponsesRotation.events.filter(
-    (event) => event.event === "capture",
-  );
+  const goResponsesCaptures = goResponsesRotation.events.filter((event) => event !== null);
   assert(
-    (goResponsesCaptures.at(-1) as any)?.cacheKeyChanged === false,
+    goResponsesCaptures.at(-1)?.cacheKeyChanged === false,
     "opencode-go responses rotation must keep cacheKeyChanged=false",
   );
   assert(
-    (goResponsesCaptures.at(-1) as any)?.prefixChanged === true,
+    goResponsesCaptures.at(-1)?.prefixChanged === true,
     "opencode-go responses rotation must re-anchor via the generic path",
   );
 
   // isXaiRoute() stays provider-keyed: an opencode-go grok-4.5 route is not
   // xAI even when the model id matches a direct xAI best-effort model.
-  const goGrokCtx = makeWarmCtx("go-grok-route", {
+  const goGrokCtx = makeWarmCtx("go-grok-route", modelFixture({
     provider: "opencode-go",
     id: "grok-4.5",
     api: "openai-responses",
     baseUrl: "https://opencode.ai/zen/go/v1",
-  });
+  }));
+  const unusedComplete = completeFixture(async () => ({
+    stopReason: "stop",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  }));
   const goGrokWarmer = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    async (): Promise<any> => ({ stopReason: "stop", usage: {} }),
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    unusedComplete,
   );
   goGrokWarmer.bindContext(goGrokCtx);
   assert(!goGrokWarmer.isXaiRoute(), "an opencode-go grok-4.5 route must not be xAI-keyed");
   const xaiGrokCtx = makeWarmCtx("xai-grok-route", xaiResponsesModel);
   const xaiGrokWarmer = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    async (): Promise<any> => ({ stopReason: "stop", usage: {} }),
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    unusedComplete,
   );
   xaiGrokWarmer.bindContext(xaiGrokCtx);
   assert(xaiGrokWarmer.isXaiRoute(), "a direct xai grok-4.5 route must be xAI-keyed");
@@ -4773,16 +4802,17 @@ function deepEqualExcept<Actual, Expected>(
   // Label-driven UI copy: Go best-effort waiting/hit lines render the Go label
   // and never xAI; the " session" join and the title-case difference are
   // snapshot-pinned. A past nextDueAt pins the wait label to the plan interval.
-  const goUiCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
-  const goUiCtx = {
+  type DiagnosticUiCall = { kind: "widget" | "status"; value: string | string[] | undefined };
+  const goUiCalls: DiagnosticUiCall[] = [];
+  const goUiCtx = contextFixture({
     hasUI: true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      setWidget: (_id: string, value: unknown) => goUiCalls.push({ kind: "widget", value }),
-      setStatus: (_id: string, value: unknown) => goUiCalls.push({ kind: "status", value }),
+      setWidget: (_id: string, value?: string[]) => goUiCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value?: string) => goUiCalls.push({ kind: "status", value }),
     },
-  } as any;
-  const goAnchor = {
+  });
+  const goAnchor = cacheAnchorFixture({
     cachedTokens: 128_000,
     promptTokens: 128_000,
     probeHitCount: 2,
@@ -4792,8 +4822,8 @@ function deepEqualExcept<Actual, Expected>(
     // A verified probing route: automaticWarm true, so savings render.
     capability: { state: "verified", automaticWarm: true },
     provider: "opencode-go",
-  } as any;
-  const goPlan = {
+  });
+  const goPlan = strategyPlanFixture({
     family: "opencode-go-plain",
     intervalMs: 240_000,
     ttlLabel: "best-effort probe cadence (~4m)",
@@ -4801,12 +4831,12 @@ function deepEqualExcept<Actual, Expected>(
     automaticWarm: true,
     manualProbe: false,
     cacheRetention: "short",
-  } as any;
+  });
   renderWaitingUi(goUiCtx, { ...DEFAULT_CONFIG, showWidget: true }, goAnchor, goPlan, Date.now() - 60_000);
   renderWarmHitUi(goUiCtx, { ...DEFAULT_CONFIG, showWidget: true }, goAnchor, goPlan, 128_000);
   const goWidgets = goUiCalls
-    .filter((call) => call.kind === "widget")
-    .map((call) => call.value as string[]);
+    .filter((call) => call.kind === "widget" && Array.isArray(call.value))
+    .map((call) => call.value);
   assert(
     goWidgets[0]![0] === "⚡ OpenCode Go best-effort cache-warm wait · extension probe in 4m",
     "Go waiting L1 must use the Go label with lowercase cache-warm",
@@ -4842,26 +4872,26 @@ function deepEqualExcept<Actual, Expected>(
 
   // xAI waiting/hit lines stay byte-identical when the same renderers compute
   // the label from an xai-best-effort family.
-  const xaiPinCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
-  const xaiPinCtx = {
+  const xaiPinCalls: DiagnosticUiCall[] = [];
+  const xaiPinCtx = contextFixture({
     hasUI: true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      setWidget: (_id: string, value: unknown) => xaiPinCalls.push({ kind: "widget", value }),
-      setStatus: (_id: string, value: unknown) => xaiPinCalls.push({ kind: "status", value }),
+      setWidget: (_id: string, value?: string[]) => xaiPinCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value?: string) => xaiPinCalls.push({ kind: "status", value }),
     },
-  } as any;
-  const xaiPinAnchor = { ...goAnchor, provider: "xai" } as any;
-  const xaiPinPlan = {
+  });
+  const xaiPinAnchor = cacheAnchorFixture({ ...goAnchor, provider: "xai" });
+  const xaiPinPlan = strategyPlanFixture({
     ...goPlan,
     family: "xai-best-effort",
     ttlLabel: "xAI best-effort probe cadence",
-  } as any;
+  });
   renderWaitingUi(xaiPinCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiPinAnchor, xaiPinPlan, Date.now() - 60_000);
   renderWarmHitUi(xaiPinCtx, { ...DEFAULT_CONFIG, showWidget: true }, xaiPinAnchor, xaiPinPlan, 128_000);
-  const xaiPinWidgets = xaiPinCalls
-    .filter((call) => call.kind === "widget")
-    .map((call) => call.value as string[]);
+  const xaiPinWidgets = xaiPinCalls.flatMap((call) =>
+    call.kind === "widget" && Array.isArray(call.value) ? [call.value] : [],
+  );
   assert(
     xaiPinWidgets[0]![0] === "⚡ xAI best-effort cache-warm wait · extension probe in 4m",
     "xai waiting L1 must stay byte-identical",
@@ -4893,15 +4923,15 @@ function deepEqualExcept<Actual, Expected>(
   // An explicit non-xai label wins over "xai" in detail text (the
   // post-promotion conflation path: a Go gateway error containing xai must not
   // label the widget as xAI). Without a label, the sniff still applies.
-  const labelWinCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
-  const labelWinCtx = {
+  const labelWinCalls: DiagnosticUiCall[] = [];
+  const labelWinCtx = contextFixture({
     hasUI: true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      setWidget: (_id: string, value: unknown) => labelWinCalls.push({ kind: "widget", value }),
-      setStatus: (_id: string, value: unknown) => labelWinCalls.push({ kind: "status", value }),
+      setWidget: (_id: string, value?: string[]) => labelWinCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value?: string) => labelWinCalls.push({ kind: "status", value }),
     },
-  } as any;
+  });
   renderFailureUi(
     labelWinCtx,
     { ...DEFAULT_CONFIG, showWidget: true },
@@ -4918,15 +4948,15 @@ function deepEqualExcept<Actual, Expected>(
     !labelWinText.includes("xAI best-effort"),
     "an explicit non-xai label must beat xai in detail text",
   );
-  const sniffCalls: Array<{ kind: "widget" | "status"; value: unknown }> = [];
-  const sniffCtx = {
+  const sniffCalls: DiagnosticUiCall[] = [];
+  const sniffCtx = contextFixture({
     hasUI: true,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
-      setWidget: (_id: string, value: unknown) => sniffCalls.push({ kind: "widget", value }),
-      setStatus: (_id: string, value: unknown) => sniffCalls.push({ kind: "status", value }),
+      setWidget: (_id: string, value?: string[]) => sniffCalls.push({ kind: "widget", value }),
+      setStatus: (_id: string, value?: string) => sniffCalls.push({ kind: "status", value }),
     },
-  } as any;
+  });
   renderFailureUi(
     sniffCtx,
     { ...DEFAULT_CONFIG, showWidget: true },
