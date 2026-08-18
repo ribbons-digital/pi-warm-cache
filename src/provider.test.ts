@@ -77,6 +77,14 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 type WarmComplete = NonNullable<ConstructorParameters<typeof SessionWarmer>[1]>;
 type NotifyLevel = "info" | "warning" | "error";
+type WarmCompleteContext = {
+  systemPrompt?: string;
+};
+type ProbeRequestOptions = {
+  sessionId?: string;
+  cacheRetention?: string;
+  onPayload?: <Payload>(payload: Payload, model: Model<any>) => Payload;
+};
 
 function assert<Condition>(cond: Condition, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
@@ -2574,20 +2582,20 @@ function deepEqualExcept<Actual, Expected>(
 // 10) Direct xAI uses the exact anchor, stable cache routing, legal output
 // shaping, quiet first miss, and a bounded re-anchor after repeated misses.
 {
-  const notifications: Array<{ message: string; level: string }> = [];
+  const notifications: Array<{ message: string; level: NotifyLevel }> = [];
   const responses = [
-    { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
-    { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
-    { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
+    { stopReason: "stop" as const, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
+    { stopReason: "stop" as const, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
+    { stopReason: "stop" as const, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } },
   ];
-  const xaiModel = {
+  const xaiModel = modelFixture({
     id: "grok-4.5",
     provider: "xai",
     api: "openai-responses",
     baseUrl: "https://api.x.ai/v1",
     compat: { sessionAffinityFormat: "openai", supportsLongCacheRetention: false },
     cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
-  } as any;
+  });
   const capturedPayload = {
     model: "grok-4.5",
     input: [{ role: "user", content: [{ type: "input_text", text: "keep this exact" }] }],
@@ -2597,23 +2605,27 @@ function deepEqualExcept<Actual, Expected>(
     reasoning: { effort: "high", summary: "auto" },
     tools: [{ type: "function", name: "bash" }],
   };
-  const calls: Array<{ options: any; payload: any }> = [];
-  const completeStub = async (_model: any, _context: any, options: any): Promise<any> => {
-    const payload = options.onPayload?.(structuredClone({
+  const calls: Array<{ sessionId?: string; cacheRetention?: string; payload: ReturnType<typeof payloadObject> }> = [];
+  const completeStub = completeFixture(async (
+    _model: Model<any>,
+    _context: WarmCompleteContext,
+    options?: ProbeRequestOptions,
+  ) => {
+    const payload = payloadObject(options?.onPayload?.(structuredClone({
       model: "grok-4.5",
       input: [],
       prompt_cache_key: "generated-by-adapter",
-    }), xaiModel);
-    calls.push({ options, payload });
+    }), xaiModel));
+    calls.push({ sessionId: options?.sessionId, cacheRetention: options?.cacheRetention, payload });
     return responses.shift();
-  };
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
-    notify: (message: string, level: string) => notifications.push({ message, level }),
+    notify: (message: string, level: NotifyLevel = "info") => notifications.push({ message, level }),
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model: xaiModel,
     hasUI: true,
@@ -2624,8 +2636,8 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "xai-key", headers: {}, env: {} }),
     },
-  } as any;
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "high" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "high" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({
     ...DEFAULT_CONFIG,
@@ -2654,15 +2666,16 @@ function deepEqualExcept<Actual, Expected>(
   assert(warmer.getStatusText().includes("strategy=xai-best-effort"), "status should expose the xAI strategy");
   assert(warmer.getStatusText().includes("cadence=xAI best-effort probe cadence"), "status should expose the xAI cadence");
   assert(warmer.getStatusText().includes("cacheKey="), "status should expose cache-key identity");
-  assert(calls[0]?.options.sessionId === "xai-session", "xAI probe should reuse the stable session identity");
-  assert(calls[0]?.options.cacheRetention === "short", "xAI probe should use short cache retention");
-  const shaped = calls[0]?.payload as Record<string, unknown>;
-  assert(shaped.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS, "xAI probe should cap output legally");
-  assert(shaped.prompt_cache_key === capturedPayload.prompt_cache_key, "xAI probe should preserve the cache key");
-  assert(shaped.instructions === capturedPayload.instructions, "xAI probe should preserve instructions");
-  assert(JSON.stringify(shaped.reasoning) === JSON.stringify(capturedPayload.reasoning), "xAI probe should preserve reasoning");
-  assert(JSON.stringify(shaped.tools) === JSON.stringify(capturedPayload.tools), "xAI probe should preserve tools");
-  assert(JSON.stringify(shaped.input) === JSON.stringify(capturedPayload.input), "xAI probe should preserve the exact prefix");
+  assert(calls[0]?.sessionId === "xai-session", "xAI probe should reuse the stable session identity");
+  assert(calls[0]?.cacheRetention === "short", "xAI probe should use short cache retention");
+  const warmPayload = calls[0]?.payload;
+  assert(warmPayload, "xAI probe should send a payload");
+  assert(warmPayload.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS, "xAI probe should cap output legally");
+  assert(warmPayload.prompt_cache_key === capturedPayload.prompt_cache_key, "xAI probe should preserve the cache key");
+  assert(warmPayload.instructions === capturedPayload.instructions, "xAI probe should preserve instructions");
+  assert(JSON.stringify(warmPayload.reasoning) === JSON.stringify(capturedPayload.reasoning), "xAI probe should preserve reasoning");
+  assert(JSON.stringify(warmPayload.tools) === JSON.stringify(capturedPayload.tools), "xAI probe should preserve tools");
+  assert(JSON.stringify(warmPayload.input) === JSON.stringify(capturedPayload.input), "xAI probe should preserve the exact prefix");
   assert(notifications.every((entry) => entry.level !== "warning"), "first xAI miss should not warn immediately");
 
   const second = await warmer.warmNow(ctx);
@@ -2694,28 +2707,28 @@ function deepEqualExcept<Actual, Expected>(
 // injected cache_control must keep the refusal on the new anchor, so /warm now
 // refuses to replay the tampered body and never calls the provider.
 {
-  const notifications: Array<{ message: string; level: string }> = [];
-  const calls: unknown[] = [];
-  const completeStub = async (args: unknown): Promise<any> => {
-    calls.push(args);
+  const notifications: Array<{ message: string; level: NotifyLevel }> = [];
+  let calls = 0;
+  const completeStub = completeFixture(async () => {
+    calls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
     };
-  };
-  const goModel = {
+  });
+  const goModel = modelFixture({
     id: "deepseek-v4-flash",
     provider: "opencode-go",
     api: "openai-completions",
     baseUrl: "https://opencode.ai/zen/go/v1",
-  } as any;
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
-    notify: (message: string, level: string) => notifications.push({ message, level }),
+    notify: (message: string, level: NotifyLevel = "info") => notifications.push({ message, level }),
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model: goModel,
     hasUI: true,
@@ -2726,8 +2739,8 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
     },
-  } as any;
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({
     ...DEFAULT_CONFIG,
@@ -2772,7 +2785,7 @@ function deepEqualExcept<Actual, Expected>(
     refused.capabilityReason?.includes("cache_control"),
     "the refusal reason must be exposed on the /warm now result",
   );
-  assert(calls.length === 0, "a refused Go completions payload must never reach the provider");
+  assert(calls === 0, "a refused Go completions payload must never reach the provider");
   warmer.dispose();
 }
 
@@ -2780,41 +2793,44 @@ function deepEqualExcept<Actual, Expected>(
 // completions probe on an uncapped captured body writes the declared
 // maxTokensField (max_tokens), never the default max_completion_tokens.
 {
-  const notifications: Array<{ message: string; level: string }> = [];
+  const notifications: Array<{ message: string; level: NotifyLevel }> = [];
   const responses = [
     {
-      stopReason: "stop",
+      stopReason: "stop" as const,
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
     },
   ];
-  const goModel = {
+  const goModel = modelFixture({
     id: "deepseek-v4-flash",
     provider: "opencode-go",
     api: "openai-completions",
     baseUrl: "https://opencode.ai/zen/go/v1",
     compat: { maxTokensField: "max_tokens" },
     cost: { input: 2, cacheRead: 0.3, cacheWrite: 0, output: 6 },
-  } as any;
+  });
   assert(
     getModelCompat(goModel)?.maxTokensField === "max_tokens",
     "getModelCompat must expose the declared maxTokensField",
   );
-  const calls: Array<{ options: any; payload: any }> = [];
-  const completeStub = async (_model: any, _context: any, options: any): Promise<any> => {
-    const payload = options.onPayload?.(
+  const calls: Array<ReturnType<typeof payloadObject>> = [];
+  const completeStub = completeFixture(async (
+    _model: Model<any>,
+    _context: WarmCompleteContext,
+    options?: ProbeRequestOptions,
+  ) => {
+    calls.push(payloadObject(options?.onPayload?.(
       structuredClone({ model: "deepseek-v4-flash", messages: [] }),
       goModel,
-    );
-    calls.push({ options, payload });
+    )));
     return responses.shift();
-  };
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
-    notify: (message: string, level: string) => notifications.push({ message, level }),
+    notify: (message: string, level: NotifyLevel = "info") => notifications.push({ message, level }),
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model: goModel,
     hasUI: true,
@@ -2825,8 +2841,8 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "go-key", headers: {}, env: {} }),
     },
-  } as any;
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({
     ...DEFAULT_CONFIG,
@@ -2843,17 +2859,18 @@ function deepEqualExcept<Actual, Expected>(
   const result = await warmer.warmNow(ctx);
   assert(result.ok === true, "a manual probe on a clean Go completions payload should run");
   assert(calls.length === 1, "a manual probe must reach the provider");
-  const shaped = calls[0]?.payload as Record<string, unknown>;
+  const warmPayload = calls[0];
+  assert(warmPayload, "a manual probe must send a payload");
   assert(
-    shaped.max_tokens === 1,
+    warmPayload.max_tokens === 1,
     "the probe must cap the declared maxTokensField (max_tokens)",
   );
   assert(
-    !("max_completion_tokens" in shaped),
+    !("max_completion_tokens" in warmPayload),
     "the probe must not write the default max_completion_tokens field",
   );
   assert(
-    JSON.stringify(shaped.messages) === JSON.stringify(captured.messages),
+    JSON.stringify(warmPayload.messages) === JSON.stringify(captured.messages),
     "the probe must preserve the exact captured prefix",
   );
   warmer.dispose();
