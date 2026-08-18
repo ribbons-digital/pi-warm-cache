@@ -128,13 +128,29 @@ function strategyPlanFixture<Fixture>(plan: Fixture): StrategyPlan {
 
 function timerWarmerFixture<Warmer>(warmer: Warmer): {
   runWarm: (reason: "timer") => Promise<WarmResult>;
+  clearTimers: () => void;
+  anchor: { lastRealTurnAt: number } | null;
 } {
-  // SAFETY: Tests fire the private timer path; SessionWarmer has no public timer hook.
-  return warmer as { runWarm: (reason: "timer") => Promise<WarmResult> };
+  // SAFETY: Idle-cutoff and spend tests drive the private timer clock and fire path.
+  return warmer as {
+    runWarm: (reason: "timer") => Promise<WarmResult>;
+    clearTimers: () => void;
+    anchor: { lastRealTurnAt: number } | null;
+  };
 }
 
 function runTimerWarm(warmer: SessionWarmer): Promise<WarmResult> {
   return timerWarmerFixture(warmer).runWarm("timer");
+}
+
+function clearWarmerTimers(warmer: SessionWarmer): void {
+  timerWarmerFixture(warmer).clearTimers();
+}
+
+function setLastRealTurnAt(warmer: SessionWarmer, at: number): void {
+  const anchor = timerWarmerFixture(warmer).anchor;
+  assert(anchor !== null, "expected an anchor before shifting idle time");
+  anchor.lastRealTurnAt = at;
 }
 
 type ProbeReply = {
@@ -3823,12 +3839,12 @@ function deepEqualExcept<Actual, Expected>(
 // runWarm("timer") directly with a call-counting stub (test-15 pattern).
 {
   const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-idle-cutoff-"));
-  const anthropicModel = {
+  const anthropicModel = modelFixture({
     id: "claude-sonnet-4-5",
     provider: "anthropic",
     api: "anthropic-messages",
     baseUrl: "https://api.anthropic.com/v1",
-  } as any;
+  });
   const longPayload = {
     model: "claude-sonnet-4-5",
     max_tokens: 16000,
@@ -3847,14 +3863,14 @@ function deepEqualExcept<Actual, Expected>(
     messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
   };
   let calls = 0;
-  const completeStub = async (): Promise<any> => {
+  const completeStub = completeFixture(async () => {
     calls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
     };
-  };
-  const ctx = {
+  });
+  const ctx = contextFixture({
     cwd,
     model: anthropicModel,
     hasUI: false,
@@ -3869,17 +3885,16 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
     },
-  } as any;
+  });
 
   // anthropic-long: probes at 48m and 96m, aborts at the 120m boundary.
-  const longWarmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  const longWarmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   longWarmer.bindContext(ctx);
   longWarmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10, logToFile: true });
   longWarmer.capturePayload(longPayload, ctx);
   longWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
-  const longAnchor = (longWarmer as any).anchor;
   assert(
-    longAnchor.cacheFamily === "anthropic-long",
+    longWarmer.getStatusText().includes("strategy=anthropic-long"),
     "the 1h-marker payload must classify anthropic-long",
   );
   assert(
@@ -3887,32 +3902,28 @@ function deepEqualExcept<Actual, Expected>(
     "the anthropic-long cutoff must be 120m",
   );
 
-  longAnchor.lastRealTurnAt = Date.now() - 48 * 60_000;
-  const at48m = await (longWarmer as any).runWarm("timer");
+  setLastRealTurnAt(longWarmer, Date.now() - 48 * 60_000);
+  const at48m = await runTimerWarm(longWarmer);
   assert(at48m.ok && at48m.probeOutcome === "hit", "anthropic-long must still probe at 48m idle");
   assert(Number(calls) === 1, "the 48m probe must be the only provider call so far");
-  (longWarmer as any).clearTimers();
+  clearWarmerTimers(longWarmer);
 
-  longAnchor.lastRealTurnAt = Date.now() - 96 * 60_000;
-  const at96m = await (longWarmer as any).runWarm("timer");
+  setLastRealTurnAt(longWarmer, Date.now() - 96 * 60_000);
+  const at96m = await runTimerWarm(longWarmer);
   assert(at96m.ok && at96m.probeOutcome === "hit", "anthropic-long must still probe at 96m idle");
   assert(Number(calls) === 2, "the 96m probe must be the second provider call");
-  (longWarmer as any).clearTimers();
+  clearWarmerTimers(longWarmer);
 
-  longAnchor.lastRealTurnAt = Date.now() - 120 * 60_000;
-  const at120m = await (longWarmer as any).runWarm("timer");
+  setLastRealTurnAt(longWarmer, Date.now() - 120 * 60_000);
+  const at120m = await runTimerWarm(longWarmer);
   assert(
     !at120m.ok && at120m.unavailable === true && at120m.probeOutcome === "unavailable",
     "a timer probe at exactly the 120m cutoff must not fire",
   );
   assert(Number(calls) === 2, "the cutoff abort must never call the provider");
   assert(
-    (longWarmer as any).nextDueAt === 0,
-    "the cutoff abort must clear timers (no re-arm loop)",
-  );
-  assert(
     longWarmer.getStatusText().includes("nextDue=none"),
-    "the cutoff abort status must show no pending timer",
+    "the cutoff abort must clear timers (no re-arm loop)",
   );
   assert(
     longWarmer.getStatusText().includes("probeFailStreak=0/3"),
@@ -3926,32 +3937,31 @@ function deepEqualExcept<Actual, Expected>(
   // cutoff: agent_settled after the abort must not re-arm a timer.
   longWarmer.onAgentSettled(ctx);
   assert(
-    (longWarmer as any).nextDueAt === 0,
+    longWarmer.getStatusText().includes("nextDue=none"),
     "reschedule must not arm a timer past the idle cutoff",
   );
   longWarmer.dispose();
 
   // anthropic-short: fires at 20m, stops at the 30m floor; maxidle=0 restores
   // warm-until-failure.
-  const shortWarmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  const shortWarmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   shortWarmer.bindContext(ctx);
   shortWarmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10 });
   shortWarmer.capturePayload(shortPayload, ctx);
   shortWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
-  const shortAnchor = (shortWarmer as any).anchor;
-  assert(shortAnchor.cacheFamily === "anthropic-short", "the short payload must classify anthropic-short");
+  assert(shortWarmer.getStatusText().includes("strategy=anthropic-short"), "the short payload must classify anthropic-short");
   assert(
     resolveMaxIdleWarmMs(shortWarmer.getConfig(), "anthropic-short") === 30 * 60_000,
     "the anthropic-short cutoff must be 30m",
   );
 
-  shortAnchor.lastRealTurnAt = Date.now() - 20 * 60_000;
-  const at20m = await (shortWarmer as any).runWarm("timer");
+  setLastRealTurnAt(shortWarmer, Date.now() - 20 * 60_000);
+  const at20m = await runTimerWarm(shortWarmer);
   assert(at20m.ok, "a short family must still probe at 20m idle");
-  (shortWarmer as any).clearTimers();
+  clearWarmerTimers(shortWarmer);
 
-  shortAnchor.lastRealTurnAt = Date.now() - 30 * 60_000;
-  const at30m = await (shortWarmer as any).runWarm("timer");
+  setLastRealTurnAt(shortWarmer, Date.now() - 30 * 60_000);
+  const at30m = await runTimerWarm(shortWarmer);
   assert(
     !at30m.ok && at30m.unavailable === true && at30m.probeOutcome === "unavailable",
     "a short family must stop at the 30m idle cutoff",
@@ -3962,8 +3972,8 @@ function deepEqualExcept<Actual, Expected>(
   );
 
   shortWarmer.setConfig({ ...shortWarmer.getConfig(), maxIdleWarmMs: 0 });
-  shortAnchor.lastRealTurnAt = Date.now() - 5 * 3_600_000;
-  const unlimited = await (shortWarmer as any).runWarm("timer");
+  setLastRealTurnAt(shortWarmer, Date.now() - 5 * 3_600_000);
+  const unlimited = await runTimerWarm(shortWarmer);
   assert(unlimited.ok, "maxidle=0 must restore warm-until-failure after the cutoff");
   shortWarmer.dispose();
   rmSync(cwd, { recursive: true, force: true });
@@ -3975,21 +3985,21 @@ function deepEqualExcept<Actual, Expected>(
 {
   resetProbeSpendLedgerForTest();
   const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-spend-ledger-"));
-  const model = {
+  const model = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     baseUrl: "https://api.openai.com/v1",
-  } as any;
+  });
   let calls = 0;
-  const completeStub = async (): Promise<any> => {
+  const completeStub = completeFixture(async () => {
     calls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
     };
-  };
-  const ctx = {
+  });
+  const ctx = contextFixture({
     cwd,
     model,
     hasUI: false,
@@ -4004,7 +4014,7 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
     },
-  } as any;
+  });
   const payload = {
     model: model.id,
     input: [{ role: "user", content: [{ type: "input_text", text: "keep warm" }] }],
@@ -4013,7 +4023,7 @@ function deepEqualExcept<Actual, Expected>(
 
   // Dollar ceiling: 1 cent. One probe costs 1 cent, so the second timer fire
   // must soft-block without calling the provider.
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any, completeStub as any);
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }), completeStub);
   warmer.bindContext(ctx);
   warmer.setConfig({
     ...DEFAULT_CONFIG,
@@ -4024,11 +4034,11 @@ function deepEqualExcept<Actual, Expected>(
   warmer.capturePayload(payload, ctx);
   warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
 
-  const first = await (warmer as any).runWarm("timer");
+  const first = await runTimerWarm(warmer);
   assert(first.ok && first.probeOutcome === "hit", "the first timer probe must fire under the ceiling");
   assert(Number(calls) === 1, "one probe must cost one cent against the 1-cent ceiling");
 
-  const blocked = await (warmer as any).runWarm("timer");
+  const blocked = await runTimerWarm(warmer);
   assert(
     !blocked.ok && blocked.unavailable === true && blocked.probeOutcome === "unavailable",
     "a timer probe over the spend ceiling must soft-block",
@@ -4045,7 +4055,7 @@ function deepEqualExcept<Actual, Expected>(
   // /warm now bypasses the ceiling, but the timer stays soft-blocked.
   const manualBypass = await warmer.warmNow(ctx);
   assert(manualBypass.ok, "/warm now must bypass the spend ceiling");
-  const stillBlocked = await (warmer as any).runWarm("timer");
+  const stillBlocked = await runTimerWarm(warmer);
   assert(
     !stillBlocked.ok && stillBlocked.unavailable === true,
     "a timer probe must stay soft-blocked even after a manual bypass",
@@ -4058,15 +4068,15 @@ function deepEqualExcept<Actual, Expected>(
   // A real turn clears this instance's soft block and resets the campaign ledger.
   warmer.capturePayload(payload, ctx);
   warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
-  const resumed = await (warmer as any).runWarm("timer");
+  const resumed = await runTimerWarm(warmer);
   assert(resumed.ok, "a real turn must clear the soft block and reset the ledger");
   assert(Number(calls) === 3, "the post-reset probe must be the third provider call");
   warmer.dispose();
 
   // spend=0 means unlimited: probes never trip the ceiling.
   const unlimitedWarmer = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    completeStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    completeStub,
   );
   unlimitedWarmer.bindContext(ctx);
   unlimitedWarmer.setConfig({
@@ -4077,8 +4087,8 @@ function deepEqualExcept<Actual, Expected>(
   });
   unlimitedWarmer.capturePayload(payload, ctx);
   unlimitedWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
-  const u1 = await (unlimitedWarmer as any).runWarm("timer");
-  const u2 = await (unlimitedWarmer as any).runWarm("timer");
+  const u1 = await runTimerWarm(unlimitedWarmer);
+  const u2 = await runTimerWarm(unlimitedWarmer);
   assert(u1.ok && u2.ok, "spend=0 must keep the ceiling inactive for every provider");
   assert(
     unlimitedWarmer.getStatusText().includes("spendCeiling=ok"),
@@ -4090,16 +4100,16 @@ function deepEqualExcept<Actual, Expected>(
   // so the probe-count ceiling stops the campaign instead.
   resetProbeSpendLedgerForTest();
   let zeroCostCalls = 0;
-  const zeroCostStub = async (): Promise<any> => {
+  const zeroCostStub = completeFixture(async () => {
     zeroCostCalls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0 },
     };
-  };
+  });
   const fallbackWarmer = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    zeroCostStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    zeroCostStub,
   );
   fallbackWarmer.bindContext(ctx);
   fallbackWarmer.setConfig({
@@ -4111,10 +4121,10 @@ function deepEqualExcept<Actual, Expected>(
   fallbackWarmer.capturePayload(payload, ctx);
   fallbackWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
   for (let i = 0; i < 250; i++) {
-    const probe = await (fallbackWarmer as any).runWarm("timer");
+    const probe = await runTimerWarm(fallbackWarmer);
     assert(probe.ok, `probe ${i + 1} must fire under the 250-probe fallback`);
   }
-  const fallbackBlocked = await (fallbackWarmer as any).runWarm("timer");
+  const fallbackBlocked = await runTimerWarm(fallbackWarmer);
   assert(
     !fallbackBlocked.ok &&
       fallbackBlocked.unavailable === true &&
@@ -4131,16 +4141,16 @@ function deepEqualExcept<Actual, Expected>(
   // disabling it (spend=0) clears this instance's soft block immediately,
   // matching the documented spend=0 opt-out.
   let resumeCalls = 0;
-  const resumeStub = async (): Promise<any> => {
+  const resumeStub = completeFixture(async () => {
     resumeCalls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
     };
-  };
+  });
   const resumeWarmer = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    resumeStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    resumeStub,
   );
   resumeWarmer.bindContext(ctx);
   resumeWarmer.setConfig({
@@ -4151,14 +4161,14 @@ function deepEqualExcept<Actual, Expected>(
   });
   resumeWarmer.capturePayload(payload, ctx);
   resumeWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
-  const r1 = await (resumeWarmer as any).runWarm("timer");
+  const r1 = await runTimerWarm(resumeWarmer);
   assert(r1.ok, "the first probe must fire against the 1-cent ceiling");
-  const rBlocked = await (resumeWarmer as any).runWarm("timer");
+  const rBlocked = await runTimerWarm(resumeWarmer);
   assert(!rBlocked.ok, "the second timer fire must soft-block");
   assert(Number(resumeCalls) === 1, "the soft block must hold before any config change");
   // spend=0 (unlimited) resumes warming without waiting for a real turn.
   resumeWarmer.setConfig({ ...resumeWarmer.getConfig(), warmSpendCeilingUsd: 0 });
-  const rUnlimited = await (resumeWarmer as any).runWarm("timer");
+  const rUnlimited = await runTimerWarm(resumeWarmer);
   assert(rUnlimited.ok, "spend=0 must resume a soft-blocked session immediately");
   assert(Number(resumeCalls) === 2, "the resumed probe must be the second provider call");
   assert(
@@ -4167,14 +4177,14 @@ function deepEqualExcept<Actual, Expected>(
   );
   // A lowered ceiling keeps the block; a raised ceiling resumes it.
   resumeWarmer.setConfig({ ...resumeWarmer.getConfig(), warmSpendCeilingUsd: 0.01 });
-  const rLowered = await (resumeWarmer as any).runWarm("timer");
+  const rLowered = await runTimerWarm(resumeWarmer);
   assert(
     !rLowered.ok && rLowered.unavailable === true,
     "a lowered ceiling must keep the session soft-blocked",
   );
   assert(Number(resumeCalls) === 2, "no provider call while the lowered ceiling holds");
   resumeWarmer.setConfig({ ...resumeWarmer.getConfig(), warmSpendCeilingUsd: 5 });
-  const rRaised = await (resumeWarmer as any).runWarm("timer");
+  const rRaised = await runTimerWarm(resumeWarmer);
   assert(rRaised.ok, "a raised ceiling must resume a soft-blocked session");
   assert(Number(resumeCalls) === 3, "the resumed probe must be the third provider call");
   resumeWarmer.dispose();
@@ -4183,16 +4193,16 @@ function deepEqualExcept<Actual, Expected>(
   // priced session is bounded by dollars, never by the unrelated probe count.
   resetProbeSpendLedgerForTest();
   let pricedCalls = 0;
-  const pricedStub = async (): Promise<any> => {
+  const pricedStub = completeFixture(async () => {
     pricedCalls += 1;
     return {
       stopReason: "stop",
       usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
     };
-  };
+  });
   const pricedWarmer = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    pricedStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    pricedStub,
   );
   pricedWarmer.bindContext(ctx);
   pricedWarmer.setConfig({
@@ -4204,10 +4214,10 @@ function deepEqualExcept<Actual, Expected>(
   pricedWarmer.capturePayload(payload, ctx);
   pricedWarmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
   for (let i = 0; i < 250; i++) {
-    const probe = await (pricedWarmer as any).runWarm("timer");
+    const probe = await runTimerWarm(pricedWarmer);
     assert(probe.ok, `priced probe ${i + 1} must fire past the fallback count`);
   }
-  const priced251 = await (pricedWarmer as any).runWarm("timer");
+  const priced251 = await runTimerWarm(pricedWarmer);
   assert(
     priced251.ok,
     "the 250-probe fallback must not fire while the campaign has real spend",
