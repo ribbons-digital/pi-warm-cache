@@ -6,6 +6,20 @@ type RouteCompat = {
   sessionAffinityFormat?: "openai" | "openai-nosession" | "openrouter";
 };
 
+type PromptCacheKeyCandidate =
+  | string
+  | number
+  | boolean
+  | bigint
+  | symbol
+  | object
+  | null
+  | undefined;
+
+type PromptCachePayload = {
+  prompt_cache_key?: PromptCacheKeyCandidate;
+};
+
 const OPENAI_COMPAT_APIS = new Set(["openai-responses", "openai-completions"]);
 const XAI_PROBE_APIS = new Set(["openai-responses", "openai-completions"]);
 const XAI_BEST_EFFORT_MODEL_IDS = new Set(["grok-4.5"]);
@@ -165,7 +179,14 @@ export const PROXY_ROUTE_REGISTRY: readonly ProxyRouteRegistration[] = [
 ];
 
 function getCompat(model: Model<any>): RouteCompat | undefined {
-  return (model as { compat?: RouteCompat }).compat;
+  const compat = model.compat;
+  if (!compat) return undefined;
+  return {
+    cacheControlFormat:
+      "cacheControlFormat" in compat ? compat.cacheControlFormat : undefined,
+    sessionAffinityFormat:
+      "sessionAffinityFormat" in compat ? compat.sessionAffinityFormat : undefined,
+  };
 }
 
 function hasFirstPartyBaseUrl(model: Model<any>, hosts: Set<string>): boolean {
@@ -242,9 +263,9 @@ function hasExactProxyBaseUrl(
  * The anthropic-messages transport carries `cache_control` by design, so the
  * refusal never fires for it.
  */
-export function opencodeGoForeignInstrumentationReason(
+export function opencodeGoForeignInstrumentationReason<Payload>(
   model: Model<any> | undefined,
-  payload?: unknown,
+  payload?: Payload,
 ): string | null {
   if (!model || model.provider !== "opencode-go") return null;
   if (model.api !== "openai-completions") return null;
@@ -267,9 +288,9 @@ export function opencodeGoForeignInstrumentationReason(
  * stays unverified and the payload-specific refusal disables the manual probe
  * for that payload only; a later clean real-turn payload resolves normally.
  */
-function resolveProxyRouteCapability(
+function resolveProxyRouteCapability<Payload>(
   model: Model<any>,
-  payload?: unknown,
+  payload?: Payload,
 ): ProviderCapability | null {
   const registrations = PROXY_ROUTE_REGISTRY.filter(
     (route) => route.provider === model.provider,
@@ -440,13 +461,18 @@ export function isDirectXaiGrokRoute(model: Model<any> | undefined): boolean {
  * exact format. Keep the check strict about accidental whitespace and control
  * characters without inventing a provider-specific length or character rule.
  */
-export function isStablePromptCacheKey(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value === value.trim() &&
-    !/[\u0000-\u001f\u007f-\u009f]/.test(value)
-  );
+export function isStablePromptCacheKey<Value>(value: Value): value is Value & string {
+  if (
+    value === Object(value) ||
+    Object.prototype.toString.call(value) !== "[object String]"
+  ) return false;
+  const text = String(value);
+  if (text.length === 0 || text !== text.trim()) return false;
+  for (const character of text) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return false;
+  }
+  return true;
 }
 
 /**
@@ -457,7 +483,7 @@ export function isStablePromptCacheKey(value: unknown): value is string {
  * feeds the redacted fingerprint and never any gate beyond the literal
  * "openai-responses" keyed checks.
  */
-export function getPromptCacheKey(payload: unknown, api: string | undefined): string | null {
+export function getPromptCacheKey<Payload>(payload: Payload, api: string | undefined): string | null {
   if (
     api !== "openai-responses" &&
     api !== "openai-codex-responses" &&
@@ -466,8 +492,13 @@ export function getPromptCacheKey(payload: unknown, api: string | undefined): st
   ) {
     return null;
   }
-  if (!payload || typeof payload !== "object") return null;
-  const key = (payload as Record<string, unknown>).prompt_cache_key;
+  if (
+    !payload ||
+    payload !== Object(payload) ||
+    Object.prototype.toString.call(payload).endsWith("Function]")
+  ) return null;
+  // SAFETY: The object identity check excludes primitive payloads before property access.
+  const key = (payload as PromptCachePayload).prompt_cache_key;
   return isStablePromptCacheKey(key) ? key : null;
 }
 
@@ -480,7 +511,7 @@ export function getPromptCacheKey(payload: unknown, api: string | undefined): st
  * keyed-but-unretained payload is not a separate family and behaves like
  * plain, because the gateway in-memory TTL is still the default.
  */
-export function hasStableResponsesCacheKey(payload: unknown): boolean {
+export function hasStableResponsesCacheKey<Payload>(payload: Payload): boolean {
   return (
     isSafeReplayPayload(payload, "openai-responses") &&
     Boolean(getPromptCacheKey(payload, "openai-responses"))
@@ -491,12 +522,12 @@ export function hasStableResponsesCacheKey(payload: unknown): boolean {
  * xAI Responses needs a provider cache key in the captured body before a
  * best-effort probe can be armed. This is the route's stable cache identity.
  */
-export function hasXaiPromptCacheKey(payload: unknown): boolean {
+export function hasXaiPromptCacheKey<Payload>(payload: Payload): boolean {
   return hasStableResponsesCacheKey(payload);
 }
 
 /** True when a captured direct xAI payload is safe for automatic replay. */
-export function isSafeXaiReplayPayload(payload: unknown): boolean {
+export function isSafeXaiReplayPayload<Payload>(payload: Payload): boolean {
   return hasStableResponsesCacheKey(payload);
 }
 
