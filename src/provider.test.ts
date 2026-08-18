@@ -73,6 +73,10 @@ import {
 } from "./ui.ts";
 import { resolveWarmNowFailure } from "./index.ts";
 import { DEFAULT_CONFIG, type ProviderCapability } from "./types.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+type WarmComplete = NonNullable<ConstructorParameters<typeof SessionWarmer>[1]>;
+type NotifyLevel = "info" | "warning" | "error";
 
 function assert<Condition>(cond: Condition, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
@@ -81,6 +85,53 @@ function assert<Condition>(cond: Condition, msg: string): asserts cond {
 function modelFixture<Fixture>(model: Fixture): Model<any> {
   // SAFETY: Route tests intentionally provide only fields read by the capability under test.
   return model as Model<any>;
+}
+
+function extensionApiFixture<Fixture>(api: Fixture): ExtensionAPI {
+  // SAFETY: Warmer tests provide only getThinkingLevel, which SessionWarmer reads.
+  return api as ExtensionAPI;
+}
+
+function contextFixture<Fixture>(ctx: Fixture): ExtensionContext {
+  // SAFETY: Warmer tests provide only the context fields SessionWarmer reads.
+  return ctx as ExtensionContext;
+}
+
+function completeFixture<Fn>(fn: Fn): WarmComplete {
+  // SAFETY: Warmer tests return only the complete() fields SessionWarmer reads.
+  return fn as WarmComplete;
+}
+
+function nextDueAtMs(status: string): number | null {
+  const match = /(?:^|\s)nextDue=(\S+)/.exec(status);
+  if (!match || match[1] === "none") return null;
+  const due = Date.parse(match[1]);
+  return Number.isFinite(due) ? due : null;
+}
+
+function logString<Value>(value: Value): string | null {
+  if (value !== Object(value) && Object.prototype.toString.call(value) === "[object String]") {
+    return String(value);
+  }
+  return null;
+}
+
+function reanchorLog(line: string): {
+  reason: string | null;
+  oldPayloadFingerprint: string | null;
+  newPayloadFingerprint: string | null;
+  oldCacheKeyFingerprint: string | null;
+  newCacheKeyFingerprint: string | null;
+} | null {
+  const body = payloadObject(JSON.parse(line));
+  if (!body || body.event !== "anchor_reanchored") return null;
+  return {
+    reason: logString(body.reason),
+    oldPayloadFingerprint: logString(body.oldPayloadFingerprint),
+    newPayloadFingerprint: logString(body.newPayloadFingerprint),
+    oldCacheKeyFingerprint: logString(body.oldCacheKeyFingerprint),
+    newCacheKeyFingerprint: logString(body.newCacheKeyFingerprint),
+  };
 }
 
 function deepEqualExcept<Actual, Expected>(
@@ -1762,11 +1813,11 @@ function deepEqualExcept<Actual, Expected>(
 
 // 8) Savings pricing: zero-cost proxy => n/a (do not invent catalog rates)
 {
-  const vibe = {
+  const vibe = modelFixture({
     id: "claude-opus-5",
     provider: "vibeproxy",
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  } as any;
+  });
   const p = resolveModelPricing(vibe);
   assert(p.source === "unknown", `expected unknown, got ${p.source}`);
   assert(!p.savingsKnown, "zero-cost proxy must not claim known savings");
@@ -1780,10 +1831,10 @@ function deepEqualExcept<Actual, Expected>(
     "unknown must not render as $0.00",
   );
 
-  const priced = {
+  const priced = modelFixture({
     id: "x",
     cost: { input: 5, cacheRead: 0.5, cacheWrite: 6.25, output: 25 },
-  } as any;
+  });
   const m = resolveModelPricing(priced);
   assert(m.source === "model", "non-zero model cost wins");
   assert(
@@ -2000,8 +2051,8 @@ function deepEqualExcept<Actual, Expected>(
 
 // 10) Session warmer keeps real-turn observations, probe outcomes, and retries separate.
 {
-  const notifications: Array<{ message: string; level: string }> = [];
-  const responses: Array<unknown> = [
+  const notifications: Array<{ message: string; level: NotifyLevel }> = [];
+  const responses = [
     {
       stopReason: "stop",
       usage: {
@@ -2034,25 +2085,25 @@ function deepEqualExcept<Actual, Expected>(
       },
     },
   ];
-  const completeStub = async (): Promise<any> => {
+  const completeStub = completeFixture(async () => {
     const next = responses.shift();
     if (next instanceof Error) throw next;
     return next;
-  };
-  const model = {
+  });
+  const model = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     baseUrl: "https://api.openai.com/v1",
     cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
-  } as any;
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
-    notify: (message: string, level: string) => notifications.push({ message, level }),
+    notify: (message: string, level: NotifyLevel = "info") => notifications.push({ message, level }),
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model,
     hasUI: true,
@@ -2063,10 +2114,10 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
     },
-  } as any;
+  });
   const warmer = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    completeStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    completeStub,
   );
   warmer.bindContext(ctx);
   warmer.setConfig({
@@ -2228,8 +2279,8 @@ function deepEqualExcept<Actual, Expected>(
   warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
   await new Promise((resolve) => setTimeout(resolve, 20));
   warmer.onAgentSettled(ctx);
-  const reanchoredDueAt = (warmer as any).nextDueAt as number;
-  assert(reanchoredDueAt > Date.now(), "re-anchor should arm the normal strategy timer");
+  const reanchoredDueAt = nextDueAtMs(warmer.getStatusText());
+  assert(reanchoredDueAt !== null && reanchoredDueAt > Date.now(), "re-anchor should arm the normal strategy timer");
   assert(
     reanchoredDueAt <= reanchorCapturedAt + 60_010,
     "re-anchor timer should not add settlement time to the normal interval",
@@ -2242,19 +2293,19 @@ function deepEqualExcept<Actual, Expected>(
 // 11) Hard re-anchor logs the invalidation reason and both payload/cache identities.
 {
   const cwd = mkdtempSync(join(tmpdir(), "pi-warm-cache-reanchor-"));
-  const model = {
+  const model = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     baseUrl: "https://api.openai.com/v1",
-  } as any;
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
     notify: () => undefined,
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd,
     model,
     hasUI: false,
@@ -2265,8 +2316,8 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
     },
-  } as any;
-  const warmer = new SessionWarmer({ getThinkingLevel: () => "off" } as any);
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }));
   const config = {
     ...DEFAULT_CONFIG,
     minCachedTokens: 10,
@@ -2297,22 +2348,22 @@ function deepEqualExcept<Actual, Expected>(
     .trim()
     .split("\n")
     .filter(Boolean)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
-  const transition = events.find((event) => event.event === "anchor_reanchored");
+    .map(reanchorLog);
+  const transition = events.find((event) => event !== null);
   assert(transition !== undefined, "fresh capture should log an anchor_reanchored transition");
-  assert(transition?.reason === "compacted · waiting for next turn", "transition should preserve the reason");
+  assert(transition.reason === "compacted · waiting for next turn", "transition should preserve the reason");
   assert(
-    transition?.oldPayloadFingerprint === oldPayloadFingerprint,
+    transition.oldPayloadFingerprint === oldPayloadFingerprint,
     "transition should log the dropped payload fingerprint",
   );
   assert(
-    transition?.newPayloadFingerprint === stableFingerprint(newPayload),
+    transition.newPayloadFingerprint === stableFingerprint(newPayload),
     "transition should log the fresh payload fingerprint",
   );
   assert(
-    typeof transition?.oldCacheKeyFingerprint === "string" &&
+    transition.oldCacheKeyFingerprint !== null &&
       transition.oldCacheKeyFingerprint !== "reanchor-old-key" &&
-      typeof transition?.newCacheKeyFingerprint === "string" &&
+      transition.newCacheKeyFingerprint !== null &&
       transition.newCacheKeyFingerprint !== "reanchor-new-key",
     "transition should log only redacted old and new cache-key fingerprints",
   );
@@ -2323,8 +2374,8 @@ function deepEqualExcept<Actual, Expected>(
 
 // 12) Disable/re-enable preserves "awaiting-reanchor" and "blocked" states
 {
-  const notifications: Array<{ message: string; level: string }> = [];
-  const responses: Array<unknown> = [
+  const notifications: Array<{ message: string; level: NotifyLevel }> = [];
+  const responses = [
     {
       stopReason: "stop",
       usage: {
@@ -2336,25 +2387,25 @@ function deepEqualExcept<Actual, Expected>(
       },
     },
   ];
-  const completeStub = async (): Promise<any> => {
+  const completeStub = completeFixture(async () => {
     const next = responses.shift();
     if (next instanceof Error) throw next;
     return next;
-  };
-  const model = {
+  });
+  const model = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     baseUrl: "https://api.openai.com/v1",
     cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
-  } as any;
+  });
   const ui = {
     theme: { fg: (_color: string, text: string) => text },
-    notify: (message: string, level: string) => notifications.push({ message, level }),
+    notify: (message: string, level: NotifyLevel = "info") => notifications.push({ message, level }),
     setStatus: () => undefined,
     setWidget: () => undefined,
   };
-  const ctx = {
+  const ctx = contextFixture({
     cwd: process.cwd(),
     model,
     hasUI: true,
@@ -2365,12 +2416,12 @@ function deepEqualExcept<Actual, Expected>(
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {}, env: {} }),
     },
-  } as any;
+  });
 
   // Test 1: Disable while in "awaiting-reanchor" state, then re-enable restores "awaiting-reanchor"
   const warmer1 = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    completeStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    completeStub,
   );
   warmer1.bindContext(ctx);
   warmer1.setConfig({
@@ -2402,8 +2453,8 @@ function deepEqualExcept<Actual, Expected>(
 
   // Test 2: Disable while "blocked" (autoWarmBlockReason set), then re-enable restores "blocked"
   const warmer2 = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    completeStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    completeStub,
   );
   warmer2.bindContext(ctx);
   warmer2.setConfig({
@@ -2441,13 +2492,13 @@ function deepEqualExcept<Actual, Expected>(
   // Since we can't easily trigger autoWarmBlockReason through the test fixture without Codex,
   // let's test the scenario differently by using the clearAutoWarmBlock API.
   // We'll create a new warmer and use a Codex model instead.
-  const codexModel = {
+  const codexModel = modelFixture({
     id: "gpt-5.6",
     provider: "openai-codex",
     api: "openai-codex-responses",
     baseUrl: "https://api.openai.com/v1",
     cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
-  } as any;
+  });
   const codexResponses = [
     // First oversized response (soft-skip)
     {
@@ -2460,13 +2511,13 @@ function deepEqualExcept<Actual, Expected>(
       usage: { input: 1, output: 300, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
     },
   ];
-  const codexCompleteStub = async (): Promise<any> => {
+  const codexCompleteStub = completeFixture(async () => {
     return codexResponses.shift();
-  };
-  const codexCtx = { ...ctx, model: codexModel };
+  });
+  const codexCtx = contextFixture({ ...ctx, model: codexModel });
   const warmer3 = new SessionWarmer(
-    { getThinkingLevel: () => "off" } as any,
-    codexCompleteStub as any,
+    extensionApiFixture({ getThinkingLevel: () => "off" }),
+    codexCompleteStub,
   );
   warmer3.bindContext(codexCtx);
   warmer3.setConfig({
@@ -2489,11 +2540,11 @@ function deepEqualExcept<Actual, Expected>(
   warmer3.noteAssistantUsage(codexCtx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
 
   // First oversized probe (soft-skip)
-  const firstCodex = await warmer3.warmNow(codexCtx);
+  await warmer3.warmNow(codexCtx);
   assert(warmer3.getLifecycleState() === "anchored", "first oversized should soft-skip and stay anchored");
 
   // Second oversized probe (sticky-block)
-  const secondCodex = await warmer3.warmNow(codexCtx);
+  await warmer3.warmNow(codexCtx);
   assert(warmer3.getLifecycleState() === "blocked", "second oversized should trigger sticky-block");
   assert(warmer3.getAutoWarmBlockReason() !== null, "autoWarmBlockReason should be set");
 
