@@ -39,6 +39,7 @@ import {
   OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
   payloadHasAnthropicLongTtl,
   payloadHasCacheControl,
+  payloadObject,
   PROXY_ROUTE_REGISTRY,
   supportsManualProbe,
   XAI_BEST_EFFORT_INTERVAL_MS,
@@ -73,7 +74,7 @@ import {
 import { resolveWarmNowFailure } from "./index.ts";
 import { DEFAULT_CONFIG, type ProviderCapability } from "./types.ts";
 
-function assert(cond: unknown, msg: string): asserts cond {
+function assert<Condition>(cond: Condition, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
 }
 
@@ -82,26 +83,39 @@ function modelFixture<Fixture>(model: Fixture): Model<any> {
   return model as Model<any>;
 }
 
-function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""): void {
-  if (a === b) return;
-  if (typeof a !== typeof b) throw new Error(`type mismatch at ${path}`);
-  if (!a || !b || typeof a !== "object") {
-    if (a !== b) throw new Error(`value mismatch at ${path}: ${String(a)} !== ${String(b)}`);
-    return;
+function deepEqualExcept<Actual, Expected>(
+  actual: Actual,
+  expected: Expected,
+  allowed: Set<string>,
+  path = "",
+): void {
+  if (Object.is(actual, expected)) return;
+  if (Object.prototype.toString.call(actual) !== Object.prototype.toString.call(expected)) {
+    throw new Error(`type mismatch at ${path}`);
   }
-  if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    if (!Array.isArray(actual) || !Array.isArray(expected) || actual.length !== expected.length) {
       throw new Error(`array mismatch at ${path}`);
     }
-    for (let i = 0; i < a.length; i++) deepEqualExcept(a[i], b[i], allowed, `${path}[${i}]`);
+    for (let i = 0; i < actual.length; i++) {
+      deepEqualExcept(actual[i], expected[i], allowed, `${path}[${i}]`);
+    }
     return;
   }
-  const ao = a as Record<string, unknown>;
-  const bo = b as Record<string, unknown>;
-  const keys = new Set([...Object.keys(ao), ...Object.keys(bo)]);
+  const actualObject = payloadObject(actual);
+  const expectedObject = payloadObject(expected);
+  if (!actualObject || !expectedObject) {
+    throw new Error(`value mismatch at ${path}: ${String(actual)} !== ${String(expected)}`);
+  }
+  const keys = new Set([...Object.keys(actualObject), ...Object.keys(expectedObject)]);
   for (const key of keys) {
     if (path === "" && allowed.has(key)) continue;
-    deepEqualExcept(ao[key], bo[key], allowed, path ? `${path}.${key}` : key);
+    deepEqualExcept(
+      actualObject[key],
+      expectedObject[key],
+      allowed,
+      path ? `${path}.${key}` : key,
+    );
   }
 }
 
@@ -116,7 +130,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     tools: [{ name: "bash", input_schema: { type: "object" } }],
   };
   const cloned = structuredClone(original);
-  const out = applyWarmOutputLimit(cloned, 1) as typeof original;
+  const out = applyWarmOutputLimit(cloned, 1);
 
   assert(out.max_tokens === 8001, `expected max_tokens=8001, got ${out.max_tokens}`);
   deepEqualExcept(original, out, WARM_MUTABLE_PAYLOAD_KEYS);
@@ -131,7 +145,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     prompt_cache_key: "sess-1",
     input: [{ role: "user", content: "hi" }],
   };
-  const out = applyWarmOutputLimit(structuredClone(original), 1, "openai-responses") as typeof original;
+  const out = applyWarmOutputLimit(structuredClone(original), 1, "openai-responses");
   assert(
     out.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
     `openai-responses floor ${OPENAI_RESPONSES_MIN_OUTPUT_TOKENS}, got ${out.max_output_tokens}`,
@@ -150,7 +164,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     reasoning: { effort: "high", summary: "auto" },
     tools: [{ type: "function", name: "bash" }],
   };
-  const out = applyXaiWarmOutputLimit(structuredClone(original), 1) as typeof original;
+  const out = applyXaiWarmOutputLimit(structuredClone(original), 1);
   assert(out.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS, "xAI output cap should use the legal floor");
   assert(out.prompt_cache_key === original.prompt_cache_key, "xAI cache key must stay unchanged");
   assert(out.instructions === original.instructions, "xAI instructions must stay unchanged");
@@ -174,23 +188,20 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     tool_choice: "auto",
     tools: [{ type: "function", name: "bash" }],
   };
-  const out = applyWarmOutputLimit(structuredClone(original), 1, "openai-codex-responses") as Record<
-    string,
-    unknown
-  >;
+  const out = applyWarmOutputLimit(structuredClone(original), 1, "openai-codex-responses");
   assert(!("max_output_tokens" in out), "codex must not receive max_output_tokens");
   assert(!("max_tokens" in out), "codex must not receive max_tokens");
-  assert((out.reasoning as { effort: string }).effort === "xhigh", "codex effort must stay identical");
+  assert(out.reasoning.effort === "xhigh", "codex effort must stay identical");
   assert(out.tool_choice === "auto", "codex tool_choice must stay identical");
   assert(out.instructions === original.instructions, "instructions must stay identical");
   assert(JSON.stringify(out.tools) === JSON.stringify(original.tools), "tools must stay identical");
-  assert(isCodexPayload(original as any), "fixture should look like codex");
+  assert(isCodexPayload(original), "fixture should look like codex");
 
-  const withTurn = appendWarmUserTurn(structuredClone(original), "Reply OK only", "openai-codex-responses") as {
-    input: unknown[];
-    instructions: string;
-    tools: unknown;
-  };
+  const withTurn = appendWarmUserTurn(
+    structuredClone(original),
+    "Reply OK only",
+    "openai-codex-responses",
+  );
   assert(withTurn.input.length === original.input.length + 1, "suffix adds one input item");
   assert(withTurn.instructions === original.instructions, "suffix must not edit instructions");
   assert(JSON.stringify(withTurn.tools) === JSON.stringify(original.tools), "suffix must not edit tools");
@@ -225,12 +236,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     model: "deepseek-v4-flash",
     messages: [{ role: "user", content: "hi" }],
   };
-  const declared = applyWarmOutputLimit(
+  const declared = payloadObject(applyWarmOutputLimit(
     structuredClone(uncapped),
     8,
     "openai-completions",
     { maxTokensField: "max_tokens" },
-  ) as Record<string, unknown>;
+  ));
+  assert(declared, "declared completions result must remain an object");
   assert(
     declared.max_tokens === 8,
     "uncapped completions must write the declared maxTokensField",
@@ -240,11 +252,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "must not write the default field when maxTokensField is declared",
   );
 
-  const defaulted = applyWarmOutputLimit(
+  const defaulted = payloadObject(applyWarmOutputLimit(
     structuredClone(uncapped),
     8,
     "openai-completions",
-  ) as Record<string, unknown>;
+  ));
+  assert(defaulted, "default completions result must remain an object");
   assert(
     defaulted.max_completion_tokens === 8,
     "uncapped completions without compat keeps the default field",
@@ -263,7 +276,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     8,
     "openai-completions",
     { maxTokensField: "max_tokens" },
-  ) as Record<string, unknown>;
+  );
   assert(cappedOut.max_tokens === 8, "an existing declared cap field is capped in place");
   deepEqualExcept(cappedOriginal, cappedOut, WARM_MUTABLE_PAYLOAD_KEYS);
 
@@ -272,21 +285,23 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     model: "claude-fable-5",
     messages: [{ role: "user", content: "hi" }],
   };
-  const anthropicOut = applyWarmOutputLimit(
+  const anthropicOut = payloadObject(applyWarmOutputLimit(
     structuredClone(anthropicUncapped),
     8,
     "anthropic-messages",
     { maxTokensField: "max_tokens" },
-  ) as Record<string, unknown>;
+  ));
+  assert(anthropicOut, "Anthropic result must remain an object");
   assert(anthropicOut.max_tokens === 8, "the Anthropic fallback keeps writing max_tokens");
 
   const responsesUncapped = { model: "gpt-5.6", input: [{ role: "user", content: "hi" }] };
-  const responsesOut = applyWarmOutputLimit(
+  const responsesOut = payloadObject(applyWarmOutputLimit(
     structuredClone(responsesUncapped),
     8,
     "openai-responses",
     { maxTokensField: "max_tokens" },
-  ) as Record<string, unknown>;
+  ));
+  assert(responsesOut, "Responses result must remain an object");
   assert(
     responsesOut.max_output_tokens === OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
     "the Responses fallback keeps writing max_output_tokens at its legal floor",

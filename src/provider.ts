@@ -7,6 +7,7 @@ import {
   isDirectXaiGrokRoute,
   isSafeReplayPayload,
   isSafeXaiReplayPayload,
+  payloadObject,
   resolveProviderCapability,
 } from "./capability.ts";
 import type {
@@ -14,7 +15,6 @@ import type {
   CacheFamily,
   ProviderCapability,
   ProbeOutcome,
-  ProviderCapabilityState,
   RealTurnObservation,
   StrategyPlan,
   WarmCacheConfig,
@@ -32,6 +32,7 @@ export {
   isStablePromptCacheKey,
   opencodeGoForeignInstrumentationReason,
   payloadHasCacheControl,
+  payloadObject,
   PROXY_ROUTE_REGISTRY,
   resolveProviderCapability,
 } from "./capability.ts";
@@ -135,8 +136,7 @@ export function isAnthropicModel(model: Model<any> | undefined): boolean {
   if (!model) return false;
   if (model.api === "anthropic-messages") return true;
   if (model.provider === "anthropic") return true;
-  const compat = (model as { compat?: { cacheControlFormat?: string } }).compat;
-  return compat?.cacheControlFormat === "anthropic";
+  return getModelCompat(model)?.cacheControlFormat === "anthropic";
 }
 
 export function isOpenAIModel(model: Model<any> | undefined): boolean {
@@ -163,7 +163,7 @@ export function supportsAutomaticWarm(model: Model<any> | undefined): boolean {
 }
 
 /** True when the route is allowed to make a one-shot manual probe. */
-export function supportsManualProbe(model: Model<any> | undefined, payload?: unknown): boolean {
+export function supportsManualProbe<Payload = undefined>(model: Model<any> | undefined, payload?: Payload): boolean {
   // The payload is passed through so payload-dependent gates (the direct xAI
   // key gate and the opencode-go foreign-instrumentation refusal) can disable
   // the manual probe for an unsafe exact payload. With no payload supplied the
@@ -198,7 +198,19 @@ type ModelCompat = {
  * field the model actually accepts.
  */
 export function getModelCompat(model: Model<any> | undefined): ModelCompat | undefined {
-  return (model as { compat?: ModelCompat } | undefined)?.compat;
+  const compat = model?.compat;
+  if (!compat) return undefined;
+  return {
+    cacheControlFormat:
+      "cacheControlFormat" in compat ? compat.cacheControlFormat : undefined,
+    supportsLongCacheRetention:
+      "supportsLongCacheRetention" in compat ? compat.supportsLongCacheRetention : undefined,
+    supportsExplicitPromptCacheMode:
+      "supportsExplicitPromptCacheMode" in compat
+        ? compat.supportsExplicitPromptCacheMode
+        : undefined,
+    maxTokensField: "maxTokensField" in compat ? compat.maxTokensField : undefined,
+  };
 }
 
 /**
@@ -221,24 +233,23 @@ export function modelSupportsExplicitPromptCacheMode(model: Model<any> | undefin
 }
 
 /** True when the real provider payload already carries Anthropic 1h cache markers. */
-export function payloadHasAnthropicLongTtl(payload: unknown): boolean {
+export function payloadHasAnthropicLongTtl<Payload>(payload: Payload): boolean {
   let found = false;
-  const visit = (node: unknown): void => {
-    if (found || !node || typeof node !== "object") return;
+  function visit<Node>(node: Node): void {
+    if (found) return;
     if (Array.isArray(node)) {
       for (const item of node) visit(item);
       return;
     }
-    const obj = node as Record<string, unknown>;
-    if (obj.cache_control && typeof obj.cache_control === "object") {
-      const cc = obj.cache_control as Record<string, unknown>;
-      if (cc.type === "ephemeral" && cc.ttl === "1h") {
-        found = true;
-        return;
-      }
+    const body = payloadObject(node);
+    if (!body) return;
+    const cacheControl = payloadObject(body.cache_control);
+    if (cacheControl?.type === "ephemeral" && cacheControl.ttl === "1h") {
+      found = true;
+      return;
     }
-    for (const value of Object.values(obj)) visit(value);
-  };
+    for (const value of Object.values(body)) visit(value);
+  }
   visit(payload);
   return found;
 }
@@ -253,10 +264,10 @@ export type StrategyResolution = StrategyPlan & {
   longTtlDegradedReason: string | null;
 };
 
-function resolveVerifiedCacheFamily(
+function resolveVerifiedCacheFamily<Payload = undefined>(
   model: Model<any>,
   anthropicTtl: AnthropicTtlMode,
-  payload?: unknown,
+  payload?: Payload,
 ): CacheFamily {
   if (isAnthropicModel(model)) {
     // Actual on-wire TTL wins. We never inject 1h onto real turns.
@@ -306,10 +317,10 @@ function opencodeGoFamilyCadence(family: CacheFamily): string | null {
   }
 }
 
-export function resolveCacheFamily(
+export function resolveCacheFamily<Payload = undefined>(
   model: Model<any> | undefined,
   anthropicTtl: AnthropicTtlMode,
-  payload?: unknown,
+  payload?: Payload,
 ): CacheFamily {
   const capability = resolveProviderCapability(model, payload);
   // OpenCode Go families are payload-driven and resolve before any
@@ -345,10 +356,10 @@ export function resolveCacheRetention(family: CacheFamily): CacheRetention {
   }
 }
 
-export function resolveStrategy(
+export function resolveStrategy<Payload = undefined>(
   model: Model<any> | undefined,
   config: WarmCacheConfig,
-  payload?: unknown,
+  payload?: Payload,
 ): StrategyResolution {
   const capability = resolveProviderCapability(model, payload);
   const family = resolveCacheFamily(model, config.anthropicTtl, payload);
@@ -626,11 +637,11 @@ export function isCodexPayload(payload: Record<string, unknown>): boolean {
  * Does not edit earlier messages/tools/instructions (prefix stays cacheable).
  * This steers the model away from continuing the agent trajectory on replay.
  */
-export function appendWarmUserTurn(
-  payload: unknown,
+export function appendWarmUserTurn<Payload>(
+  payload: Payload,
   text: string,
   api?: string,
-): unknown {
+): Payload {
   if (!payload || typeof payload !== "object") return payload;
   if (!text || !text.trim()) return payload;
   const p = payload as Record<string, unknown>;
@@ -645,7 +656,7 @@ export function appendWarmUserTurn(
         content: [{ type: "input_text", text: content }],
       },
     ];
-    return p;
+    return payload;
   }
 
   if (Array.isArray(p.messages)) {
@@ -659,10 +670,10 @@ export function appendWarmUserTurn(
         ? { role: "user", content: [{ type: "text", text: content }] }
         : { role: "user", content },
     ];
-    return p;
+    return payload;
   }
 
-  return p;
+  return payload;
 }
 
 /**
@@ -684,12 +695,12 @@ export function appendWarmUserTurn(
  *   model declares it, else the default "max_completion_tokens". Some upstreams
  *   (all OpenCode Go completions models today) reject the unknown default field.
  */
-export function applyWarmOutputLimit(
-  payload: unknown,
+export function applyWarmOutputLimit<Payload>(
+  payload: Payload,
   maxOutputTokens: number,
   api?: string,
   compat?: ModelCompat,
-): unknown {
+): Payload {
   if (!payload || typeof payload !== "object") return payload;
   const p = payload as Record<string, unknown>;
 
@@ -700,7 +711,7 @@ export function applyWarmOutputLimit(
     delete p.max_tokens;
     delete p.max_completion_tokens;
     // Leave reasoning.effort / tool_choice identical (no same-session proof yet).
-    return p;
+    return payload;
   }
 
   let floor = minimumOutputTokensForPayload(p, maxOutputTokens);
@@ -738,7 +749,7 @@ export function applyWarmOutputLimit(
     // Unknown API shapes: leave unchanged rather than guess a rejected field.
   }
 
-  return p;
+  return payload;
 }
 
 /**
@@ -746,14 +757,14 @@ export function applyWarmOutputLimit(
  * xAI accepts max_output_tokens; do not add or rewrite max_tokens or Codex
  * fields, and leave reasoning/tool/cache-routing fields untouched.
  */
-export function applyXaiWarmOutputLimit(payload: unknown, preferred: number): unknown {
+export function applyXaiWarmOutputLimit<Payload>(payload: Payload, preferred: number): Payload {
   if (!payload || typeof payload !== "object") return payload;
   const p = payload as Record<string, unknown>;
   p.max_output_tokens = Math.max(
     OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
     Math.max(1, preferred),
   );
-  return p;
+  return payload;
 }
 
 /** Lowest legal output cap that still satisfies thinking-budget constraints. */
