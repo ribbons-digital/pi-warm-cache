@@ -8,6 +8,7 @@
 
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import type { Model } from "@earendil-works/pi-ai";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -70,10 +71,15 @@ import {
   renderWarmHitUi,
 } from "./ui.ts";
 import { resolveWarmNowFailure } from "./index.ts";
-import { DEFAULT_CONFIG } from "./types.ts";
+import { DEFAULT_CONFIG, type ProviderCapability } from "./types.ts";
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
+}
+
+function modelFixture<Fixture>(model: Fixture): Model<any> {
+  // SAFETY: Route tests intentionally provide only fields read by the capability under test.
+  return model as Model<any>;
 }
 
 function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""): void {
@@ -289,13 +295,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
 // 3) Strategy intervals stay inside TTL.
 {
-  const anthropic = {
+  const anthropic = modelFixture({
     id: "claude-fable-5",
     provider: "anthropic",
     api: "anthropic-messages",
-  } as any;
-  const assertReasoned = (capability: any, label: string): void => {
-    assert(typeof capability.reason === "string" && capability.reason.length > 0, `${label} needs a reason`);
+  });
+  const assertReasoned = (capability: ProviderCapability, label: string): void => {
+    assert(capability.reason.length > 0, `${label} needs a reason`);
   };
   const noModelCapability = resolveProviderCapability(undefined);
   assert(noModelCapability.state === "unsupported", "no model should be unsupported");
@@ -326,18 +332,18 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(long.cacheRetention === "long", "1h mode uses long retention");
   assert(payloadHasAnthropicLongTtl(longPayload), "detector finds 1h markers");
 
-  const noLong = {
+  const noLong = modelFixture({
     id: "proxy-model",
     provider: "anthropic",
     api: "anthropic-messages",
     compat: { supportsLongCacheRetention: false },
-  } as any;
+  });
   assert(modelSupportsLongCacheRetention(noLong) === false, "explicit false disables long");
 
-  const wrongAnthropicEndpoint = {
+  const wrongAnthropicEndpoint = modelFixture({
     ...anthropic,
     baseUrl: "https://anthropic-proxy.example/v1",
-  } as any;
+  });
   const wrongAnthropicCapability = resolveProviderCapability(wrongAnthropicEndpoint);
   assert(wrongAnthropicCapability.state === "unsupported", "wrong Anthropic endpoint must fail closed");
   assert(
@@ -345,35 +351,35 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "Anthropic endpoint rejection must identify the incorrect baseUrl",
   );
 
-  const openaiExplicit = {
+  const openaiExplicit = modelFixture({
     id: "gpt-5.6",
     provider: "openai",
     api: "openai-responses",
     compat: { supportsExplicitPromptCacheMode: true },
-  } as any;
+  });
   const oaiCapability = resolveProviderCapability(openaiExplicit);
   assert(oaiCapability.state === "verified", "first-party OpenAI should be verified");
   assertReasoned(oaiCapability, "first-party OpenAI capability");
-  const anthropicCompat = {
+  const anthropicCompat = modelFixture({
     id: "claude-compatible",
     provider: "proxy-anthropic",
     api: "anthropic-messages",
     compat: { cacheControlFormat: "anthropic" },
-  } as any;
+  });
   const anthropicCompatCapability = resolveProviderCapability(anthropicCompat);
   assert(anthropicCompatCapability.state === "verified", "registered Anthropic-compatible route should be verified");
   assertReasoned(anthropicCompatCapability, "Anthropic-compatible capability");
-  const azure = {
+  const azure = modelFixture({
     id: "azure-gpt",
     provider: "azure-openai-responses",
     api: "azure-openai-responses",
-  } as any;
+  });
   assert(resolveProviderCapability(azure).state === "verified", "registered Azure route should be verified");
-  const codex = {
+  const codex = modelFixture({
     id: "gpt-5.6",
     provider: "openai-codex",
     api: "openai-codex-responses",
-  } as any;
+  });
   assert(resolveProviderCapability(codex).state === "verified", "registered Codex route should be verified");
   const oai = resolveStrategy(openaiExplicit, DEFAULT_CONFIG);
   assert(oai.family === "openai-explicit", "compat flag selects explicit 30m family");
@@ -381,17 +387,17 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(openAiInterval !== null, "OpenAI strategy must have an interval");
   assert(openAiInterval < 30 * 60_000, "openai interval inside 30m");
 
-  const openaiOld = {
+  const openaiOld = modelFixture({
     id: "o3",
     provider: "openai",
     api: "openai-responses",
-  } as any;
+  });
   const old = resolveStrategy(openaiOld, DEFAULT_CONFIG);
   assert(old.family === "openai-implicit", "without compat flag, OpenAI stays implicit");
-  const wrongOpenAi = {
+  const wrongOpenAi = modelFixture({
     ...openaiOld,
     baseUrl: "https://openai-proxy.example/v1",
-  } as any;
+  });
   const wrongOpenAiCapability = resolveProviderCapability(wrongOpenAi);
   assert(wrongOpenAiCapability.state === "unsupported", "wrong OpenAI endpoint must fail closed");
   assert(
@@ -399,33 +405,33 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "OpenAI endpoint rejection must identify the incorrect baseUrl",
   );
 
-  const directXai = {
+  const directXai = modelFixture({
     id: "grok-4.5",
     provider: "xai",
     api: "openai-responses",
     baseUrl: "https://api.x.ai/v1",
     compat: { sessionAffinityFormat: "openai", supportsLongCacheRetention: false },
-  } as any;
+  });
   const xaiCapability = resolveProviderCapability(directXai);
   assert(xaiCapability.state === "verified", "direct xAI Grok 4.5 should be verified");
   assert(xaiCapability.automaticWarm, "verified xAI should allow automatic warming");
   assert(!xaiCapability.manualProbe, "verified xAI does not need an unverified probe escape hatch");
-  const insecureXai = { ...directXai, baseUrl: "http://api.x.ai/v1" } as any;
+  const insecureXai = modelFixture({ ...directXai, baseUrl: "http://api.x.ai/v1" });
   const insecureCapability = resolveProviderCapability(insecureXai);
   assert(insecureCapability.state === "unsupported", "HTTP xAI routes must not receive first-party capability");
   assert(
     insecureCapability.reason.includes("baseUrl is not api.x.ai"),
     "xAI endpoint rejection must identify the incorrect baseUrl",
   );
-  const missingBaseUrl = { ...directXai, baseUrl: undefined } as any;
+  const missingBaseUrl = modelFixture({ ...directXai, baseUrl: undefined });
   assert(
     resolveProviderCapability(missingBaseUrl).state === "unsupported",
     "xAI routes without endpoint metadata must fail closed",
   );
-  const wrongRouting = {
+  const wrongRouting = modelFixture({
     ...directXai,
     compat: { sessionAffinityFormat: "openrouter" },
-  } as any;
+  });
   assert(
     resolveProviderCapability(wrongRouting).state === "unsupported",
     "proxy cache-routing metadata must fail closed for direct xAI",
@@ -451,10 +457,16 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(!isStablePromptCacheKey("session-id "), "trailing whitespace must not qualify as stable");
   assert(!isStablePromptCacheKey(""), "empty key must not qualify as stable");
   assert(!isStablePromptCacheKey(42), "non-string key must not qualify as stable");
+  assert(!isStablePromptCacheKey(Object("session-id")), "boxed strings must not qualify as stable");
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "   " }), "blank xAI key must be rejected");
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "xai\nkey" }), "control characters must be rejected");
   assert(!hasXaiPromptCacheKey({ ...xaiPayload, prompt_cache_key: "key\u009Bvalue" }), "C1 control characters (U+0080-U+009F) must be rejected");
   assert(getPromptCacheKey(xaiPayload, "anthropic-messages") === null, "wrong API must not expose a cache key");
+  const callablePayload = Object.assign(() => undefined, { prompt_cache_key: "callable" });
+  assert(
+    getPromptCacheKey(callablePayload, directXai.api) === null,
+    "callable values must not qualify as payload objects",
+  );
   assert(!canManualProbe(directXai, xaiPayload), "verified xAI should not use the unverified probe path");
   const xaiWithoutKey = { ...xaiPayload, prompt_cache_key: undefined };
   const xaiWithoutKeyStrategy = resolveStrategy(directXai, DEFAULT_CONFIG, xaiWithoutKey);
@@ -482,7 +494,7 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     xaiPayload,
   );
   assert(xaiOverride.intervalMs === 75_000, "xAI should honor the existing interval override");
-  const otherXai = { ...directXai, id: "grok-4.3" } as any;
+  const otherXai = modelFixture({ ...directXai, id: "grok-4.3" });
   const otherXaiCapability = resolveProviderCapability(otherXai);
   assert(otherXaiCapability.state === "unverified", "other xAI models remain unverified");
   assert(!otherXaiCapability.automaticWarm, "unverified xAI routes must not auto-warm");
@@ -501,13 +513,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     "unsafe xAI payload should not allow a manual probe",
   );
 
-  const openRouterXai = {
+  const openRouterXai = modelFixture({
     id: "x-ai/grok-4.5",
     provider: "openrouter",
     api: "openai-responses",
     baseUrl: "https://openrouter.ai/api/v1",
     compat: { sessionAffinityFormat: "openrouter" },
-  } as any;
+  });
   const openRouterCapability = resolveProviderCapability(openRouterXai);
   assert(openRouterCapability.state === "unverified", "OpenRouter should use the manual-only tier");
   assert(!openRouterCapability.automaticWarm, "OpenRouter manual-only routes must never auto-warm");
@@ -523,37 +535,37 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
   assert(!openRouterStrategy.automaticWarm, "manual-only OpenRouter route must not auto-warm");
   assert(openRouterStrategy.intervalMs === null, "manual-only OpenRouter route must not receive a timer");
 
-  const openRouterWrongEndpoint = {
+  const openRouterWrongEndpoint = modelFixture({
     ...openRouterXai,
     baseUrl: "https://openrouter-proxy.example/v1",
-  } as any;
+  });
   assert(
     resolveProviderCapability(openRouterWrongEndpoint).state === "unsupported",
     "OpenRouter routes with a different endpoint must fail closed",
   );
-  const openRouterWrongPath = {
+  const openRouterWrongPath = modelFixture({
     ...openRouterXai,
     baseUrl: "https://openrouter.ai/api/v2",
-  } as any;
+  });
   assert(
     resolveProviderCapability(openRouterWrongPath).state === "unsupported",
     "OpenRouter routes on an unregistered path must fail closed (exact-path matching)",
   );
-  const openRouterWrongRouting = {
+  const openRouterWrongRouting = modelFixture({
     ...openRouterXai,
     compat: { sessionAffinityFormat: "openai" },
-  } as any;
+  });
   assert(
     resolveProviderCapability(openRouterWrongRouting).state === "unsupported",
     "OpenRouter routes with non-OpenRouter routing metadata must fail closed",
   );
 
-  const openRouterMissingMetadata = {
+  const openRouterMissingMetadata = modelFixture({
     id: "x-ai/grok-4.5",
     provider: "openrouter",
     api: "openai-responses",
     baseUrl: "https://openrouter.ai/api/v1",
-  } as any;
+  });
   assert(
     resolveProviderCapability(openRouterMissingMetadata).state === "unsupported",
     "OpenRouter routes with missing session-affinity metadata must fail closed",
@@ -578,14 +590,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
       "data",
       "opencode-go.json",
     );
-    const registry = JSON.parse(readFileSync(registryPath, "utf8")) as Record<
-      string,
-      Record<string, any>
-    >;
-    const goModels: any[] = [];
+    type GoModelRegistry = Record<string, Record<string, Model<any>>>;
+    const registry: GoModelRegistry = JSON.parse(readFileSync(registryPath, "utf8"));
+    const goModels: Model<any>[] = [];
     for (const [api, modelsById] of Object.entries(registry)) {
       for (const model of Object.values(modelsById)) {
-        goModels.push({ ...model, api });
+        goModels.push(modelFixture({ ...model, api }));
       }
     }
     assert(
@@ -663,23 +673,23 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     // The single responses model carries the registered routing metadata and
     // resolves through its exact path; the anthropic-messages models need no
     // compat at all.
-    const goGrok = {
+    const goGrok = modelFixture({
       id: "grok-4.5",
       provider: "opencode-go",
       api: "openai-responses",
       baseUrl: "https://opencode.ai/zen/go/v1",
       compat: { sessionAffinityFormat: "openai-nosession" },
-    } as any;
+    });
     assert(
       resolveProviderCapability(goGrok).state === "verified",
       "the responses model must resolve verified through its registered path",
     );
-    const goGrokTrailingSlash = { ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/" } as any;
+    const goGrokTrailingSlash = modelFixture({ ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/" });
     assert(
       resolveProviderCapability(goGrokTrailingSlash).state === "verified",
       "a trailing slash must normalize to the registered path",
     );
-    const goGrokExtraPath = { ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/extra" } as any;
+    const goGrokExtraPath = modelFixture({ ...goGrok, baseUrl: "https://opencode.ai/zen/go/v1/extra" });
     assert(
       resolveProviderCapability(goGrokExtraPath).state === "unsupported",
       "a longer path must not match via prefix semantics",
@@ -687,34 +697,34 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
     // Wrong-path fixtures: each (provider, api) pair has exactly one path.
     // /zen/go is a prefix of /zen/go/v1 and must not match the wrong transport.
-    const goAnthropicOnCompletionsPath = {
+    const goAnthropicOnCompletionsPath = modelFixture({
       id: "minimax-m3",
       provider: "opencode-go",
       api: "anthropic-messages",
       baseUrl: "https://opencode.ai/zen/go/v1",
-    } as any;
+    });
     assert(
       resolveProviderCapability(goAnthropicOnCompletionsPath).state === "unsupported",
       "an anthropic model on the completions path must fail closed",
     );
-    const goCompletionsOnAnthropicPath = {
+    const goCompletionsOnAnthropicPath = modelFixture({
       id: "deepseek-v4-flash",
       provider: "opencode-go",
       api: "openai-completions",
       baseUrl: "https://opencode.ai/zen/go",
-    } as any;
+    });
     assert(
       resolveProviderCapability(goCompletionsOnAnthropicPath).state === "unsupported",
       "a completions model on the anthropic path must fail closed",
     );
 
     // Wrong-api fixture: an unregistered OpenCode Go transport fails closed.
-    const goWrongApi = {
+    const goWrongApi = modelFixture({
       id: "grok-4.5",
       provider: "opencode-go",
       api: "openai-codex-responses",
       baseUrl: "https://opencode.ai/zen/go/v1",
-    } as any;
+    });
     assert(
       resolveProviderCapability(goWrongApi).state === "unsupported",
       "an unregistered OpenCode Go API must fail closed",
@@ -727,13 +737,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     // Regression: a provider match always returns a decision. An OpenCode Go
     // anthropic model copying first-party metadata must never reach the
     // first-party verified branch.
-    const goAnthropicCompat = {
+    const goAnthropicCompat = modelFixture({
       id: "qwen3.7-max",
       provider: "opencode-go",
       api: "anthropic-messages",
       baseUrl: "https://opencode.ai/zen/go",
       compat: { cacheControlFormat: "anthropic" },
-    } as any;
+    });
     const goAnthropicCompatCapability = resolveProviderCapability(goAnthropicCompat);
     assert(
       goAnthropicCompatCapability.state === "unverified",
@@ -750,12 +760,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
     // A registered OpenCode Go route without any compat still resolves; the
     // anthropic-messages transport does not require routing metadata.
-    const goAnthropicNoCompat = {
+    const goAnthropicNoCompat = modelFixture({
       id: "qwen3.7-plus",
       provider: "opencode-go",
       api: "anthropic-messages",
       baseUrl: "https://opencode.ai/zen/go",
-    } as any;
+    });
     assert(
       resolveProviderCapability(goAnthropicNoCompat).state === "unverified",
       "anthropic-messages models need no compat routing metadata to resolve",
@@ -782,12 +792,12 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
     // declares it today, so any cache_control is evidence of third-party
     // mutation (for example the community pi-opencode-go-cache rewriter) and
     // is refused for replay.
-    const goCompletions = {
+    const goCompletions = modelFixture({
       id: "deepseek-v4-flash",
       provider: "opencode-go",
       api: "openai-completions",
       baseUrl: "https://opencode.ai/zen/go/v1",
-    } as any;
+    });
     const goCompletionsClean = {
       model: "deepseek-v4-flash",
       messages: [{ role: "user", content: "hi" }],
@@ -877,13 +887,13 @@ function deepEqualExcept(a: unknown, b: unknown, allowed: Set<string>, path = ""
 
     // Compat-conditional allow: a completions model that declares
     // cacheControlFormat: "anthropic" may carry cache_control with no refusal.
-    const goCompletionsAnthropicCompat = {
+    const goCompletionsAnthropicCompat = modelFixture({
       id: "future-completions-model",
       provider: "opencode-go",
       api: "openai-completions",
       baseUrl: "https://opencode.ai/zen/go/v1",
       compat: { cacheControlFormat: "anthropic" },
-    } as any;
+    });
     const goCompletionsMarkerPayload = {
       model: "future-completions-model",
       messages: [
