@@ -59,7 +59,7 @@ pi --warm-cache="1h interval=45m"
 
 ## What stays warm
 
-Automatic keepalive is on for these routes when Pi is talking to the first-party endpoint:
+Automatic keepalive is on for these registered routes:
 
 | Route | What you get |
 |---|---|
