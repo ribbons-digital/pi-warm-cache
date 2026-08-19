@@ -7,7 +7,7 @@
  * 1. Snapshot the exact provider payload on each real turn (`before_provider_request`).
  *    This hook is READ-ONLY. We never rewrite real user turns.
  * 2. After the agent settles, start a provider-specific timer (4m / 50m / 24m / ...).
- * 3. On tick, replay that payload with a minimal legal output cap via `complete({ onPayload })`.
+ * 3. On tick, replay that payload with a minimal legal output cap via `modelRegistry.complete({ onPayload })`.
  * 4. Never use `sendUserMessage` for warming (would pollute the session and run tools).
  */
 

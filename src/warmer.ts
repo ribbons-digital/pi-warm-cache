@@ -1,4 +1,3 @@
-import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   appendWarmUserTurn,
@@ -145,7 +144,19 @@ export function resetProbeSpendLedgerForTest(): void {
   probeSpendLedger.resetAll();
 }
 
-type CompleteRequest = typeof complete;
+export type CompleteRequest = ExtensionContext["modelRegistry"]["complete"];
+
+function resolveCompleteRequest(
+  ctx: ExtensionContext,
+  injected?: CompleteRequest,
+): CompleteRequest {
+  if (injected) return injected;
+  const complete = ctx.modelRegistry.complete;
+  if (!complete) {
+    throw new Error("Pi 0.84 or newer is required for warm probes");
+  }
+  return complete.bind(ctx.modelRegistry);
+}
 
 type PendingReanchor = {
   reason: string;
@@ -163,7 +174,7 @@ export type RescheduleOptions = {
 
 export class SessionWarmer {
   private readonly pi: ExtensionAPI;
-  private readonly completeRequest: CompleteRequest;
+  private readonly completeRequest: CompleteRequest | undefined;
   private config: WarmCacheConfig = { ...DEFAULT_CONFIG };
   private timer: ReturnType<typeof setTimeout> | null = null;
   private uiTimer: ReturnType<typeof setInterval> | null = null;
@@ -214,7 +225,7 @@ export class SessionWarmer {
     detail: string;
   } | null = null;
 
-  constructor(pi: ExtensionAPI, completeRequest: CompleteRequest = complete) {
+  constructor(pi: ExtensionAPI, completeRequest?: CompleteRequest) {
     this.pi = pi;
     this.completeRequest = completeRequest;
   }
@@ -1892,12 +1903,7 @@ export class SessionWarmer {
     });
 
     try {
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-      if (!auth.ok || !auth.apiKey) {
-        throw new Error(auth.ok ? "missing api key" : auth.error);
-      }
-
-      const response = await this.completeRequest(
+      const response = await resolveCompleteRequest(ctx, this.completeRequest)(
         model,
         {
           systemPrompt: "cache-warm",
@@ -1910,9 +1916,6 @@ export class SessionWarmer {
           ],
         },
         {
-          apiKey: auth.apiKey,
-          headers: auth.headers,
-          env: auth.env,
           signal: this.abort.signal,
           maxTokens: this.config.maxOutputTokens,
           cacheRetention: plan.cacheRetention,
