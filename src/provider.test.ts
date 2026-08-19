@@ -771,7 +771,7 @@ function deepEqualExcept<Actual, Expected>(
   // OpenCode Go: per-api proxy route registry with exact baseUrl paths.
   {
     // Drive the gate from the live pi-ai registry so catalog churn stays
-    // visible: 3 anthropic-messages, 12 openai-completions, 1 openai-responses.
+    // visible: 4 anthropic-messages, 13 openai-completions, 2 openai-responses.
     const registryPath = join(
       dirname(fileURLToPath(import.meta.url)),
       "..",
@@ -792,8 +792,8 @@ function deepEqualExcept<Actual, Expected>(
       }
     }
     assert(
-      goModels.length === 16,
-      `expected 16 OpenCode Go registry models, got ${goModels.length}`,
+      goModels.length === 19,
+      `expected 19 OpenCode Go registry models, got ${goModels.length}`,
     );
     const goApiCounts: Record<string, number> = {};
     for (const model of goModels) {
@@ -859,9 +859,9 @@ function deepEqualExcept<Actual, Expected>(
         `opencode-go ${model.id} should register the exact ${expectedPath} baseUrl`,
       );
     }
-    assert(goApiCounts["anthropic-messages"] === 3, "expected 3 anthropic-messages models");
-    assert(goApiCounts["openai-completions"] === 12, "expected 12 openai-completions models");
-    assert(goApiCounts["openai-responses"] === 1, "expected 1 openai-responses model");
+    assert(goApiCounts["anthropic-messages"] === 4, "expected 4 anthropic-messages models");
+    assert(goApiCounts["openai-completions"] === 13, "expected 13 openai-completions models");
+    assert(goApiCounts["openai-responses"] === 2, "expected 2 openai-responses models");
 
     // The single responses model carries the registered routing metadata and
     // resolves through its exact path; the anthropic-messages models need no
@@ -2403,6 +2403,102 @@ function deepEqualExcept<Actual, Expected>(
   warmer.setConfig({ ...warmer.getConfig(), enabled: false });
   assert(warmer.getLifecycleState() === "disabled", "disabled config should enter disabled state");
   warmer.dispose();
+}
+
+// 10b) Default probe path uses modelRegistry.complete and does not assemble auth.
+{
+  const calls: Array<{ apiKey?: unknown; headers?: unknown; env?: unknown }> = [];
+  const model = modelFixture({
+    id: "gpt-5.6",
+    provider: "openai",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+    cost: { input: 2, cacheRead: 0.2, cacheWrite: 2, output: 4 },
+  });
+  const ui = {
+    theme: { fg: (_color: string, text: string) => text },
+    notify: () => undefined,
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  };
+  const ctx = contextFixture({
+    cwd: process.cwd(),
+    model,
+    hasUI: false,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "registry-complete-test" },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => {
+        throw new Error("getApiKeyAndHeaders must not assemble probe auth");
+      },
+      complete: async (_model: Model<any>, _context: WarmCompleteContext, options?: ProbeRequestOptions & {
+        apiKey?: unknown;
+        headers?: unknown;
+        env?: unknown;
+      }) => {
+        calls.push({
+          apiKey: options?.apiKey,
+          headers: options?.headers,
+          env: options?.env,
+        });
+        return {
+          stopReason: "stop",
+          usage: { input: 1, output: 1, cacheRead: 100, cacheWrite: 0, cost: { total: 0.01 } },
+        };
+      },
+    },
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }));
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10 });
+  warmer.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "registry-complete",
+    },
+    ctx,
+  );
+  warmer.noteAssistantUsage(ctx, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const result = await warmer.warmNow(ctx);
+  assert(result.ok === true, "registry complete probe should succeed");
+  assert(calls.length === 1, "default path should call modelRegistry.complete once");
+  assert(calls[0]?.apiKey === undefined, "registry complete must receive no hand-built apiKey");
+  assert(calls[0]?.headers === undefined, "registry complete must receive no hand-built headers");
+  assert(calls[0]?.env === undefined, "registry complete must receive no hand-built env");
+  warmer.dispose();
+
+  const missing = contextFixture({
+    cwd: process.cwd(),
+    model,
+    hasUI: false,
+    ui,
+    thinkingLevel: "off",
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => "missing-complete" },
+    modelRegistry: {},
+  });
+  const oldHost = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }));
+  oldHost.bindContext(missing);
+  oldHost.setConfig({ ...DEFAULT_CONFIG, minCachedTokens: 10 });
+  oldHost.capturePayload(
+    {
+      model: model.id,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      prompt_cache_key: "registry-complete",
+    },
+    missing,
+  );
+  oldHost.noteAssistantUsage(missing, { input: 20, cacheRead: 100, cacheWrite: 0, output: 2 });
+  const refused = await oldHost.warmNow(missing);
+  assert(refused.ok === false, "missing modelRegistry.complete should fail the probe");
+  assert(
+    (refused.error ?? "").includes("Pi 0.84"),
+    `old hosts should get a floor error, got ${refused.error}`,
+  );
+  oldHost.dispose();
 }
 
 // 11) Hard re-anchor logs the invalidation reason and both payload/cache identities.

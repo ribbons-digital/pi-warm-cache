@@ -30,6 +30,7 @@ If a co-installed rewriter edits the body before our hook, we capture and replay
 If a rewriter edits after our capture, our replay differs from the real wire body and the failure mode is a cache miss, never an error.
 
 The extension supports Pi only.
+Host Pi 0.84 or newer is required.
 Tau is out of scope.
 
 ## Provider support
@@ -56,7 +57,7 @@ Repeated no-read/no-write probes stop warming and request a new real-turn anchor
 
 ### OpenCode Go coverage
 
-All 16 OpenCode Go models are registered across three API transports: 12 `openai-completions`, 3 `anthropic-messages`, and 1 `openai-responses`.
+All 19 OpenCode Go models are registered across three API transports: 13 `openai-completions`, 4 `anthropic-messages`, and 2 `openai-responses`.
 The extension classifies each captured payload by the cache instrumentation actually observed on the wire, so the coverage depends on the retention setting Pi emits.
 
 | OpenCode Go route | What the extension does | Coverage |
