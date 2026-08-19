@@ -1,6 +1,6 @@
 {
   "name": "pi-warm-cache",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pi extension that keeps supported provider prompt caches warm during long idle gaps",
   "type": "module",
   "keywords": [
