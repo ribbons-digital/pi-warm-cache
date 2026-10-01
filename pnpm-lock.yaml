@@ -15,8 +15,8 @@ importers:
         specifier: 0.84.2
         version: 0.84.2(ws@8.21.2)(zod@4.4.3)
       '@earendil-works/pi-tui':
-        specifier: 0.84.4
-        version: 0.84.4
+        specifier: 0.87.1
+        version: 0.87.1
       '@oxlint/plugins':
         specifier: 1.78.0
         version: 1.78.0
@@ -173,6 +173,10 @@ packages:
 
   '@earendil-works/pi-tui@0.84.4':
     resolution: {integrity: sha512-nPUnwDkLtupPXnZQYrCwPFcuTydCDqTY6ZbFqhsL4S4kVq0AT418kPa/6uXwtaCD+MjBNBltb7ScTYX65yeE1w==}
+    engines: {node: '>=22.19.0'}
+
+  '@earendil-works/pi-tui@0.87.1':
+    resolution: {integrity: sha512-YEH2vRyOeiO7hhN6j6AE6YwKSq2Kz2f3XR8bj1TbR+aGE/JsnY1hLPMI2pvaZfRM1n9Y00tejxFQ4zbzvF7nkQ==}
     engines: {node: '>=22.19.0'}
 
   '@google/genai@1.52.0':
@@ -705,6 +709,11 @@ packages:
     resolution: {integrity: sha512-4pfM1Ff0x50o0tQwb5ucw/RzNyD0/YJME6IVcStalZuMWxdt3sR3huStTtxz4PUmvZfRguvDejasvQ2kifR11g==}
     engines: {node: 20 || >=22}
 
+  marked@18.0.11:
+    resolution: {integrity: sha512-HnslJfsZkRPBDJRHvVtAaWlZHEpSu7u8LgQuJCELjRKuWR+hpq4A7sLq3p8HaI9ypVoXDXxV34CsQJEe1+J5Aw==}
+    engines: {node: '>= 20'}
+    hasBin: true
+
   marked@18.0.5:
     resolution: {integrity: sha512-S6GcvALHg6K4ohtu4E7x0a1AqhAjp6cV8KhLSyN9qVapnzJkusVBxZRcIU9AeYsbe6P1hKDusSbEOzGyyuce6w==}
     engines: {node: '>= 20'}
@@ -1236,6 +1245,11 @@ snapshots:
       get-east-asian-width: 1.6.0
       marked: 18.0.5
 
+  '@earendil-works/pi-tui@0.87.1':
+    dependencies:
+      get-east-asian-width: 1.6.0
+      marked: 18.0.11
+
   '@google/genai@1.52.0':
     dependencies:
       google-auth-library: 10.9.1
@@ -1630,6 +1644,8 @@ snapshots:
   long@5.3.2: {}
 
   lru-cache@11.5.2: {}
+
+  marked@18.0.11: {}
 
   marked@18.0.5: {}
 
