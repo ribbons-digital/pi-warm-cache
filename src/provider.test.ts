@@ -770,8 +770,8 @@ function deepEqualExcept<Actual, Expected>(
 
   // OpenCode Go: per-api proxy route registry with exact baseUrl paths.
   {
-    // Drive the gate from the live pi-ai registry so catalog churn stays
-    // visible: 4 anthropic-messages, 13 openai-completions, 2 openai-responses.
+    // Audit every bundled route without treating catalog size or model names
+    // as a stable API contract.
     const registryPath = join(
       dirname(fileURLToPath(import.meta.url)),
       "..",
@@ -787,13 +787,19 @@ function deepEqualExcept<Actual, Expected>(
     const registry: GoModelRegistry = JSON.parse(readFileSync(registryPath, "utf8"));
     const goModels: Model<any>[] = [];
     for (const [api, modelsById] of Object.entries(registry)) {
+      assert(
+        ["anthropic-messages", "openai-completions", "openai-responses"].includes(api),
+        `unexpected OpenCode Go transport: ${api}`,
+      );
       for (const model of Object.values(modelsById)) {
+        assert(model.provider === "opencode-go", `unexpected provider for ${api}/${model.id}`);
+        assert(model.id.trim().length > 0, `OpenCode Go ${api} model must have an id`);
         goModels.push(modelFixture({ ...model, api }));
       }
     }
     assert(
-      goModels.length === 19,
-      `expected 19 OpenCode Go registry models, got ${goModels.length}`,
+      new Set(goModels.map((model) => `${model.api}/${model.id}`)).size === goModels.length,
+      "OpenCode Go route identities must be unique",
     );
     const goApiCounts: Record<string, number> = {};
     for (const model of goModels) {
@@ -859,13 +865,12 @@ function deepEqualExcept<Actual, Expected>(
         `opencode-go ${model.id} should register the exact ${expectedPath} baseUrl`,
       );
     }
-    assert(goApiCounts["anthropic-messages"] === 4, "expected 4 anthropic-messages models");
-    assert(goApiCounts["openai-completions"] === 13, "expected 13 openai-completions models");
-    assert(goApiCounts["openai-responses"] === 2, "expected 2 openai-responses models");
+    for (const api of ["anthropic-messages", "openai-completions", "openai-responses"]) {
+      assert(goApiCounts[api] > 0, `required OpenCode Go transport missing: ${api}`);
+    }
 
-    // The single responses model carries the registered routing metadata and
-    // resolves through its exact path; the anthropic-messages models need no
-    // compat at all.
+    // Responses routing resolves through its exact path and metadata;
+    // anthropic-messages needs no compat metadata.
     const goGrok = modelFixture({
       id: "grok-4.5",
       provider: "opencode-go",

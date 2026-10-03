@@ -11,9 +11,13 @@ permissions:
 
 jobs:
   test:
-    name: test
+    name: Pi ${{ matrix.pi }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pi: ["0.84.2", "1.0.0"]
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
@@ -26,11 +30,15 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7.0.0
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Select previous supported Pi dependencies
+        if: matrix.pi == '0.84.2'
+        run: pnpm add --save-dev --save-exact @earendil-works/pi-ai@0.84.2 @earendil-works/pi-coding-agent@0.84.2 @earendil-works/pi-tui@0.84.4
 
       - name: Run tests
         run: pnpm test
