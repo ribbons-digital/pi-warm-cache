@@ -11,7 +11,8 @@
  * 4. Never use `sendUserMessage` for warming (would pollute the session and run tools).
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { HAS_NATIVE_WARMING } from "./provider.ts";
 import { parseConfigArgs } from "./config.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 import { SessionWarmer } from "./warmer.ts";
@@ -49,9 +50,23 @@ export function resolveWarmNowFailure(args: {
 }
 
 export default function piWarmCache(pi: ExtensionAPI) {
-  const warmer = new SessionWarmer(pi);
+  let warmer = new SessionWarmer(pi);
   let config = { ...DEFAULT_CONFIG };
   let lastCapabilityNoticeKey: string | null = null;
+  let realTurnActive = false;
+
+  if (HAS_NATIVE_WARMING) {
+    // SAFETY: This public event arrived in Pi 0.86; the cast keeps the older
+    // supported host declarations compilable without loading private APIs.
+    type NativeDecisionRegistrar = ExtensionAPI["on"] & ((
+      event: "cache_warming_decision",
+      handler: (event: { action: "warm" | "stop" }, ctx: ExtensionContext) => { action: "stop" } | undefined
+    ) => void);
+    // SAFETY: The retained host overloads gain only the version-gated native event.
+    const onNativeDecision = pi.on.bind(pi) as NativeDecisionRegistrar;
+    onNativeDecision("cache_warming_decision", (_event, ctx) =>
+      warmer.ownsAutomaticRoute(ctx) ? { action: "stop" } : undefined);
+  }
 
   // Optional CLI: pi --warm-cache / pi --warm-cache=off
   pi.registerFlag("warm-cache", {
@@ -61,6 +76,9 @@ export default function piWarmCache(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (event, ctx) => {
+    realTurnActive = false;
+    warmer.dispose();
+    warmer = new SessionWarmer(pi);
     warmer.bindContext(ctx);
 
     // Opt-in file diagnostics. Never default-write into the project cwd.
@@ -113,6 +131,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     lastCapabilityNoticeKey = null;
+    realTurnActive = false;
     warmer.dispose();
   });
 
@@ -138,11 +157,13 @@ export default function piWarmCache(pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", async (_event, ctx) => {
+    realTurnActive = true;
     warmer.bindContext(ctx);
     warmer.onAgentStart(ctx);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    realTurnActive = false;
     warmer.bindContext(ctx);
     warmer.onAgentSettled(ctx);
   });
@@ -154,7 +175,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
    * and silently doubles cache-write cost outside Pi's retention gates.
    */
   pi.on("before_provider_request", (event, ctx) => {
-    if (warmer.isWarming()) return;
+    if (!realTurnActive || warmer.isWarming()) return;
     warmer.capturePayload(event.payload, ctx);
   });
 
@@ -316,7 +337,7 @@ export default function piWarmCache(pi: ExtensionAPI) {
 
       if (!config.enabled) {
         clearWarmUi(ctx);
-        ctx.ui.notify("pi-warm-cache disabled", "info");
+        ctx.ui.notify("pi-warm-cache disabled. Pi's native warmer is unchanged. Enabling again requires a new real turn.", "info");
         return;
       }
 

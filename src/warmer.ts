@@ -18,6 +18,10 @@ import {
   payloadObject,
   isSafeXaiReplayPayload,
   resolveMaxIdleWarmMs,
+  resolveCacheLifetimeMs,
+  resolveWarmRouteProfile,
+  HAS_NATIVE_WARMING,
+  isSubscriptionRoute,
   resolveProviderCapability,
   resolveStrategy,
   stableFingerprint,
@@ -230,6 +234,12 @@ export class SessionWarmer {
     this.completeRequest = completeRequest;
   }
 
+  private cancelProbe(): void {
+    this.abort?.abort();
+    this.abort = null;
+    this.warming = false;
+  }
+
   isWarming(): boolean {
     return this.warming;
   }
@@ -296,7 +306,47 @@ export class SessionWarmer {
 
   private currentCapability(ctx?: ExtensionContext | null): ProviderCapability {
     const context = ctx ?? this.ctx;
-    return this.anchor?.capability ?? this.capability ?? resolveProviderCapability(context?.model);
+    return this.anchor?.capability ?? this.capability ?? this.resolveCapability(context);
+  }
+
+  private resolveCapability<Payload = undefined>(ctx?: ExtensionContext | null, payload?: Payload): ProviderCapability {
+    return resolveProviderCapability(ctx?.model, payload, ctx ?
+      resolveWarmRouteProfile(ctx, ctx.thinkingLevel ?? this.pi.getThinkingLevel?.()) : undefined);
+  }
+
+  private resolvePlan<Payload>(ctx: ExtensionContext, payload: Payload): StrategyResolution {
+    return resolveStrategy(ctx.model, this.config, payload,
+      resolveWarmRouteProfile(ctx, ctx.thinkingLevel ?? this.pi.getThinkingLevel?.()));
+  }
+
+  /** Ownership is a policy, not a fallback when our timer is paused or blocked. */
+  ownsAutomaticRoute(ctx: ExtensionContext): boolean {
+    if (this.disposed || !this.config.enabled || !ctx.model) return false;
+    const profile = resolveWarmRouteProfile(ctx, ctx.thinkingLevel ?? this.pi.getThinkingLevel?.());
+    if (ctx.model.provider === "openai" &&
+      (ctx.model.api === "openai-responses" || ctx.model.api === "openai-completions") &&
+      profile.auth !== "api-key") return true;
+    const sameRoute = this.anchor?.provider === ctx.model.provider &&
+      this.anchor.modelId === ctx.model.id && this.anchor.modelApi === ctx.model.api;
+    const payload = sameRoute ? this.lastPayload : undefined;
+    const capability = this.resolveCapability(ctx, payload);
+    return capability.state === "verified" && (this.resolvePlan(ctx, payload).automaticWarm ||
+      capability.reason.startsWith("captured request disabled") ||
+      capability.reason.startsWith("budget-based thinking"));
+  }
+
+  private ownershipStatus(): string {
+    if (!HAS_NATIVE_WARMING) return "extension-only (host has no native warmer)";
+    return this.ctx && this.ownsAutomaticRoute(this.ctx)
+      ? "extension (native veto; last overriding handler wins)"
+      : "native/none (extension does not veto this route)";
+  }
+
+  private expireAnchor(ctx: ExtensionContext, anchor: CacheAnchor): boolean {
+    const lifetime = resolveCacheLifetimeMs(anchor.cacheFamily);
+    if (lifetime === null || Date.now() < anchor.cacheRefreshedAt + lifetime) return false;
+    this.invalidateAnchor(ctx, "cache refresh deadline passed · wait for a new real turn");
+    return true;
   }
 
   getLogFile(): string | null {
@@ -304,7 +354,12 @@ export class SessionWarmer {
   }
 
   setConfig(config: WarmCacheConfig): void {
+    const ownershipChanged = this.config.enabled !== config.enabled;
     this.config = { ...config };
+    if (ownershipChanged && this.ctx) {
+      this.enterAwaitingReanchor(this.ctx, "warming ownership changed · wait for a new real turn");
+      if (config.enabled && this.autoWarmBlockReason) this.lifecycleState = "blocked";
+    }
     // Re-evaluate the per-instance spend soft block when the ceiling changes:
     // raising the ceiling or disabling it (spend=0) resumes warming for this
     // instance, matching the documented spend=0 opt-out. A lowered ceiling
@@ -341,7 +396,7 @@ export class SessionWarmer {
       this.stateBeforeDisabled = null;
     }
     if (this.ctx?.model && this.lastPayload) {
-      this.plan = resolveStrategy(this.ctx.model, this.config, this.lastPayload);
+      this.plan = this.resolvePlan(this.ctx, this.lastPayload);
     }
     this.reschedule();
   }
@@ -359,7 +414,8 @@ export class SessionWarmer {
     });
     this.autoWarmBlockReason = null;
     if (this.lifecycleState === "blocked") {
-      this.lifecycleState = this.anchor && this.lastPayload ? "anchored" : "idle";
+      this.lifecycleState = this.pendingReanchor ? "awaiting-reanchor" :
+        this.anchor && this.lastPayload ? "anchored" : "idle";
     }
   }
 
@@ -380,7 +436,7 @@ export class SessionWarmer {
 
   bindContext(ctx: ExtensionContext): void {
     this.ctx = ctx;
-    this.capability = resolveProviderCapability(ctx.model);
+    this.capability = this.resolveCapability(ctx);
     if (!this.config.enabled) {
       this.stateBeforeDisabled = this.lifecycleState;
       this.lifecycleState = "disabled";
@@ -392,8 +448,7 @@ export class SessionWarmer {
     this.disposed = true;
     this.lifecycleState = "disabled";
     this.clearTimers();
-    this.abort?.abort();
-    this.abort = null;
+    this.cancelProbe();
     this.anchor = null;
     this.lastInvalidatedProbe = null;
     this.lastPayload = null;
@@ -435,7 +490,7 @@ export class SessionWarmer {
     };
 
     this.ctx = ctx;
-    this.capability = resolveProviderCapability(ctx.model);
+    this.capability = this.resolveCapability(ctx);
     this.lastInvalidatedProbe = preserveProbe ? (this.anchor?.latestProbe ?? null) : null;
     this.anchor = null;
     this.lastPayload = null;
@@ -447,8 +502,7 @@ export class SessionWarmer {
     this.plan = null;
     this.lifecycleState = this.config.enabled ? "awaiting-reanchor" : "disabled";
     this.clearTimers();
-    this.abort?.abort();
-    this.abort = null;
+    this.cancelProbe();
     this.log({
       event: "anchor_invalidated",
       source: "system",
@@ -487,7 +541,7 @@ export class SessionWarmer {
 
   /** Capture the exact provider payload from a real agent turn. Read-only. */
   capturePayload<Payload>(payload: Payload, ctx: ExtensionContext): void {
-    if (this.warming || !payloadObject(payload)) return;
+    if (this.disposed || !this.config.enabled || this.warming || !payloadObject(payload)) return;
 
     this.ctx = ctx;
     this.logFile = warmLogPath(ctx.cwd);
@@ -502,7 +556,7 @@ export class SessionWarmer {
     const model = ctx.model;
     if (model) probeSpendLedger.reset(model.provider);
     const cacheKeyFingerprint = getPromptCacheKeyFingerprint(payload, model?.api);
-    this.capability = resolveProviderCapability(model, payload);
+    this.capability = this.resolveCapability(ctx, payload);
 
     if (!model || this.capability.state === "unsupported") {
       this.anchor = null;
@@ -515,8 +569,7 @@ export class SessionWarmer {
       this.realTurnContinuity = false;
       this.plan = null;
       this.clearTimers();
-      this.abort?.abort();
-      this.abort = null;
+      this.cancelProbe();
       this.log({
         event: "capture",
         source: "real_turn",
@@ -601,11 +654,11 @@ export class SessionWarmer {
     // cache_control) and re-enable /warm now on an unsafe exact payload.
     // Restore the payload-aware resolution so the re-anchored anchor keeps the
     // refusal and manualProbeAvailable stays false for this captured body.
-    this.capability = resolveProviderCapability(model, payload);
+    this.capability = this.resolveCapability(ctx, payload);
 
     this.lastInvalidatedProbe = null;
     this.lastPayload = structuredClone(payload);
-    this.plan = resolveStrategy(model, this.config, this.lastPayload);
+    this.plan = this.resolvePlan(ctx, this.lastPayload);
     const reanchorTransition = this.pendingReanchor;
     const capturedAt = Date.now();
     const manualProbeAvailable =
@@ -657,6 +710,9 @@ export class SessionWarmer {
       modelId: model.id,
       modelApi: model.api,
       thinkingLevel: ctx.thinkingLevel ?? this.pi.getThinkingLevel?.(),
+      routeProfile: resolveWarmRouteProfile(ctx, ctx.thinkingLevel ?? this.pi.getThinkingLevel?.()),
+      baseUrl: model.baseUrl,
+      cacheRefreshedAt: capturedAt,
       capability: this.capability,
       manualProbeAvailable,
       cacheFamily: this.plan.family,
@@ -853,7 +909,7 @@ export class SessionWarmer {
 
   onAgentStart(ctx: ExtensionContext): void {
     this.ctx = ctx;
-    this.capability = resolveProviderCapability(ctx.model);
+    this.capability = this.resolveCapability(ctx);
     if (!this.config.enabled) {
       this.stateBeforeDisabled = this.lifecycleState;
       this.lifecycleState = "disabled";
@@ -861,6 +917,7 @@ export class SessionWarmer {
       this.lifecycleState = "blocked";
     }
     this.clearTimers();
+    this.cancelProbe();
     if (this.capability.state === "verified" && ctx.hasUI) {
       ctx.ui.setStatus("pi-warm-cache", ctx.ui.theme.fg("dim", "warm paused · agent active"));
     } else if (this.capability.state !== "verified") {
@@ -929,7 +986,7 @@ export class SessionWarmer {
   /** Manual warm for /warm now */
   async warmNow(ctx: ExtensionContext): Promise<WarmResult> {
     this.ctx = ctx;
-    this.capability = resolveProviderCapability(ctx.model);
+    this.capability = this.resolveCapability(ctx);
     const result = await this.runWarm("manual");
     return this.withRouteDiagnostics(result);
   }
@@ -972,6 +1029,9 @@ export class SessionWarmer {
     const probeMisses = anchor?.probeMissCount ?? 0;
     const stableBlock = [
       `lifecycle=${this.lifecycleState}`,
+      `owner=${this.ownershipStatus()}`,
+      `cacheDeadline=${anchor && resolveCacheLifetimeMs(anchor.cacheFamily) !== null ?
+        new Date(anchor.cacheRefreshedAt + resolveCacheLifetimeMs(anchor.cacheFamily)!).toISOString() : "none"}`,
       `capability=${capability.state}`,
       `capabilityReason=${capability.reason}`,
       `provider=${route}`,
@@ -1102,7 +1162,7 @@ export class SessionWarmer {
       return;
     }
     // Codex has no output-token cap. Measured first-tick out≈1127 on GPT-5.6 Luna.
-    // Do not auto-schedule unless the user explicitly opts in.
+    // Preserve the existing default; honor the user's explicit Codex timer switch.
     const api = this.anchor?.modelApi ?? ctx.model?.api;
     if (api === "openai-codex-responses" && !this.config.allowCodexAutoWarm) {
       this.showIdle(
@@ -1127,6 +1187,7 @@ export class SessionWarmer {
       );
       return;
     }
+    if (this.expireAnchor(ctx, anchor)) return;
     const knownPromptTokens = getKnownPromptTokens(anchor);
     if (knownPromptTokens < this.config.minCachedTokens) {
       this.showIdle(ctx, `prefix < ${this.config.minCachedTokens} tok`);
@@ -1244,8 +1305,7 @@ export class SessionWarmer {
       this.lifecycleState = "disabled";
     }
     this.clearTimers();
-    this.abort?.abort();
-    this.abort = null;
+    this.cancelProbe();
     if (reason === "disabled") this.deferredProbe = null;
     if (!this.ctx) return;
     if (this.currentCapability(this.ctx).state === "verified") {
@@ -1634,7 +1694,7 @@ export class SessionWarmer {
     // Per-instance probe-spend soft block. Cleared only by this instance's
     // capturePayload, so another session's real turn cannot resume our probes
     // by resetting the shared module-level ledger.
-    if (reason === "timer" && this.spendBlockReason) {
+    if ((reason === "timer" || isSubscriptionRoute(ctx?.model, anchor?.routeProfile)) && this.spendBlockReason) {
       const detail = `spend ceiling: ${this.spendBlockReason}`;
       this.recordAttempt(reason, false, detail);
       this.clearTimers();
@@ -1661,7 +1721,7 @@ export class SessionWarmer {
       };
     }
 
-    if (!ctx || !anchor || !payload || !plan) {
+    if (this.disposed || !ctx || !anchor || !payload || !plan) {
       const detail =
         capability.state === "unverified"
           ? `no safe captured payload for manual probe: ${capability.reason}`
@@ -1770,10 +1830,21 @@ export class SessionWarmer {
       }
     }
 
-    if (!ctx.isIdle() && reason === "timer") {
+    if (reason === "timer" && (!this.config.enabled || !plan.automaticWarm ||
+      (anchor.modelApi === "openai-codex-responses" && !this.config.allowCodexAutoWarm))) {
+      this.clearTimers();
+      return buildWarmResult({ fingerprint: anchor.payloadFingerprint,
+        error: "automatic warming is disabled by route or configuration policy", unavailable: true, anchor });
+    }
+    if (reason === "timer" && this.expireAnchor(ctx, anchor)) {
+      return buildWarmResult({ fingerprint: anchor.payloadFingerprint,
+        error: "cache refresh deadline passed; wait for a new real turn", unavailable: true, anchor });
+    }
+
+    if (!ctx.isIdle()) {
       const deferral = this.deferProbe("agent busy", reason);
       this.recordAttempt(reason, false, `agent busy - ${formatDeferralStatus(deferral)}`);
-      this.reschedule({ delayMs: DEFER_BACKOFF_MS, reason: "agent busy" });
+      if (reason === "timer") this.reschedule({ delayMs: DEFER_BACKOFF_MS, reason: "agent busy" });
       return this.buildDeferredWarmResult(anchor, deferral);
     }
 
@@ -1803,11 +1874,15 @@ export class SessionWarmer {
     // spurious route-changed invalidation on every warm probe. this.lastPayload
     // is nulled on invalidation and only set alongside a fresh anchor, so it is
     // the payload that produced anchor.capability.reason.
-    const currentCapability = resolveProviderCapability(model, payload);
+    const currentCapability = this.resolveCapability(ctx, payload);
+    const subscriptionProbe = isSubscriptionRoute(model, anchor.routeProfile);
     if (
+      ctx.sessionManager.getSessionId() !== anchor.sessionId ||
       model.provider !== anchor.provider ||
       model.id !== anchor.modelId ||
       model.api !== anchor.modelApi ||
+      model.baseUrl !== anchor.baseUrl ||
+      (ctx.thinkingLevel ?? this.pi.getThinkingLevel?.()) !== anchor.thinkingLevel ||
       currentCapability.state !== anchor.capability.state ||
       currentCapability.reason !== anchor.capability.reason
     ) {
@@ -1822,8 +1897,8 @@ export class SessionWarmer {
 
     // Per-provider probe-spend ceiling, checked before the concurrency gate so
     // a ceiling-active provider never spends while a slot is waiting. Scoped to
-    // timer fires only; /warm now bypasses both guards.
-    if (reason === "timer") {
+    // timer fires and subscription manual probes; verified-route manual bypass stays.
+    if (reason === "timer" || subscriptionProbe) {
       const ceilingUsd = resolveProviderSpendCeilingUsd(this.config, anchor.provider);
       if (ceilingUsd !== null) {
         const campaignSpend = probeSpendLedger.getSpendUsd(anchor.provider);
@@ -1871,15 +1946,23 @@ export class SessionWarmer {
     if (!globalGate.tryEnter(this.config.maxConcurrentWarmSessions)) {
       const deferral = this.deferProbe("concurrency limit", reason);
       this.recordAttempt(reason, false, formatDeferralStatus(deferral));
-      this.reschedule({ delayMs: DEFER_BACKOFF_MS, reason: "concurrency limit" });
+      if (!subscriptionProbe) this.reschedule({ delayMs: DEFER_BACKOFF_MS, reason: "concurrency limit" });
       return this.buildDeferredWarmResult(anchor, deferral);
     }
 
     this.deferredProbe = null;
     this.warming = true;
-    this.abort = new AbortController();
+    const abort = new AbortController();
+    this.abort = abort;
     const fingerprint = anchor.payloadFingerprint;
-    let shouldRescheduleAfter = true;
+    let shouldRescheduleAfter = !subscriptionProbe;
+    let dispatchAt = Date.now();
+    let payloadSupplied = false;
+    let timedOut = false;
+    const timeout = subscriptionProbe ? setTimeout(() => {
+      timedOut = true;
+      abort.abort();
+    }, 45_000) : null;
 
     const unverifiedProbe = anchor.capability.state === "unverified";
     if (ctx.hasUI && !unverifiedProbe) {
@@ -1916,11 +1999,38 @@ export class SessionWarmer {
           ],
         },
         {
-          signal: this.abort.signal,
-          maxTokens: this.config.maxOutputTokens,
+          signal: abort.signal,
+          maxRetries: subscriptionProbe ? 0 : undefined,
+          timeoutMs: subscriptionProbe ? 45_000 : undefined,
+          maxTokens: subscriptionProbe ? 16 : this.config.maxOutputTokens,
           cacheRetention: plan.cacheRetention,
           sessionId: anchor.sessionId,
           onPayload: () => {
+            if (abort.signal.aborted || this.anchor !== anchor || this.disposed) {
+              throw new Error("warm probe cancelled before dispatch");
+            }
+            const dispatchCapability = this.resolveCapability(ctx, payload);
+            if (ctx.sessionManager.getSessionId() !== anchor.sessionId ||
+              ctx.model?.provider !== anchor.provider || ctx.model.id !== anchor.modelId ||
+              ctx.model.api !== anchor.modelApi || ctx.model.baseUrl !== anchor.baseUrl ||
+              (ctx.thinkingLevel ?? this.pi.getThinkingLevel?.()) !== anchor.thinkingLevel ||
+              dispatchCapability.state !== anchor.capability.state ||
+              dispatchCapability.reason !== anchor.capability.reason) {
+              this.invalidateAnchor(ctx, "route, authentication, or thinking changed before dispatch");
+              throw new Error("warm route changed before dispatch");
+            }
+            const idleCutoff = reason === "timer" ? resolveMaxIdleWarmMs(this.config,
+              anchor.cacheFamily, anchor.cacheFamily === "xai-best-effort" ?
+                (plan.intervalMs ?? undefined) : undefined) : null;
+            if (!ctx.isIdle() || (reason === "timer" && (!this.config.enabled ||
+              (anchor.modelApi === "openai-codex-responses" && !this.config.allowCodexAutoWarm) ||
+              (idleCutoff !== null && Date.now() - anchor.lastRealTurnAt >= idleCutoff) ||
+              !this.resolvePlan(ctx, payload).automaticWarm || this.expireAnchor(ctx, anchor))) ||
+              (subscriptionProbe && (payloadSupplied || this.spendCeilingTripped(anchor.provider)))) {
+              throw new Error("warm probe refused by dispatch safety policy");
+            }
+            dispatchAt = Date.now();
+            payloadSupplied = true;
             // 1) Clone last real payload (exact tools/system/history prefix).
             // 2) Codex only: append constrained warm user turn so the model is
             //    not asked to continue the agent trajectory (no output cap).
@@ -1939,7 +2049,7 @@ export class SessionWarmer {
               ? applyXaiWarmOutputLimit(warmPayload, this.config.maxOutputTokens)
               : applyWarmOutputLimit(
                   warmPayload,
-                  this.config.maxOutputTokens,
+                  subscriptionProbe ? 16 : this.config.maxOutputTokens,
                   model.api,
                   getModelCompat(model),
                 );
@@ -1947,6 +2057,9 @@ export class SessionWarmer {
         },
       );
 
+      if (abort.signal.aborted || this.anchor !== anchor || this.disposed) {
+        throw new Error("warm probe retired after session activity");
+      }
       if (response.stopReason === "aborted") {
         throw new Error("aborted");
       }
@@ -1978,6 +2091,7 @@ export class SessionWarmer {
             maxConsecutiveFailures: this.config.maxConsecutiveFailures,
           });
       this.observeProbeResult(anchor, result, model, outcome, fingerprint);
+      if (result.cacheHit) anchor.cacheRefreshedAt = dispatchAt;
 
       if (unverifiedProbe) {
         const payloadDrift = outcome === "payload-drift";
@@ -2123,6 +2237,21 @@ export class SessionWarmer {
 
       return result;
     } catch (err) {
+      if (this.anchor !== anchor || this.disposed || this.abort !== abort) {
+        return buildWarmResult({ fingerprint, error: "warm probe cancelled; current anchor unchanged", unavailable: true, anchor });
+      }
+      if (timedOut) {
+        this.recordAttempt(reason, false, "subscription manual probe timed out after 45 seconds");
+        return buildWarmResult({ fingerprint, error: "subscription manual probe timed out after 45 seconds; request cancelled", anchor });
+      }
+      if (abort.signal.aborted) {
+        return buildWarmResult({
+          fingerprint,
+          error: "warm probe cancelled; current anchor unchanged",
+          unavailable: true,
+          anchor,
+        });
+      }
       if (!unverifiedProbe) anchor.consecutiveFailures += 1;
       const message = err instanceof Error ? err.message : String(err);
       const xaiBestEffort = model.provider === "xai";
@@ -2150,11 +2279,15 @@ export class SessionWarmer {
         anchor,
       });
     } finally {
-      this.warming = false;
-      this.abort = null;
+      if (timeout) clearTimeout(timeout);
       globalGate.leave();
-      if (!this.disposed && this.config.enabled && shouldRescheduleAfter) {
-        this.reschedule();
+      // A retired request must not clear or reschedule a newer probe.
+      if (this.abort === abort) {
+        this.warming = false;
+        this.abort = null;
+        if (!this.disposed && this.config.enabled && this.anchor === anchor && shouldRescheduleAfter) {
+          this.reschedule();
+        }
       }
     }
   }

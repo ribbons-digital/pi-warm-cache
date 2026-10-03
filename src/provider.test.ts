@@ -108,7 +108,12 @@ function extensionApiFixture<Fixture>(api: Fixture): ExtensionAPI {
 
 function contextFixture<Fixture>(ctx: Fixture): ExtensionContext {
   // SAFETY: Warmer tests provide only the context fields SessionWarmer reads.
-  return ctx as ExtensionContext;
+  const context = ctx as ExtensionContext;
+  if (context.modelRegistry) {
+    context.modelRegistry.isUsingOAuth ??= () => false;
+    context.modelRegistry.hasConfiguredAuth ??= () => true;
+  }
+  return context;
 }
 
 function completeFixture<Fn>(fn: Fn): WarmComplete {
@@ -362,6 +367,19 @@ function deepEqualExcept<Actual, Expected>(
   assert(out.instructions === original.instructions, "instructions must stay identical");
   assert(JSON.stringify(out.tools) === JSON.stringify(original.tools), "tools must stay identical");
   assert(isCodexPayload(original), "fixture should look like codex");
+
+  for (const api of ["openai-responses", "azure-openai-responses"]) {
+    const capped = payloadObject(applyWarmOutputLimit(structuredClone(original), 1, api));
+    assert(capped?.max_output_tokens === 16, "explicit Responses API must win over the Codex shape heuristic");
+    deepEqualExcept(original, capped, WARM_MUTABLE_PAYLOAD_KEYS);
+  }
+  const injectedCaps = { ...original, max_output_tokens: 100, max_tokens: 100, max_completion_tokens: 100 };
+  for (const api of [undefined, "openai-codex-responses"]) {
+    const stripped = payloadObject(applyWarmOutputLimit(structuredClone(injectedCaps), 16, api));
+    assert(stripped, "Codex shaping keeps the payload object");
+    for (const key of WARM_MUTABLE_PAYLOAD_KEYS) assert(!(key in stripped), "legacy Codex still strips injected caps");
+    deepEqualExcept(original, stripped, WARM_MUTABLE_PAYLOAD_KEYS);
+  }
 
   const withTurn = appendWarmUserTurn(
     structuredClone(original),
@@ -2775,13 +2793,13 @@ function deepEqualExcept<Actual, Expected>(
 
   // Clear the block and re-disable/re-enable to verify it doesn't restore blocked
   warmer3.clearAutoWarmBlock("test clear");
-  assert(warmer3.getLifecycleState() === "anchored", "should be anchored after clearing block");
+  assert(warmer3.getLifecycleState() === "awaiting-reanchor", "clearing a block must not restore an anchor lost during ownership change");
 
   warmer3.setConfig({ ...warmer3.getConfig(), enabled: false });
   assert(warmer3.getLifecycleState() === "disabled", "should be disabled again");
 
   warmer3.setConfig({ ...warmer3.getConfig(), enabled: true });
-  assert(warmer3.getLifecycleState() === "anchored", "should restore anchored (not blocked) after block was cleared");
+  assert(warmer3.getLifecycleState() === "awaiting-reanchor", "ownership toggles must require a new real payload after the block was cleared");
 
   warmer3.dispose();
   warmer2.dispose();
@@ -5172,6 +5190,91 @@ function deepEqualExcept<Actual, Expected>(
   );
 
   rmSync(cwd, { recursive: true, force: true });
+}
+
+// A real turn retires an in-flight probe; its late reply must not replace
+// the fresh anchor or clear the next probe's in-flight state.
+{
+  const model = modelFixture({
+    id: "gpt-5.6", provider: "openai", api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+  });
+  const reply: ProbeReply = {
+    stopReason: "stop",
+    usage: { input: 20, output: 1, cacheRead: 1024, cacheWrite: 0, cost: { total: 0.01 } },
+  };
+  const first: FirstProbeHooks = {};
+  const second: FirstProbeHooks = {};
+  const firstStarted = new Promise<void>((resolve) => { first.started = resolve; });
+  const secondStarted = new Promise<void>((resolve) => { second.started = resolve; });
+  const requests: Array<{ signal?: AbortSignal; payload: unknown; onPayload?: ProbeRequestOptions["onPayload"] }> = [];
+  const complete = completeFixture((_model: Model<any>, _context: WarmCompleteContext,
+    options?: ProbeRequestOptions & { signal?: AbortSignal }) => {
+    requests.push({ signal: options?.signal, payload: options?.onPayload?.({}, model), onPayload: options?.onPayload });
+    const hooks = requests.length === 1 ? first : second;
+    hooks.started?.();
+    // Deliberately ignore abort to exercise a late provider completion.
+    return new Promise<ProbeReply>((resolve) => { hooks.release = resolve; });
+  });
+  let idle = true;
+  const ctx = contextFixture({
+    cwd: process.cwd(), model, hasUI: false, thinkingLevel: "off",
+    ui: { theme: { fg: (_color: string, text: string) => text },
+      notify: () => undefined, setStatus: () => undefined, setWidget: () => undefined },
+    isIdle: () => idle,
+    sessionManager: { getSessionId: () => "real-turn-probe-race" },
+    modelRegistry: { complete },
+  });
+  const warmer = new SessionWarmer(extensionApiFixture({ getThinkingLevel: () => "off" }));
+  const previous = { input: [{ role: "user", content: "old prefix" }], prompt_cache_key: "old-key" };
+  const fresh = { input: [{ role: "user", content: "new prefix" }], prompt_cache_key: "new-key" };
+  warmer.bindContext(ctx);
+  warmer.setConfig({ ...DEFAULT_CONFIG, intervalMs: 60_000 });
+  warmer.capturePayload(previous, ctx);
+  warmer.noteAssistantUsage(ctx, reply.usage);
+  const oldProbe = warmer.warmNow(ctx);
+  let freshProbe: Promise<WarmResult> | undefined;
+  try {
+    await firstStarted;
+    assert(warmer.isWarming(), "old probe must be in flight before the real turn");
+    idle = false;
+    warmer.onAgentStart(ctx);
+    assert(requests[0].signal?.aborted, "real turn must abort the in-flight warm request");
+    assert(!warmer.isWarming(), "retired probe must not suppress the real payload capture");
+    const latePayloadHook = requests[0].onPayload;
+    assert(latePayloadHook, "probe must supply its replay payload hook");
+    let lateDispatchRefused = false;
+    try {
+      latePayloadHook({}, model);
+    } catch (error) {
+      lateDispatchRefused = error instanceof Error && error.message === "warm probe cancelled before dispatch";
+    }
+    assert(lateDispatchRefused, "retired probe must reject a late payload callback before dispatch");
+    warmer.capturePayload(fresh, ctx);
+    warmer.noteAssistantUsage(ctx, reply.usage);
+    idle = true;
+    warmer.onAgentSettled(ctx);
+    freshProbe = warmer.warmNow(ctx);
+    await secondStarted;
+    assert(stableFingerprint(requests[1].payload) === stableFingerprint(
+      applyWarmOutputLimit(structuredClone(fresh), DEFAULT_CONFIG.maxOutputTokens, model.api)),
+      "next probe must use the newly captured real payload");
+    first.release?.(reply);
+    const retired = await oldProbe;
+    assert(!retired.ok, "a retired probe must not report a successful warm");
+    assert(warmer.isWarming(), "old completion must not clear the next probe's in-flight state");
+    assert(warmer.getLatestProbeObservation() === null, "late reply must not enter fresh-anchor observations");
+    second.release?.(reply);
+    const current = await freshProbe;
+    assert(current.ok, "fresh probe should complete normally");
+    assert(warmer.getSessionWarmStats().probeHitCount === 1, "only the fresh probe counts as a hit");
+    assert(warmer.getActiveWarmSessions() === 0, "both completed requests must release their slots");
+  } finally {
+    first.release?.(reply);
+    second.release?.(reply);
+    await Promise.allSettled([oldProbe, freshProbe]);
+    warmer.dispose();
+  }
 }
 
 console.log("provider.test.ts: all assertions passed");

@@ -1,10 +1,15 @@
 # Pi v1.0 compatibility findings and action plan
 
-Status: Non-release Slice 1 on `compat/pi-v1-contract` passed Astra implementation review and is open as [PR #71](https://github.com/ribbons-digital/pi-warm-cache/pull/71).
-The user subsequently approved including the maintenance updates from PRs #65-67.
-Those additions are checked locally; Astra's recorded pass applies to the slice before these maintenance additions.
-Production warming behavior is unchanged.
-No merge, further slice, or release is approved.
+Status: Non-release Slice 1 merged as [PR #71](https://github.com/ribbons-digital/pi-warm-cache/pull/71), commit `4b17f916c21697c348b145cdf30485ad7ef7481c`.
+Local `main` is synced, and the merged local and remote feature branches are gone.
+The user approved starting Slice 2 on `compat/pi-v1-safety`.
+Slice 2 implementation and local verification are complete on that branch.
+The user's initial independent review required a correction for an instructions-triggered subscription cap bypass.
+The correction has before/after intercepted-HTTP evidence on both targets.
+The user reported that re-review passed and approved committing, pushing the feature branch, and opening a Slice 2 pull request.
+Merge and release remain separate gates.
+The maintenance updates from PRs #65-67 passed both CI targets before merge; Astra's recorded pass applies to the slice before those additions.
+No Slice 2 merge, Slice 3, live campaign, or release is approved.
 A subsequent user-approved live trial is recorded in [OpenAI ChatGPT sign-in evidence](evidence/openai-chatgpt-v1-live-trial.md).
 Its results update the subscription-route recommendation below.
 A [follow-up cache investigation](evidence/openai-chatgpt-v1-cache-investigation.md) checked actual HTTP identity, raw usage, and native cache fields.
@@ -13,14 +18,17 @@ After updating pi-subagents, the user selected Astra instead and prohibited Anth
 The Astra retry also failed at startup: `assertRequiredChildExtensionsAdmitted` was not a function.
 The user subsequently supplied a direct Astra review with the verdict “agree with corrections.”
 The parent checked and accepted its three findings: evidence-driver claims, explicit manual bounds, and release/documentation gates.
-The user approved non-release Slice 1 only.
-The checks and limits are recorded under [Slice 1 verification](#slice-1-verification).
-Slice 2 and release work remain separate approval gates.
+The original implementation approval covered non-release Slice 1.
+After its merge, the user approved starting Slice 2.
+The Slice 1 checks and limits are recorded under [Slice 1 verification](#slice-1-verification).
+Slice 2 review passed as reported by the user.
+Its merge, later slices, and release remain separate gates.
 
 ## Summary
 
-pi-warm-cache 0.4.0 passes type checking against Pi 1.0.0, but it is not ready for an unconditional compatibility claim.
-The main problems are request safety, coordination with native warming, and a test that assumes an old model catalog.
+The original pi-warm-cache 0.4.0 audit passed type checking against Pi 1.0.0 but did not support an unconditional compatibility claim.
+Its main problems were request safety, coordination with native warming, and a test that assumed an old model catalog.
+Slice 1 corrected the contract checks; the reviewed Slice 2 corrects the safety policy and matching documentation, pending pull-request CI and merge approval.
 A rewrite is not needed.
 
 Keep our exact provider-payload replay and route verification.
@@ -127,7 +135,7 @@ Repeated refreshes can therefore produce an optimistic cumulative savings figure
 Keep existing diagnostic fields compatible, but label that figure as a probe-price comparison rather than realized avoided spending.
 Show economic-policy estimates separately if the new policy is enabled.
 
-## Compatibility findings
+## Compatibility findings at the original baseline
 
 ### 1. Public APIs used by the extension still exist
 
@@ -392,12 +400,12 @@ The baseline verification first installed the new frozen v1 lockfile, then appli
 The v1 frozen installation also passed, and the installed tools reported npm 12.1.0 and Oxlint 1.85.0.
 Logs are preserved as `slice1-maintenance-verified-baseline.log` and `slice1-maintenance-verified-v1.log` under the research sandbox workspace.
 The release workflow was not executed; no provider credential or live inference was used.
-The initial PR's two CI targets passed before these additions; the updated PR must run them again.
+Both CI targets passed again after the maintenance additions, before PR #71 merged.
 
 PRs #68-70 target Pi 0.87.1 and are superseded by PR #71's 1.0.0 target.
 They remain unmerged; no Dependabot ignore policy was added.
-Review the maintenance changes and their new CI results before making the separate merge decision.
-Slice 2 and release work remain outside this approval.
+The maintenance changes shipped in the merged non-release Slice 1.
+The later approval to start Slice 2 does not approve a release.
 
 ### Slice 2: Ship safety, route ownership, and matching documentation together
 
@@ -445,6 +453,74 @@ New subscription manual checks verify profile restrictions, the sixteen-token ca
 Inspect command/status output, ownership transitions, failed-provider behavior, and relevant fullscreen/regular TUI views.
 Matching user documentation is complete before these safety and ownership changes can ship.
 
+### Slice 2 verification
+
+The implementation is complete locally on `compat/pi-v1-safety`, based on merged Slice 1.
+The user reported an independent review pass after the cap correction and approved opening the pull request.
+See [safety verification evidence](evidence/pi-v1-safety-checks.md) for commands, artifacts, the failed CLI harness incident, and limits.
+
+Implemented scope:
+
+- Version-gated public native-decision veto with ownership status and no private production API dependency.
+  Ownership covers managed automatic routes, verified safety-restricted requests, and registered OpenAI transports with subscription or unknown auth.
+  Paused or blocked extension timers do not silently release the veto.
+- Capture only during real agent turns; off/on and lifecycle boundaries discard old payloads.
+  Real turns abort and retire probes, while late callbacks/results cannot change fresh anchors, failure status, scheduling, or a newer probe's state.
+- Public registry authentication classification with exact subscription profile and payload gates in the capability resolver.
+- One subscription manual request per accepted action, sixteen output tokens, forty-five-second cancellation, zero automatic HTTP retries, configured spend prechecks, and no queued follow-up.
+  Existing verified-route manual idle/spend bypass remains.
+- Actual cache opt-out and budget-thinking automatic guards, including registered proxy routes.
+- Wire-driven explicit OpenAI retention and capture/dispatch-clock expiry checks after deferrals and awaited preparation.
+  Idle cutoff and Codex-off policy are rechecked immediately before dispatch too.
+  Existing verified-route defaults, cadence, idle/spend controls, failure budgets, and Codex protection remain outside the stated safety exceptions.
+- Matching README, diagnostics/upgrade notes, contribution instructions, E2E procedure, and evidence addenda.
+  The E2E guide now requires independent confirmed baselines and native-off untouched controls without promoting an idle miss to measured expiry.
+
+The initial real-turn regression failed before its fix with `real turn must abort the in-flight warm request`.
+A final additional regression reproduced a retired timeout writing failure status onto a new anchor; its request-ownership guard is now checked before timeout recording.
+Both pass in the final suite.
+
+| Dependency target | Full tests and host check | Type check | Lint |
+|---|---|---|---|
+| pi-ai/coding-agent 0.84.2, pi-tui 0.84.4 | Passed | Passed | Zero warnings/errors |
+| All three Pi packages 1.0.0 | Passed | Passed | Zero warnings/errors |
+
+Checks ran sequentially inside `pi-warm-cache-v1-research`, with Node 24.21.0 and pnpm 10.0.0.
+Final logs are `slice2-final-slice1-baseline.log` and `slice2-final-slice1-v1.log` under `/tmp/pi-warm-cache-v1-research.J82S7J/`.
+The v1 host check exercises the installed native warmer and actual decision chain in off, streaming, and idle modes, plus off/on handoff and the last-handler-wins limitation.
+The real Responses adapter verifies synthetic OAuth cap-only replay, HTTP 500 without retry, and forty-five-second cancellation.
+The review correction also checks eligible Luna/off and Sol/low instructions bodies through the real installed HTTP path on both targets, with synthetic public-registry OAuth classification.
+Both targets failed with an absent final cap before the shared shaper made explicit API routing authoritative.
+After correction, each body contains exactly sixteen output tokens as its cap and preserves every other captured field.
+Explicit and inferred legacy Codex cap stripping and suffix/output-spike checks remain intact.
+See the [review correction evidence](evidence/pi-v1-safety-checks.md#review-correction-instructions-must-not-remove-the-subscription-cap).
+PR #72's initial CI passed Pi 0.84.2 but failed Pi 1.0.0 at the stored-OAuth fixture's public auth assertion.
+The fixture now uses a fresh runtime/session seeded with dummy OAuth credentials before creation, avoiding stale API-key snapshots from background refreshes.
+Both local target suites and ten repeated v1 host checks pass; the replacement GitHub CI run remains the acceptance check.
+Production source and existing safety assertions are unchanged.
+See the [CI correction evidence](evidence/pi-v1-safety-checks.md#pr-72-ci-correction-isolate-the-oauth-runtime).
+Compaction/tree/replacement checks emit lifecycle boundaries through the host runner; they do not perform live compaction or the complete `/new` journey.
+
+The real v1 CLI was checked in regular 80-column and fullscreen 120-column modes using isolated dummy OAuth and synthetic transport.
+Final transport records show one real-turn response, one capped manual hit, and one capped manual HTTP 500 in each mode, with no failure retry or off/on stale-payload dispatch.
+Terminal-grid renders were inspected for manual-only labels, bounds, warnings/errors, cleared off state, and re-anchor refusal.
+These checks do not demonstrate live cache preservation.
+
+The first CLI harness failed to intercept transport and reached OpenAI with dummy credentials, returning HTTP 401 in both modes.
+Those captures are explicitly excluded from offline success evidence.
+Pi's CLI dispatcher had replaced a preload installed before its module loaded.
+The repaired preload loads that module first, then installs the fetch stub.
+All outbound sandbox traffic was denied before retrying, and recorded synthetic provider calls are required for acceptance.
+The denial stays enabled; no real provider credential or new live campaign was used for Slice 2.
+
+Plan comparison: The approved safety, ownership, manual subscription contract, lifecycle, checks, and matching documentation are implemented.
+The existing public-hook limitations remain explicit: no cancellation of native in-flight requests, no guarantee against a later overriding handler, and no seamless streaming-to-idle handoff.
+There is no new economics policy, evidence-driver reuse, automatic subscription promotion, package version change, or release.
+No delegated review was launched.
+The user reported that re-review passed on 2026-10-03 and approved committing, pushing this feature branch, and opening the Slice 2 pull request.
+The parent did not launch another review or infer the reviewer's identity.
+Wait for CI and explicit merge approval; do not merge, publish, or start Slice 3.
+
 ### Slice 3: Borrow economics and extend live verification separately
 
 **Outcome:** Users can choose cost-aware warming without silently losing existing policy controls.
@@ -475,7 +551,8 @@ Documentation does not imply that native warming costs are included in extension
 ## Research sandbox
 
 - Name: `pi-warm-cache-v1-research`.
-- State: Stopped, with research files preserved.
+- State after Slice 2 verification: Stopped, with research and check files preserved.
+- Network: Sandbox-scoped deny-all policy remains enabled after the failed CLI harness correction.
 - Workspace: `/tmp/pi-warm-cache-v1-research.J82S7J`.
 - Start/access: `sbx exec --workdir /tmp/pi-warm-cache-v1-research.J82S7J pi-warm-cache-v1-research bash`.
 - Stop: `sbx stop pi-warm-cache-v1-research`.

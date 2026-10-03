@@ -42,7 +42,7 @@
   },
   "scripts": {
     "lint": "oxlint .",
-    "test": "node scripts/run-unit-tests.mjs && node --experimental-strip-types --no-warnings scripts/check-pi-host.ts",
+    "test": "node scripts/run-unit-tests.mjs && node --experimental-strip-types --no-warnings src/safety.test.ts && node --experimental-strip-types --no-warnings scripts/check-pi-host.ts",
     "typecheck": "tsc"
   },
   "pi": {

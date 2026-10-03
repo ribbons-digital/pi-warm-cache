@@ -29,7 +29,8 @@ export function renderManualOnlyUi(
   if (!ctx.hasUI) return;
 
   const xai = /xai/i.test(capability.reason);
-  const routeLabel = xai
+  const subscription = capability.reason.startsWith("ChatGPT subscription");
+  const routeLabel = subscription ? "ChatGPT subscription" : xai
     ? "xAI best-effort"
     : capability.reason.startsWith("OpenRouter")
       ? "OpenRouter"
@@ -44,6 +45,10 @@ export function renderManualOnlyUi(
     ctx.ui.theme.fg("dim", "Automatic warming disabled · no timer will start"),
     ctx.ui.theme.fg("dim", probeLine),
   ];
+  if (subscription) {
+    lines.push(ctx.ui.theme.fg("dim", "16 output tokens · 45s cancellation · one inference attempt"));
+    lines.push(ctx.ui.theme.fg("warning", "Preservation unverified · input cost and allowance use are not capped"));
+  }
 
   if (config.showWidget) {
     ctx.ui.setWidget(WIDGET_ID, lines);
@@ -54,7 +59,7 @@ export function renderManualOnlyUi(
     STATUS_ID,
     ctx.ui.theme.fg(
       "warning",
-      `${xai ? "xAI best-effort " : ""}warm · manual only${probeReady ? " · /warm now ready" : " · waiting for payload"}`,
+      `${subscription ? "ChatGPT " : xai ? "xAI best-effort " : ""}warm · manual only${probeReady ? " · /warm now ready" : " · waiting for payload"}`,
     ),
   );
 }
@@ -68,6 +73,7 @@ export function renderCapabilityNotice(
   if (!ctx.hasUI) return;
   const xai = /xai/i.test(capability.reason);
   const routeLabel = xai ? "xAI best-effort" : "pi-warm-cache";
+  const reason = capability.reason.replace(/\.$/, "");
   if (capability.state === "unverified") {
     if (capability.manualProbe) {
       renderManualOnlyUi(ctx, config, capability);
@@ -79,14 +85,14 @@ export function renderCapabilityNotice(
       ? "Use /warm now for one safe captured-payload probe."
       : "No safe manual probe is available for this captured route.";
     ctx.ui.notify(
-      `${routeLabel} ${mode}: ${capability.reason}. Automatic warming is disabled. ${probe} Savings are n/a (unverified route).`,
+      `${routeLabel} ${mode}: ${reason}. Automatic warming is disabled. ${probe} Savings are n/a (unverified route).`,
       "warning",
     );
     return;
   }
   clearWarmUi(ctx);
   ctx.ui.notify(
-    `${xai ? "xAI best-effort inactive" : "pi-warm-cache inactive"} (unsupported route): ${capability.reason}. Automatic and manual warming are disabled.`,
+    `${xai ? "xAI best-effort inactive" : "pi-warm-cache inactive"} (unsupported route): ${reason}. Automatic and manual warming are disabled.`,
     "info",
   );
 }
