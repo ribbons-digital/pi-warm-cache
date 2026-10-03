@@ -10,6 +10,11 @@ export type WarmLifecycleState =
   | "disabled"
   | "blocked";
 
+export interface WarmRouteProfile {
+  auth: "api-key" | "oauth" | "unknown";
+  thinkingLevel: ThinkingLevel | "off" | undefined;
+}
+
 export interface ProviderCapability {
   state: ProviderCapabilityState;
   /** Why this route received its capability state. */
@@ -164,6 +169,10 @@ export interface CacheAnchor {
   modelId: string;
   modelApi: string;
   thinkingLevel: ThinkingLevel | "off" | undefined;
+  routeProfile: WarmRouteProfile;
+  baseUrl: string | undefined;
+  /** Capture or successful-probe dispatch time, never settlement time. */
+  cacheRefreshedAt: number;
   capability: ProviderCapability;
   /** True when this captured payload has a safe manual-probe shape. */
   manualProbeAvailable: boolean;

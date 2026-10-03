@@ -12,7 +12,7 @@ Sol diagnostics were not tested.
 
 Do not treat these authenticated routes as having a verified thirty-minute lifetime or verified automatic warming.
 Do not shorten the timer or add repeated cold writes and claim that the original problem is fixed.
-Production code and user settings remain unchanged.
+Production code and user settings were unchanged during this investigation.
 
 ## Scope and safeguards
 
@@ -89,7 +89,9 @@ No valid expiry-versus-warming control comparison has completed.
 Keep this connection's automatic warming unverified in the compatibility proposal.
 Bounded manual replay remains a candidate only for the tested output-cap profiles, with no cache-preservation promise.
 Preserve existing verified routes and their controls.
-The current extension does not yet enforce the proposed subscription restriction.
+At the time of this investigation, the extension did not enforce the proposed subscription restriction.
+The later reviewed Slice 2 implements the [manual safety contract](../upgrade-notes.md#openai-chatgpt-subscription-manual-contract), with automatic subscription warming still disabled.
+Its synthetic checks add no new live cache-preservation evidence.
 
 A further timed comparison would need a fresh, sufficiently long-lived access token.
 The copied token was nearing the driver's safety cutoff; it was not refreshed to extend the experiment.
@@ -149,7 +151,7 @@ No reviewer result or consensus was produced.
 The subsequent status check reported no active async runs.
 No Anthropic calls or alternate execution-mode fallback were used.
 
-The checkout remains on `main` at `3153e19`, with untracked research documents and unchanged production code.
+At the time of the retry, the checkout remained on `main` at `3153e19`, with untracked research documents and unchanged production code.
 The retry snapshot is `/tmp/pi-warm-cache-astra-retry-3153e19.tar`.
 At that point, the startup failure prevented the automated review gate from completing.
 

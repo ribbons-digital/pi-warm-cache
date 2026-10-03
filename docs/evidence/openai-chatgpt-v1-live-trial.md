@@ -123,6 +123,14 @@ A model's explicit-cache capability flag therefore must not select a thirty-minu
 Before enabling timers by default for this connection, investigate the identical-request miss and complete a valid expiry/control comparison.
 Retain strict limits and honest miss reporting in the meantime.
 
+## Slice 2 safety addendum
+
+The later reviewed Slice 2 implements the [subscription manual contract](../upgrade-notes.md#openai-chatgpt-subscription-manual-contract).
+It limits eligibility to the tested first-party model/thinking profiles and safe captured payloads.
+It enforces sixteen output tokens, forty-five-second cancellation, zero automatic HTTP retries, configured spend prechecks, and no scheduled follow-up.
+Automatic subscription warming remains unverified and disabled.
+Synthetic safety and UI checks add no live retention, causality, or billing evidence to this trial.
+
 ## Artifacts
 
 - Redacted raw observations: `docs/evidence/openai-chatgpt-v1-live-trial.jsonl`.

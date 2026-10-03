@@ -14,6 +14,64 @@ The extension follows four non-negotiable rules:
 4. **No invented pricing** - savings estimates use only the active model's supplied `cost` fields.
    Missing or unusable pricing is reported as `n/a`.
 
+A real agent turn takes priority over an extension probe.
+It cancels the probe and immediately allows the fresh real request to become the anchor.
+A retired request cannot dispatch through a late replay hook, replace fresh observations, or clear a newer probe's in-flight state.
+The old request keeps its concurrency slot until its provider call ends.
+Cancellation is not a billing refund and does not guarantee zero provider usage.
+
+### Pi v1 upgrade behavior
+
+Development checks cover Pi 0.84.2 with pi-tui 0.84.4 and Pi 1.0.0.
+Native warming arrived in Pi 0.86; its public decision hook is registered only on supported hosts.
+Pi v1 defaults to native `cacheWarming: "streaming"`, with `idle` and `off` also available.
+
+The extension vetoes native warming on its managed automatic routes, verified routes restricted by cache opt-out or budget thinking, and registered OpenAI transports with subscription or unknown authentication.
+The veto stays active while the extension timer is paused, busy, blocked, or waiting for an anchor.
+Unowned routes retain native behavior.
+The veto also removes native streaming warming on owned routes; the extension still warms only while idle.
+
+`/warm off` stops only the extension and releases the veto.
+It does not change Pi's native setting or provider-side caching.
+Off/on discards the old payload and requires a new real turn.
+Disabled requests and native idle requests are not captured as real-turn anchors.
+Reload and session replacement also discard old payloads.
+
+A veto cannot cancel a native request already in flight.
+The last decision handler returning an action wins, so a later extension can override the veto.
+If that happens, explicitly set Pi's global `cacheWarming` to `off` while using this extension.
+No safe native-streaming/extension-idle handoff is claimed.
+The public hook lacks request-origin, cancellation, and refresh-completion guarantees.
+Native usage remains outside extension counters and savings.
+
+Automatic probes honor observed cache opt-out and refuse budget-based Anthropic thinking.
+The OpenAI explicit family requires captured `prompt_cache_options.ttl: "30m"`; metadata alone does not select that window.
+Expiry checks use real payload capture or successful probe dispatch, not settlement or response arrival.
+They run after busy/concurrency deferrals and again inside the replay callback.
+A late timer invalidates the payload and requires a new real turn.
+Family deadlines are conservative policy limits, not newly measured retention; xAI still has no fixed TTL promise.
+Existing verified-route manual idle/spend bypass remains available only while a usable anchor exists.
+
+### OpenAI ChatGPT subscription manual contract
+
+Automatic warming is unverified and disabled.
+The capability resolver permits manual replay only for `openai` / `openai-responses` OAuth at exactly `https://api.openai.com/v1`, with Luna (`gpt-5.6-luna`) thinking off or Sol (`gpt-6.1-sol`) low thinking.
+The captured body must match the model, use `store: false`, have a stable cache key and safe replay shape, and contain no untested retention or budget-thinking fields.
+Unknown auth, other profiles, and changed routes fail closed.
+Public registry auth checks do not inspect or refresh credentials.
+Route, auth, session, endpoint, and thinking are checked again before dispatch.
+
+Each accepted `/warm now` action changes only `max_output_tokens` to sixteen.
+It sets zero automatic HTTP retries and forty-five-second timeout/cancellation.
+No timer or queued follow-up is scheduled after success, failure, timeout, busy refusal, or concurrency refusal.
+`/warm on` and cadence overrides do not enable automatic subscription warming.
+Output bounds do not cap input tokens, total request cost, or subscription allowance use.
+A configured spend ceiling is checked before dispatch, unlike the existing verified-route manual bypass.
+It uses accumulated reported model cost and can overshoot on the accepted request; it is not a billing or per-request cost guarantee.
+Defaults are unchanged: `spend=0` disables the ceiling and the implicit one-dollar default applies only to OpenCode Go.
+The UI labels manual hits as unverified preservation with savings `n/a`.
+See the [live trial](evidence/openai-chatgpt-v1-live-trial.md) and [follow-up investigation](evidence/openai-chatgpt-v1-cache-investigation.md); this slice adds no live preservation evidence.
+
 This extension supports Pi only.
 Tau is out of scope.
 
@@ -80,6 +138,8 @@ Inactive-capability output also includes the `manualProbe` field.
 | Field | Meaning |
 |---|---|
 | `lifecycle` | The lifecycle state from the table above. |
+| `owner` | `extension` with a native veto, `native/none` on unowned routes, or `extension-only` on older hosts. The last overriding native handler can change the decision. |
+| `cacheDeadline` | The next family expiry limit from capture or successful dispatch, or `none`. It is a safety policy limit, not measured provider expiry. |
 | `capability` | The exact route policy: `verified`, `unverified`, or `unsupported`. |
 | `capabilityReason` | The actionable reason for the capability decision. This is route and payload policy, not a provider promise. |
 | `manualProbe` | In inactive-capability output, `ready` means the route permits manual probing and the captured payload is safe. `unsafe-payload` means an anchor exists but the payload is not eligible for a manual probe because the shape is unsafe or the route does not permit manual probing. `waiting-for-safe-payload` means the route permits manual probing but no payload is captured yet. `off` means manual probing is not permitted. This field is omitted from the verified-route status form. |
@@ -104,6 +164,7 @@ Inactive-capability output also includes the `manualProbe` field.
 | `autoWarm` | `on` when a verified automatic timer is allowed, `off` when it is not, or `blocked` after a sticky automatic-warm block. |
 | `codexAuto` | An optional Codex control field. `codexAuto=on` means the Codex timer switch is enabled, but the output-size safety block still applies. |
 | `blockReason` | The reason for a sticky automatic-warm block, when one exists. |
+| `spendCeiling` | `ok` or the current per-instance spend-block reason. Subscription manual probes obey this guard; existing verified-route manual bypass is retained. |
 | `probes` | The number of provider responses returned by the warm-probe path for the current anchor. |
 | `savings` | A compact current session savings label, such as `est. $0.02 saved`, `est. net cost $0.01`, or `n/a (no model pricing)`. |
 | `pricing` | The pricing source for the active anchor, currently `model` or `unknown`. |
@@ -147,7 +208,8 @@ The savings formula is:
 The extension does not use a catalog lookup or a hard-coded provider price.
 When pricing is missing or unusable, monetary fields show `n/a`.
 Unverified and unsupported routes show `n/a (unverified route)` or `n/a (unsupported route)` even when a model entry contains prices.
-The result is an estimate from observed usage, not a billing statement.
+The result is a probe-price comparison from observed usage, not a billing statement or measured avoided next-turn spending.
+A successful probe alone does not prove that it preserved the next real turn's cache.
 
 For xAI, repeated `read=0 write=0` results use the configured failure budget.
 
@@ -190,7 +252,7 @@ Fields in the event-specific column are present only when that event has the cor
 |---|---|
 | `capture` | `manualProbeAvailable` records whether the captured shape is safe for a manual probe. `prefixChanged` records whether the old anchor was replaced. `cacheKeyChanged` identifies a direct xAI key rotation. `previousCacheKeyFingerprint` records the old redacted key identity when an anchor was replaced. `realTurnContinuity` is `comparable` or `unknown`. `realTurnContinuityReason` explains the continuity decision. `modelCost` is the active model cost object or `null`. `pricingSource` is `model` or `unknown`. `savingsKnown` records whether a usable savings delta exists. `inputPricePerMTok` and `cacheReadPricePerMTok` are the resolved prices, or zero when unknown. An unsupported capture can also contain `ignored=true`. |
 | `usage` | `cacheRead`, `cacheWrite`, `input`, `output`, and `promptTokens` are raw real-turn usage values. `realTurnState` is `hit`, `miss`, or `unknown`. `realTurnReason` explains the classification. A usage event without an anchor omits `sessionId` and records `realTurnReason=no anchor`. |
-| `agent_start` | Records that the real agent turn started and the warm timer was paused. |
+| `agent_start` | Records that the real agent turn started, the warm timer was paused, and any in-flight extension probe was cancelled. |
 | `agent_settled` | `hasPayload` records whether an exact payload is available. `cachedTokens` is the scheduler's prompt-size hint. `realTurnState` and `realTurnReason` identify the latest real-turn observation. `probeOutcome`, `probeHits`, and `probeMisses` identify the latest probe state and counters. `retryState` records the failure streak and configured limit. |
 | `schedule` | `delayMs` is the scheduled delay. `nextDueAt` is the next due time as an ISO timestamp. `reason` identifies the schedule cause, such as `ttl`, `agent busy`, or `concurrency limit`. |
 | `schedule_skipped` | `automaticWarm` and `reason` explain why no timer was armed, such as an unverified capability, unsupported route, or unavailable automatic strategy. |

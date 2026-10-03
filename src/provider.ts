@@ -19,10 +19,14 @@ import type {
   RealTurnObservation,
   StrategyPlan,
   WarmCacheConfig,
+  WarmRouteProfile,
 } from "./types.ts";
 
 export {
   canManualProbe,
+  HAS_NATIVE_WARMING,
+  isSubscriptionRoute,
+  resolveWarmRouteProfile,
   classifyOpencodeGoFamily,
   getPromptCacheKey,
   hasStableResponsesCacheKey,
@@ -281,7 +285,10 @@ function resolveVerifiedCacheFamily<Payload = undefined>(
   }
   if (isXaiBestEffortModel(model)) return "xai-best-effort";
   if (isOpenAIModel(model)) {
-    return modelSupportsExplicitPromptCacheMode(model) ? "openai-explicit" : "openai-implicit";
+    // Metadata alone does not establish the retention of a captured request.
+    const options = payloadObject(payloadObject(payload)?.prompt_cache_options);
+    return (payload === undefined ? modelSupportsExplicitPromptCacheMode(model) : options?.ttl === "30m")
+      ? "openai-explicit" : "openai-implicit";
   }
   return "unsupported";
 }
@@ -322,8 +329,9 @@ export function resolveCacheFamily<Payload = undefined>(
   model: Model<any> | undefined,
   anthropicTtl: AnthropicTtlMode,
   payload?: Payload,
+  profile?: WarmRouteProfile,
 ): CacheFamily {
-  const capability = resolveProviderCapability(model, payload);
+  const capability = resolveProviderCapability(model, payload, profile);
   // OpenCode Go families are payload-driven and resolve before any
   // capability-state collapse, so an unverified Go route still surfaces its
   // family, cadence label, and hints in diagnostics. This runs before
@@ -335,6 +343,20 @@ export function resolveCacheFamily<Payload = undefined>(
   if (capability.state === "unverified") return "unverified";
   if (capability.state === "unsupported" || !model) return "unsupported";
   return resolveVerifiedCacheFamily(model, anthropicTtl, payload);
+}
+
+/** Safety window only; best-effort xAI has no declared expiry promise. */
+export function resolveCacheLifetimeMs(family: CacheFamily): number | null {
+  switch (family) {
+    case "anthropic-short":
+    case "opencode-go-short-marker":
+    case "opencode-go-plain": return ANTHROPIC_SHORT_TTL_MS;
+    case "anthropic-long":
+    case "opencode-go-long-marker": return ANTHROPIC_LONG_TTL_MS;
+    case "openai-explicit": return OPENAI_EXPLICIT_TTL_MS;
+    case "openai-implicit": return OPENAI_IMPLICIT_TTL_MS;
+    default: return null;
+  }
 }
 
 export function resolveCacheRetention(family: CacheFamily): CacheRetention {
@@ -361,12 +383,15 @@ export function resolveStrategy<Payload = undefined>(
   model: Model<any> | undefined,
   config: WarmCacheConfig,
   payload?: Payload,
+  profile?: WarmRouteProfile,
 ): StrategyResolution {
-  const capability = resolveProviderCapability(model, payload);
-  const family = resolveCacheFamily(model, config.anthropicTtl, payload);
+  const capability = resolveProviderCapability(model, payload, profile);
+  const family = resolveCacheFamily(model, config.anthropicTtl, payload, profile);
   const cacheRetention = resolveCacheRetention(family);
 
-  if (capability.state !== "verified") {
+  if (capability.state !== "verified" || (!capability.automaticWarm &&
+    family !== "opencode-go-retained" &&
+    !(family === "opencode-go-plain" && model?.api === "openai-completions"))) {
     // Unverified OpenCode Go routes keep their payload-derived family and
     // cadence label so diagnostics show what the route would do if promoted.
     // The interval stays null: an unverified route never arms a timer.
@@ -378,7 +403,7 @@ export function resolveStrategy<Payload = undefined>(
       intervalMs: null,
       ttlLabel:
         goCadence ??
-        (capability.state === "unverified" ? capability.reason : "unsupported route"),
+        (capability.state !== "unsupported" ? capability.reason : "unsupported route"),
       waitLabel: null,
       automaticWarm: false,
       manualProbe: capability.manualProbe,
@@ -718,7 +743,8 @@ export function applyWarmOutputLimit<Payload>(
   const body = payloadObject(payload);
   if (!body) return payload;
 
-  const codex = api === "openai-codex-responses" || isCodexPayload(body);
+  // An explicit API wins; instructions also belong to ordinary Responses bodies.
+  const codex = api ? api === "openai-codex-responses" : isCodexPayload(body);
   if (codex) {
     // Codex rejects hard output caps. Strip if a caller injected them.
     delete body.max_output_tokens;
@@ -728,13 +754,13 @@ export function applyWarmOutputLimit<Payload>(
     return payload;
   }
 
-  let floor = minimumOutputTokensForPayload(body, maxOutputTokens);
-  const openAiResponses =
-    api === "openai-responses" ||
-    api === "azure-openai-responses" ||
-    ("max_output_tokens" in body && Array.isArray(body.input));
+  const floor = minimumOutputTokensForPayload(body, maxOutputTokens);
+  const openAiResponses = api
+    ? api === "openai-responses" || api === "azure-openai-responses"
+    : "max_output_tokens" in body && Array.isArray(body.input);
   if (openAiResponses) {
-    floor = Math.max(floor, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS);
+    body.max_output_tokens = Math.max(floor, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS);
+    return payload;
   }
 
   let touched = false;
@@ -755,8 +781,6 @@ export function applyWarmOutputLimit<Payload>(
   if (!touched) {
     if (api === "anthropic-messages") {
       body.max_tokens = floor;
-    } else if (api === "openai-responses" || api === "azure-openai-responses") {
-      body.max_output_tokens = floor;
     } else if (api === "openai-completions") {
       body[compat?.maxTokensField ?? "max_completion_tokens"] = floor;
     }

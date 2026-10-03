@@ -1,5 +1,25 @@
 import type { Model } from "@earendil-works/pi-ai";
-import type { CacheFamily, ProviderCapability, ProviderCapabilityState } from "./types.ts";
+import { VERSION, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { CacheFamily, ProviderCapability, ProviderCapabilityState, WarmRouteProfile } from "./types.ts";
+
+const [hostMajor, hostMinor] = VERSION.split(".").map(Number);
+export const HAS_NATIVE_WARMING = hostMajor >= 1 || (hostMajor === 0 && hostMinor >= 86);
+
+/** Public registry checks only; never resolve, inspect, or refresh credentials. */
+export function resolveWarmRouteProfile(ctx: ExtensionContext, thinkingLevel = ctx.thinkingLevel): WarmRouteProfile {
+  let auth: WarmRouteProfile["auth"] = "unknown";
+  try {
+    if (ctx.model && ctx.modelRegistry.isUsingOAuth?.(ctx.model)) auth = "oauth";
+    else if (ctx.model && ctx.modelRegistry.hasConfiguredAuth?.(ctx.model)) auth = "api-key";
+  } catch {
+    // An unavailable registry is not proof of API-key authentication.
+  }
+  return { auth, thinkingLevel };
+}
+
+export function isSubscriptionRoute(model: Model<any> | undefined, profile?: WarmRouteProfile): boolean {
+  return model?.provider === "openai" && model.api === "openai-responses" && profile?.auth === "oauth";
+}
 
 type RouteCompat = {
   cacheControlFormat?: string;
@@ -684,6 +704,7 @@ function directXaiPayloadRejectionReason<Payload>(payload: Payload): string | nu
 export function resolveProviderCapability<Payload = undefined>(
   model: Model<any> | undefined,
   payload?: Payload,
+  profile?: WarmRouteProfile,
 ): ProviderCapability {
   if (!model) {
     return capability("unsupported", "no active model route; select a model before warming");
@@ -696,6 +717,51 @@ export function resolveProviderCapability<Payload = undefined>(
   // Resolve them before generic Anthropic/OpenAI compatibility checks so a
   // proxy cannot become verified merely by copying first-party metadata.
   const proxyRoute = resolveProxyRouteCapability(model, payload);
+
+  // Route-only queries may omit a profile. Every production dispatch supplies one.
+  if (model.provider === "openai" && OPENAI_COMPAT_APIS.has(model.api) && profile) {
+    if (profile.auth === "unknown") {
+      return capability("unverified", "OpenAI authentication is unknown; capture a real turn with configured public registry authentication before probing");
+    }
+    if (profile.auth === "oauth") {
+      const thinking = payloadObject(payloadObject(payload)?.reasoning)?.effort;
+      const tested = (model.id === "gpt-5.6-luna" && profile.thinkingLevel === "off" &&
+        (thinking === undefined || thinking === "none")) ||
+        (model.id === "gpt-6.1-sol" && profile.thinkingLevel === "low" &&
+          (payload === undefined || thinking === "low"));
+      const body = payloadObject(payload);
+      const safe = payload === undefined || Boolean(body && body.model === model.id && body.store === false &&
+        isSafeReplayPayload(payload, model.api) && hasStableResponsesCacheKey(payload) &&
+        body.prompt_cache_options === undefined && body.prompt_cache_retention === undefined &&
+        body.thinking === undefined);
+      const endpoint = model.api === "openai-responses" && model.baseUrl === "https://api.openai.com/v1";
+      return capability("unverified",
+        "ChatGPT subscription cache preservation is unverified; no automatic warming. " +
+        (endpoint && tested && safe
+          ? "One manual request only: 16 output tokens, 45-second cancellation, no HTTP retries; configured spend ceiling applies. Input cost and allowance use are not capped."
+          : "Manual probing requires the exact first-party endpoint, Luna with thinking off or Sol with low thinking, and a safe keyed real payload; this route/profile is refused."),
+        endpoint && tested && safe);
+    }
+  }
+
+  // Actual cache opt-out and expensive thinking cannot inherit an automatic timer.
+  const body = payloadObject(payload);
+  const cacheOptions = payloadObject(body?.prompt_cache_options);
+  const cacheDisabled = Boolean(body && (
+    (cacheOptions?.mode === "explicit" && cacheOptions.ttl === undefined && cacheOptions.prewarm !== true) ||
+    ((model.provider === "openai" || model.provider === "azure-openai-responses") &&
+      "prompt_cache_key" in body && body.prompt_cache_key === undefined && cacheOptions?.ttl === undefined) ||
+    (model.api === "anthropic-messages" && !payloadHasCacheControl(payload))));
+  const budgetThinking = payloadObject(body?.thinking)?.type === "enabled";
+  if (cacheDisabled || budgetThinking) {
+    const routeCapability = proxyRoute ?? resolveProviderCapability(model, undefined, profile);
+    if (routeCapability.state === "verified") {
+      return { ...routeCapability, automaticWarm: false,
+        reason: cacheDisabled ? "captured request disabled prompt caching; automatic warming is disabled"
+          : "budget-based thinking cannot enforce a cheap replay cap; automatic warming is disabled" };
+    }
+  }
+
   if (proxyRoute) return proxyRoute;
 
   // Anthropic-compatible routes are verified only when the route metadata says

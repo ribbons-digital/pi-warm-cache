@@ -1,225 +1,176 @@
 # E2E: idle-past-TTL cache warming test
 
-This is the canonical real-provider verification procedure for pi-warm-cache.
-Use the [diagnostics reference](upgrade-notes.md) for `/warm` status fields, lifecycle states, savings, and JSONL fields.
-The [README manual validation section](../README.md#manual-validation) points here.
+This is the real-provider verification procedure for pi-warm-cache.
+Use the [diagnostics reference](upgrade-notes.md) for status, lifecycle, savings, and JSONL fields.
+Run live tests only with explicit approval for the provider, request count, output bounds, time limit, and spend limit.
+Synthetic checks validate the mechanism, not live preservation.
 
-Manual end-to-end procedure to verify that `pi-warm-cache` actually keeps a prompt
-cache alive across a long idle gap.
+## Setup and controls
 
-File logging is optional. All evidence comes from:
-
-- `/warm` status text (`SessionWarmer.getStatusText`)
-- `/warm now` notify output
-- the widget above the editor
-- provider-side usage (Anthropic console) for cost cross-checks
-- `.pi/warm-cache.jsonl` when debug logging is enabled
-
-## Setup
-
-1. Load the extension against a real Anthropic key:
+1. Use a verified automatic route.
+   Anthropic short retention is the simplest starting point.
+   Cache markers must already be present on the real request.
+   Budget-based Anthropic thinking cannot receive automatic probes.
+2. Set Pi's global `cacheWarming` to `off` for both treatment and control groups.
+   `/warm off` disables only this extension, not the native warmer or provider caching.
+   Native streaming is otherwise the Pi v1 default and can affect a control.
+   Check for other extensions or clients that could refresh the same cache.
+3. Prepare independent treatment and control prefixes with distinct nonce values near the start of the large prefix.
+   Use distinct cache-routing keys where the route supports them.
+   Do not let treatment requests refresh the control's cache.
+   Record only redacted key and payload fingerprints in shared evidence.
+4. Keep model, endpoint, auth method, thinking, retention, output limits, and prompt size comparable.
+   Record the Pi/pi-ai versions and all non-default settings.
+   The family deadline is a safety policy, not a measured provider TTL.
+5. Load the extension in an interactive Pi session:
 
    ```bash
    pi -e ./src/index.ts --warm-cache=true
    ```
 
-   Anthropic short (5m) is the easiest family to test: 4m wait, cheap, and
-   `cacheRead` is unambiguous in usage.
+   Run dependency code in the project's Docker Sandbox.
+   A live campaign needs its own approved network and credential access; do not remove the offline-check deny rule just to run this guide.
+6. Build a large prefix above `minCachedTokens` (default 512), ideally large enough to make cached usage clear.
+   In each group, make two real turns before starting the wait.
+   The second turn must report cached reads for that group's prefix.
+   If either baseline is cold, stop and fix the baseline before comparing groups.
+7. Check `/warm` on the treatment route.
+   Expect `capability=verified`, `lifecycle=anchored`, the exact route and API, an automatic strategy, a future `nextDue`, and a confirmed real-turn hit.
+   On v1, `owner=extension` describes the native veto, not native usage accounting.
+   Unsupported or unverified capability cannot start this timer test.
 
-2. Build a big prefix. Ask the agent to read a few large files so the prompt
-   prefix is clearly above 50k tokens (well over `minCachedTokens: 512`).
+Evidence can come from `/warm`, `/warm now`, the widget, provider-reported usage, provider billing records, and optional `.pi/warm-cache.jsonl` logging.
+Inspect logs before sharing because provider error text may contain private data.
 
-   Do **two** real turns. Turn 1 writes the cache; turn 2 must show
-   `cacheRead > 0`. If turn 2 shows no cache read, stop - the problem is Pi
-   cache configuration, not this extension.
+## Step 1: replay smoke check
 
-3. Confirm the anchor exists:
-
-   ```
-   /warm
-   ```
-
-   Expect:
-
-   ```
-   enabled family=anthropic-short
-   lifecycle=anchored
-   capability=verified
-   capabilityReason=first-party Anthropic Messages route with cache markers
-   provider=anthropic/claude-fable-5
-   api=anthropic-messages
-   strategy=anthropic-short
-   cadence=5m prompt-cache TTL
-   intervalMs=240000
-   nextDue=<ISO timestamp>
-   realTurn=hit (...)
-   probe=none
-   probeSource=extension-only
-   probeHits=0
-   probeMisses=0
-   probeFailStreak=0/3
-   savingsSummary=probeHits=0 probeMisses=0 totalEstimatedSaved=$0.0000 totalProbeCost=$0.0000 net=$0.0000 pricingSource=model
-   cacheKey=none
-   pfp=<8-char hash>
-   autoWarm=on
-   probes=<n>
-   savings=est. $<amount> saved
-   pricing=model
-   realRead=<big> realWrite=0 probeRead=none prompt≈<big>
-   last=none
-   ```
-
-   - `inactive capability=unsupported` -> this route is unsupported and the provider will not be called, abort.
-   - `lifecycle=awaiting-reanchor` -> the old payload was dropped and no probe is allowed until a new real turn is captured.
-   - `realTurn=unknown (read=0 write=0 input=0 prompt=0 ...)` after a completed turn -> `message_end` usage tracking is not landing.
-
-4. Confirm the exact route before waiting.
-
-   The status must show `capability=verified`, the expected provider/model route, and the expected API transport.
-
-   Do not start a timer test for `capability=unverified` or `capability=unsupported`.
-
-   Direct xAI Grok 4.5 on `https://api.x.ai/v1` with `openai-responses` is verified as a best-effort route.
-
-   Its captured payload must include a stable `prompt_cache_key` before the automatic cadence can start.
-
-   Do not treat the 4m cadence as a provider TTL guarantee.
-
-## Step 1: smoke test (before any waiting)
-
-```
+```text
 /warm now
 ```
 
-Expect `Extension probe hit (anthropic/claude-fable-5 api=anthropic-messages; capability=verified ...; extensionProbe read=<~prefix size> write=0 in=<input tokens> out=<output tokens> cost=$<cost>; source=extension-only; pfp=<hash>; retry=0/3; savingsSummary=...)`.
+Expect `Extension probe hit`, cached reads near the intended prefix size, the permitted output cap, and `source=extension-only`.
+Check that the replay uses the same captured prefix and cache-key fingerprint.
+A miss alone does not prove body drift, expiry, or a backend cause.
+Record the actual request identity and raw usage before diagnosing it.
+If this check fails, stop the timing test.
 
-This is the highest-value check: it isolates payload replay from timing.
-If it reports `Extension probe miss (anthropic/claude-fable-5 api=anthropic-messages; capability=verified ...; extensionProbe read=0 write=<N> in=<input tokens> out=<output tokens> cost=$<cost>; source=extension-only; pfp=<hash>; retry=<N>/3; savingsSummary=...)`, the replayed payload does not
-byte-match the real one. That is the failure mode described in the README
-("payload replay, not Context rebuild"), and the timer test will only reproduce
-it more slowly.
+Make a fresh real turn before the treatment wait.
+Do not smoke-probe the control during its idle wait.
 
-Sanity check the magnitude: `cacheRead` should be within a few tokens of the
-prompt size of the last real turn. A much smaller number means only part of the
-prefix matched.
+## Step 2: treatment wait
 
-## Step 2: the idle run
+1. Leave the treatment session idle without typing, model changes, compaction, or tree navigation.
+2. With Anthropic short retention, expect a probe around four minutes.
+   The widget updates every fifteen seconds.
+3. After each tick, record dispatch time, route, payload/key fingerprints, cache read/write, input/output, cost, and outcome.
+   `/warm` must keep real-turn and extension-probe observations separate.
+4. Observe at least three ticks for a rescheduling check when approved limits allow it.
+   Three ticks test the loop; they do not prove causality.
+5. Resume with a real turn after the planned idle period.
+   Record its raw cached reads and its relation to the confirmed baseline.
 
-1. Do one more real turn to re-anchor cleanly.
-2. Do nothing. No typing, no model switch, no `/compact`, no tree navigation.
-   Model changes, compaction, branch navigation, and a non-continuing payload
-   boundary mark the next real-turn observation as `unknown` and require a new
-   anchor.
-3. Watch the widget. It refreshes every 15s and counts down to the ~4m mark.
-4. At the tick the widget flips to a probe-hit render. Then run `/warm` and
-   expect `probeHits=1 probeMisses=0` with `realTurn=hit (...)`, a positive `totalEstimatedSaved`, and `nextDue` pushed ~4m further out.
-   Run `/warm savings` to print only the cumulative savings summary.
-5. Let it run at least **3 ticks** (~12m). One tick proves replay works; three
-   prove rescheduling does not drift, collapse into a retry loop, or accumulate
-   probe misses.
-6. Break the idle with a real turn. That turn should show `realTurn=hit` and `cacheRead > 0`.
-   The real-turn observation must remain separate from the preceding probe hit.
-   This is the end-to-end payoff: the cache survived 12+ minutes of idle.
+A delayed timer that crosses the family deadline must send no automatic request.
+It drops the anchor and waits for a new real turn.
+The deadline starts at real capture or successful replay dispatch, not settlement or delayed response arrival.
+A manual probe cannot reuse an anchor already dropped by invalidation.
 
-## Step 3: control run
+## Step 3: untouched control
 
-Repeat step 2 with warming off:
+Disable the extension for the control before establishing its real-turn baseline:
 
 ```bash
 pi -e ./src/index.ts --warm-cache=off
 ```
 
-Same prefix size, same idle duration. The resuming turn should show
-`realTurn=unknown` or `realTurn=miss` with `cacheRead = 0` or a large `cacheWrite`.
-The extension must not convert Pi's own cache notice into a second savings entry.
+Keep Pi's native `cacheWarming` off too.
+Use the same idle duration and comparable settings, but an independent prefix and cache identity.
+Do not send probes or other cache-refreshing requests during the wait.
+Then resume with one real turn and record provider usage.
+The disabled extension may have no anchor and show an unknown real-turn state; use raw provider usage for the comparison.
 
-Without this control you have only proven the extension runs, not that it works.
+If treatment misses, mark it failed and stop further warming.
+Still collect the untouched control when approved safety limits permit it.
+If quota, timeout, credential validity, or another guard prevents that observation, report an incomplete comparison.
+Do not call a single idle miss measured expiry.
 
-## Pass criteria
+Repeat independent treatment/control comparisons before claiming a preservation benefit.
+If both groups remain cached, the comparison is inconclusive for benefit.
+If both miss, preservation was not demonstrated.
+A warmed real-turn hit is useful mechanism evidence, but it is not causal proof without comparable control decay.
+
+## Pass criteria and limits
 
 | Check | Expected |
-|-------|----------|
-| `/warm now` | `probe=hit`, `cacheRead` ≈ full prefix, `cacheWrite` ≈ 0 |
-| 3+ timer ticks | `probeHits` increments, `probeMisses=0` |
-| Post-idle real turn, warming on | `realTurn=hit` and `cacheRead > 0` |
-| Post-idle real turn, warming off | `cacheRead = 0` |
-| `savingsSummary=...` | hits, misses, estimated savings, probe cost, net, and pricing source are shown |
-| `savings=est. $... saved` | positive and growing for verified routes with model pricing |
-| Unknown model pricing | monetary summary fields show `n/a` |
+|---|---|
+| Confirmed baselines | Each independent group reports cached reads before its wait |
+| Replay smoke check | Exact permitted replay, legal output cap, intended cached prefix |
+| Timer mechanism | Expected cadence, separate probe counters, no duplicate owner, no expired dispatch |
+| Treatment real turn | Cached reads after the approved idle wait |
+| Control comparison | Untouched independent control observed at the comparable idle duration |
+| Preservation claim | Repeated comparable treatment benefit with control decay, not selected favorable trials |
+| Savings display | Probe-price comparison, probe costs, and model pricing; `n/a` where unknown |
 
-Caveat on the last row: the savings figure is an estimate computed from model
-pricing in `savings.ts`, not billed data. It debits actual warm spend on every
-tick, so a negative number means warming costs more than it saves. For a real
-cost claim, cross-check the Anthropic console usage for the test window.
+Savings compare cold-input and cached-read prices on probe hits.
+They do not measure avoided real-turn spending and are not a billing statement.
+Cross-check billed usage before making a cost claim.
 
-## Light concurrency check
+## Lifecycle and concurrency checks
 
-1. Open two Pi sessions that share one extension process and capture a large verified anchor in each session.
-2. Set `max=1` with `/warm interval=45s max=1` in both sessions.
-3. Let one session enter a warm probe, then allow the other session's timer to tick while the first request is still in flight.
-4. In the deferred session, `/warm` should show `activeWarmSessions=1/1` and `deferred=concurrency limit (1/1 slots used)`.
-5. With `PI_WARM_CACHE_DEBUG=1`, confirm a `warm_deferred` event with `providerRequest=false` and confirm that the deferred tick did not call the provider.
-6. After the first probe completes, the deferred session should retry and clear its deferral state.
+- After compaction, tree navigation, model or thinking selection, reload, session replacement, or off/on, the old payload must be unavailable.
+  A new real turn must capture a fresh anchor.
+- A real turn cancels an in-flight extension probe and can capture immediately.
+  Late probe replies cannot replace its observations or failure status.
+  The old call retains its concurrency slot until the provider call ends.
+- For two sessions sharing one extension process, set `max=1` and overlap synthetic slow probes.
+  The waiting timer must report `activeWarmSessions=1/1` and a concurrency deferral without calling the provider.
+  A subscription manual refusal must not queue a follow-up.
+  Separate Pi processes do not share this gate.
+- Native off, streaming, and idle ownership, off/on handoff, the last-handler limitation, failures, and cancellation are covered by `pnpm test` with synthetic transport.
+  These do not need a paid concurrency experiment.
 
-## Things that will make the test lie to you
+## Things that can invalidate the result
 
-- **Anthropic 5m TTL is sliding.** Any background activity refreshes it for
-  free, so the control run can falsely "pass". Keep the terminal untouched.
-- **Timers are `unref`'d** (`src/warmer.ts`, `unrefTimer`). In non-TUI or print
-  modes, if nothing else holds the event loop open, ticks may never fire. Test
-  in the interactive TUI.
-- **`agent_start` clears timers.** Any turn during the wait restarts the
-  countdown and you will misread the interval.
-- **Miss-with-write is sticky.** On `cacheWrite > 0 && cacheRead === 0` the
-  anchor is dropped and warming stops until the next real turn. If the widget
-  goes quiet mid-test, check `/warm` - this is more likely than a timer bug.
-- **`maxConsecutiveFailures: 3`** silently parks the warmer as
-  `too many failures`. Check status before concluding "it just stopped".
+- Background activity can refresh a sliding cache, including activity from Pi's native warmer.
+- Shared treatment/control identity can let treatment refresh the control.
+- Non-TUI timers are unreferenced and may never fire if nothing else keeps the process alive.
+- `agent_start` clears the warm timer and retires an active extension probe.
+- Cache misses, writes, or exhausted failure budgets can drop or park an anchor.
+  Check status instead of inferring expiry.
+- A CLI preload fetch stub can be replaced by Pi's transport setup.
+  Offline CLI checks must load that module first, record intercepted provider calls, and enforce sandbox network denial.
+- `maxidle=0` removes the idle cutoff, not the expiry guard.
+  Disclose it for campaigns longer than the default idle horizon.
 
-## Shortening the loop while iterating
+## Shortening the mechanism loop
 
-For debugging the mechanism (not for validating real TTL behavior):
-
-```
+```text
 /warm interval=45s
 ```
 
-A tick every 45s sits well inside the 5m TTL, so every tick should hit. Once
-that is stable for several ticks, return to the default interval for the real
-4m validation. A 45s interval proves replay correctness but says nothing about
-whether the 4m cadence actually beats the TTL.
+Use this only for replay and scheduling checks, not measured retention.
+Return to the strategy cadence for an approved timing comparison.
+An interval beyond the family deadline does not authorize an expired automatic request.
 
 ## Other families
 
-| Family | Interval | Idle wait to validate |
-|--------|----------|-----------------------|
-| `anthropic-short` | ~4m | ~12m (3 ticks) |
-| `anthropic-long` | ~48m | requires Pi cache retention set to long |
-| `openai-explicit` | ~24m | needs `supportsExplicitPromptCacheMode` |
-| `openai-implicit` | ~6.4m | ~20m (3 ticks) |
-| `xai-best-effort` | 4m heuristic | at least 12m, record observed hit rate |
+| Family | Default cadence | Verification limit |
+|---|---|---|
+| `anthropic-short` | About 4 minutes | Real request already has short cache markers |
+| `anthropic-long` | About 48 minutes | Real request already uses one-hour retention |
+| `openai-explicit` | About 24 minutes | Captured request contains explicit `ttl: "30m"` |
+| `openai-implicit` | About 6.4 minutes | Operational window, not measured expiry for every route |
+| `xai-best-effort` | Four-minute heuristic | Stable captured key; no fixed TTL promise |
 
-`anthropic-short` is the recommended default for validation. The others follow
-the same procedure with longer waits.
+For xAI, record cached reads even when cache-write usage is absent.
+Repeated no-read/no-write results exhaust the configured failure budget and require a fresh anchor.
+Never copy the raw cache key into shared evidence.
 
-For `xai-best-effort`, record the route, payload fingerprint, cache-key identity,
-read, write, output, cost, and retry values for every probe.
+### ChatGPT subscription exception
 
-xAI may report cached reads without a separate cache-write token count through Pi.
-
-Repeated no-read/no-write probes must stop and request a new real-turn anchor when
-the configured failure budget is reached.
-
-### Optional xAI validation
-
-A live xAI run is optional because it requires a direct xAI account and a captured `prompt_cache_key`.
-
-Use `PI_WARM_CACHE_DEBUG=1` when running the session if you need JSONL evidence for each best-effort probe.
-
-Confirm that `/warm` shows `policy=xAI-best-effort`, `strategy=xai-best-effort`, the configured interval, and a redacted `cacheKey` fingerprint.
-
-The raw `prompt_cache_key` must never be copied into status output, logs, issue comments, or test fixtures that represent real credentials.
-
-If the key is missing, invalid, or changes between real turns, automatic warming must stop and the next probe must wait for a new exact real-turn anchor.
-
-The four-minute xAI interval is a best-effort operational heuristic and is not a provider TTL guarantee.
+Do not use this timer procedure for new OpenAI ChatGPT sign-in.
+Automatic cache preservation remains unverified.
+Only the exact tested Luna/off and Sol/low profiles on the first-party Responses endpoint permit a safe keyed manual replay.
+Each accepted manual action has sixteen output tokens, forty-five-second cancellation, zero automatic HTTP retries, and no scheduled follow-up.
+Configured spend ceilings apply, but neither input cost nor subscription allowance use is capped.
+See the [manual contract](upgrade-notes.md#openai-chatgpt-subscription-manual-contract) and existing [live evidence](evidence/openai-chatgpt-v1-live-trial.md).
+This safety slice authorizes no new live campaign.
