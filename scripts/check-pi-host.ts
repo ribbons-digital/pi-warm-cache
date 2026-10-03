@@ -76,7 +76,7 @@ globalThis.fetch = async (input, init) => {
 
 try {
   const credentials = new InMemoryCredentialStore();
-  const modelRuntime = await ModelRuntime.create({
+  let modelRuntime = await ModelRuntime.create({
     credentials,
     authPath: join(workspace, "auth.json"),
     modelsPath: join(workspace, "models.json"),
@@ -215,8 +215,6 @@ try {
   assert.equal(bodies.length, beforeReload, "shutdown must cancel the old armed timer");
   await session.prompt("/warm now");
   assert.equal(bodies.length, beforeReload, "reloaded extension must wait for a new anchor");
-  assert.deepEqual(errors, [], "host handlers must not report extension errors");
-
   // Emit lifecycle boundaries through the installed runner, without paid compaction.
   const lifecycleRunner = session.extensionRunner;
   const compactEvent = { type: "session_compact" as const, fromExtension: false,
@@ -336,10 +334,18 @@ try {
 
     // Stored dummy OAuth data exercises the public registry and real adapter.
     await session.prompt("/warm off");
-    await credentials.modify("openai", async () => ({ type: "oauth", access: "offline-oauth-token",
+    await session.extensionRunner.emit(shutdownEvent);
+    session.dispose();
+    // Seed OAuth before creating its runtime. Reusing the API-key runtime races
+    // registerProvider's background availability refreshes and stale snapshots.
+    const oauthCredentials = new InMemoryCredentialStore();
+    await oauthCredentials.modify("openai", async () => ({ type: "oauth", access: "offline-oauth-token",
       refresh: "offline-unused-refresh", expires: Date.now() + 86_400_000 }));
-    // Re-registration merges undefined fields, so remove the previous dummy API key.
-    modelRuntime.unregisterProvider("openai");
+    modelRuntime = await ModelRuntime.create({
+      credentials: oauthCredentials,
+      authPath: join(workspace, "auth.json"), modelsPath: join(workspace, "models.json"),
+      modelsStorePath: join(workspace, "catalog.json"), allowModelNetwork: false,
+    });
     modelRuntime.registerProvider("openai", {
       api: "openai-responses", baseUrl: "https://api.openai.com/v1",
       models: ["gpt-5.6-luna", "gpt-6.1-sol"].map((id) => ({
@@ -349,6 +355,14 @@ try {
     });
     await modelRuntime.refresh({ allowNetwork: false });
     assert.equal(modelRuntime.isUsingOAuth("openai"), true, "stored-OAuth fixture must not retain API-key auth");
+    const initialSubscriptionModel = modelRuntime.getModel("openai", "gpt-5.6-luna");
+    assert(initialSubscriptionModel);
+    await loader.reload();
+    ({ session } = await createAgentSession({
+      cwd: workspace, agentDir: workspace, modelRuntime, model: initialSubscriptionModel, thinkingLevel: "off",
+      settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(workspace), noTools: "all",
+    }));
+    await session.bindExtensions({ onError: (error) => { errors.push(error.error); } });
     for (const [id, thinking] of [["gpt-5.6-luna", "off"], ["gpt-6.1-sol", "low"]] as const) {
       const subscriptionModel = modelRuntime.getModel("openai", id);
       assert(subscriptionModel);
@@ -430,6 +444,7 @@ try {
     }
   } finally { oauthProfile.mock.restore(); }
   console.log("[check-pi-host] PASS: Luna/off and Sol/low instructions replay keeps exact sixteen-token HTTP cap; synthetic OAuth classification");
+  assert.deepEqual(errors, [], "host handlers must not report extension errors");
   console.log("[check-pi-host] PASS: load/reload, active-timer cleanup, capture, settle, exact replay, cap, usage, failure, compaction/tree/replacement invalidation; offline only");
 } finally {
   try {

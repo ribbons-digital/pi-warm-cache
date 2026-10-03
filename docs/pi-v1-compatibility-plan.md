@@ -494,6 +494,11 @@ Both targets failed with an absent final cap before the shared shaper made expli
 After correction, each body contains exactly sixteen output tokens as its cap and preserves every other captured field.
 Explicit and inferred legacy Codex cap stripping and suffix/output-spike checks remain intact.
 See the [review correction evidence](evidence/pi-v1-safety-checks.md#review-correction-instructions-must-not-remove-the-subscription-cap).
+PR #72's initial CI passed Pi 0.84.2 but failed Pi 1.0.0 at the stored-OAuth fixture's public auth assertion.
+The fixture now uses a fresh runtime/session seeded with dummy OAuth credentials before creation, avoiding stale API-key snapshots from background refreshes.
+Both local target suites and ten repeated v1 host checks pass; the replacement GitHub CI run remains the acceptance check.
+Production source and existing safety assertions are unchanged.
+See the [CI correction evidence](evidence/pi-v1-safety-checks.md#pr-72-ci-correction-isolate-the-oauth-runtime).
 Compaction/tree/replacement checks emit lifecycle boundaries through the host runner; they do not perform live compaction or the complete `/new` journey.
 
 The real v1 CLI was checked in regular 80-column and fullscreen 120-column modes using isolated dummy OAuth and synthetic transport.

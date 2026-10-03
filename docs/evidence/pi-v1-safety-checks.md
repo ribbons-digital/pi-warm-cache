@@ -69,7 +69,8 @@ No capability restriction, live claim, timeout, retry, spend policy, or default 
 
 Full checks exposed a separate test-fixture issue: re-registering the provider without `apiKey` retained the previous dummy API key under Pi's merge contract.
 That let the stored-OAuth test report a verified API-key route instead of its expected unverified subscription route.
-The fixture now removes the previous registration and asserts that the public runtime reports OAuth before testing it.
+That correction removed the previous registration and asserted that the public runtime reported OAuth before testing it.
+CI later exposed a remaining background-refresh race, addressed below.
 The new synthetic-classification fixture runs afterward and restores its method mock.
 No production auth logic or existing assertion was relaxed.
 
@@ -84,6 +85,36 @@ Review-correction logs under the research workspace:
 The saved UI renders below predate this correction.
 No UI or command text changed; the correction is in shared request shaping and is checked at the intercepted HTTP boundary.
 No additional live campaign or review launch was performed.
+
+## PR #72 CI correction: isolate the OAuth runtime
+
+The [initial CI run](https://github.com/ribbons-digital/pi-warm-cache/actions/runs/37156266219) passed Pi 0.84.2 but failed Pi 1.0.0 at `stored-OAuth fixture must not retain API-key auth` with `false !== true`.
+Five unchanged host-check runs passed locally on the ARM sandbox, so the CI failure was not reproduced there.
+The failing CI log is preserved as `slice2-pr72-ci-github-before.log` in the research workspace.
+
+Pi's provider registration starts unawaited refreshes.
+A full auth refresh whose sequence has been superseded returns without publishing its snapshot.
+An awaited refresh of the reused API-key runtime therefore did not guarantee that the new OAuth snapshot was ready.
+Removing the previous provider registration was not a complete fix for this race.
+
+The OAuth scenario now uses a fresh runtime and SDK session with dummy OAuth credentials seeded before runtime creation.
+All refreshes in that runtime see the same credential type, rather than switching from API-key setup mid-test.
+The original session emits shutdown and is disposed before replacement.
+The public OAuth assertion, real adapter cap/retry/timeout assertions, and instructions-body HTTP regressions remain intact.
+The existing handler-error assertion moved to the end so it covers both SDK sessions without narrowing the error array before the second callback is registered.
+Production code, dependency versions, capability policy, and CI requirements did not change.
+
+Both targets passed full tests, type checking, and lint in the Docker Sandbox after this correction.
+Ten additional Pi 1.0.0 host-check runs passed.
+The deny-all rule remained active, and no live provider campaign ran.
+These local results do not substitute for the new GitHub CI run.
+
+Logs under the research workspace:
+
+- `slice2-pr72-ci-before.log`: Five local passes with the original setup, despite the recorded CI failure.
+- `slice2-pr72-ci-focused-after.log`: First focused test pass followed by the error-array type-check failure; preserved as failed intermediate evidence.
+- `slice2-pr72-ci-final-slice1-baseline.log` and `slice2-pr72-ci-final-slice1-v1.log`: Full passing checks after correction.
+- `slice2-pr72-ci-repeat-after.log`: Ten passing Pi 1.0.0 host checks with isolated OAuth setup.
 
 ## CLI UI checks
 
