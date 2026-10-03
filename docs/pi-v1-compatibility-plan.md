@@ -1,7 +1,8 @@
 # Pi v1.0 compatibility findings and action plan
 
-Status: Non-release Slice 1 on `compat/pi-v1-contract` passed Astra implementation review.
-The user approved opening a pull request for this slice.
+Status: Non-release Slice 1 on `compat/pi-v1-contract` passed Astra implementation review and is open as [PR #71](https://github.com/ribbons-digital/pi-warm-cache/pull/71).
+The user subsequently approved including the maintenance updates from PRs #65-67.
+Those additions are checked locally; Astra's recorded pass applies to the slice before these maintenance additions.
 Production warming behavior is unchanged.
 No merge, further slice, or release is approved.
 A subsequent user-approved live trial is recorded in [OpenAI ChatGPT sign-in evidence](evidence/openai-chatgpt-v1-live-trial.md).
@@ -319,7 +320,8 @@ The final checks ran inside `pi-warm-cache-v1-research` using Node 24.21.0 and p
 The two isolated dependency workspaces are `/tmp/pi-warm-cache-v1-research.J82S7J/slice1-baseline` and `/tmp/pi-warm-cache-v1-research.J82S7J/slice1-v1`.
 The baseline copy substitutes the previous three Pi versions; the v1 copy uses the updated frozen lockfile.
 The matrix's baseline dependency-selection command was also exercised locally.
-GitHub Actions itself was not run, and no interactive TUI or live provider flow was checked in this slice.
+Both GitHub Actions matrix targets later passed on the initial PR commit `34f4438`.
+No interactive TUI or live provider flow was checked in this slice.
 The new CI matrix uses Node 24 to match the checked TypeScript-capable runtime; the package's production Node engine range is unchanged.
 
 Run the final commands from the host, replacing `TARGET` with `slice1-baseline` or `slice1-v1`:
@@ -369,6 +371,33 @@ Astra confirmed the active-timer correction, the saved fault-test failures, rest
 No new blocking issue was reported.
 The user then approved opening a pull request for Slice 1.
 Merge and Slice 2 still require separate approval.
+
+#### Approved maintenance additions from PRs #65-67
+
+The user approved adding these maintenance updates to PR #71:
+
+- PR #65: `pnpm/action-setup` 6.0.10 to 6.1.0 in CI and the release workflow.
+  The release workflow keeps its full commit pin, updated to `ea17c68df8912ef543352723c149a84f56e3d413`.
+  The upstream annotated tag was resolved and confirmed to point to that commit.
+- PR #66: Development `npm` 12.0.2 to 12.1.0.
+- PR #67: Development `oxlint` 1.80.0 to 1.85.0.
+
+The lockfile was regenerated through pnpm inside the existing Docker Sandbox.
+It changes only npm, Oxlint, and Oxlint's platform packages relative to the reviewed slice.
+No lint rule, production source, peer range, package version, or Pi dependency target changed.
+The release-workflow change only updates the setup action; it does not dispatch a release or grant publishing approval.
+
+Both Pi dependency targets passed the full unit suite, corrected offline host check, type checking, and lint again with the updated tools.
+The baseline verification first installed the new frozen v1 lockfile, then applied the same previous-Pi selection command used by CI.
+The v1 frozen installation also passed, and the installed tools reported npm 12.1.0 and Oxlint 1.85.0.
+Logs are preserved as `slice1-maintenance-verified-baseline.log` and `slice1-maintenance-verified-v1.log` under the research sandbox workspace.
+The release workflow was not executed; no provider credential or live inference was used.
+The initial PR's two CI targets passed before these additions; the updated PR must run them again.
+
+PRs #68-70 target Pi 0.87.1 and are superseded by PR #71's 1.0.0 target.
+They remain unmerged; no Dependabot ignore policy was added.
+Review the maintenance changes and their new CI results before making the separate merge decision.
+Slice 2 and release work remain outside this approval.
 
 ### Slice 2: Ship safety, route ownership, and matching documentation together
 
