@@ -173,4 +173,4 @@ Only the exact tested Luna/off and Sol/low profiles on the first-party Responses
 Each accepted manual action has sixteen output tokens, forty-five-second cancellation, zero automatic HTTP retries, and no scheduled follow-up.
 Configured spend ceilings apply, but neither input cost nor subscription allowance use is capped.
 See the [manual contract](upgrade-notes.md#openai-chatgpt-subscription-manual-contract) and existing [live evidence](evidence/openai-chatgpt-v1-live-trial.md).
-This safety slice authorizes no new live campaign.
+The v0.5.0 release does not establish automatic subscription preservation or authorize a new live campaign.

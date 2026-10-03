@@ -77,3 +77,27 @@ Include the test and type-check commands that you ran.
 Call out any live provider validation that was not possible in the local environment.
 
 A maintainer will review the pull request before it is merged.
+
+## Releases
+
+Prepare version and user-facing documentation changes on a feature branch and open a release pull request.
+Use Node.js 24 and pnpm 10 in Docker Sandboxes to run tests, type checking, lint, and `pnpm pack`.
+Inspect the tarball for the manifest, README, license, and all production source files; do not ship tests, development scripts, or credentials.
+Check the packed extension through Pi's real loader with synthetic transport.
+
+After the maintainer merges the release PR and approves the release, sync `main` and create the version tag at that merged commit.
+Do not tag an unmerged feature branch or push release changes directly to `main`.
+Dispatch the existing trusted-publishing workflow from `main` with the approved tag:
+
+```bash
+gh workflow run release.yml --ref main -f tag=v0.5.0
+```
+
+The workflow uses Node.js 24, verifies the tag against the package version, runs checks, validates the tarball, and publishes to npm with provenance.
+Do not bypass it with registry tokens or a local publish.
+After publication succeeds, verify the npm version and provenance, then create the GitHub release with the corresponding release notes.
+The v0.5.0 notes are in [docs/release-notes-v0.5.0.md](docs/release-notes-v0.5.0.md).
+
+The earlier research sandbox was removed after PR #72 merged.
+Its logs, source snapshots, and research workspace were archived under `~/.local/share/docker-sandbox-archives/cleanup-2026-10-03/`.
+Do not use its old start command as current setup guidance.

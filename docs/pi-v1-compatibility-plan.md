@@ -1,15 +1,14 @@
 # Pi v1.0 compatibility findings and action plan
 
-Status: Non-release Slice 1 merged as [PR #71](https://github.com/ribbons-digital/pi-warm-cache/pull/71), commit `4b17f916c21697c348b145cdf30485ad7ef7481c`.
-Local `main` is synced, and the merged local and remote feature branches are gone.
-The user approved starting Slice 2 on `compat/pi-v1-safety`.
-Slice 2 implementation and local verification are complete on that branch.
-The user's initial independent review required a correction for an instructions-triggered subscription cap bypass.
-The correction has before/after intercepted-HTTP evidence on both targets.
-The user reported that re-review passed and approved committing, pushing the feature branch, and opening a Slice 2 pull request.
-Merge and release remain separate gates.
-The maintenance updates from PRs #65-67 passed both CI targets before merge; Astra's recorded pass applies to the slice before those additions.
-No Slice 2 merge, Slice 3, live campaign, or release is approved.
+Status: Compatibility implementation is complete.
+Slice 1 merged as [PR #71](https://github.com/ribbons-digital/pi-warm-cache/pull/71), commit `4b17f916c21697c348b145cdf30485ad7ef7481c`.
+Slice 2 merged as [PR #72](https://github.com/ribbons-digital/pi-warm-cache/pull/72), commit `56abbced4679849f44aaf7cdc3121b90996e243c`.
+Both CI targets passed before the Slice 2 merge, including the instructions-cap correction and isolated OAuth fixture.
+Local `main` was synced and the retired local feature branches were removed; GitHub had already removed the Slice 2 remote branch.
+The user approved v0.5.0 release preparation and publication, with matching user-facing documentation.
+Preparation is on `release/v0.5.0`; the release PR must merge before tagging or dispatching publication from `main`.
+No Slice 3, new economics policy, automatic subscription promotion, or new live campaign is included.
+The maintenance updates from PRs #65-67 passed both CI targets before the Slice 1 merge; Astra's recorded pass applies to the slice before those additions.
 A subsequent user-approved live trial is recorded in [OpenAI ChatGPT sign-in evidence](evidence/openai-chatgpt-v1-live-trial.md).
 Its results update the subscription-route recommendation below.
 A [follow-up cache investigation](evidence/openai-chatgpt-v1-cache-investigation.md) checked actual HTTP identity, raw usage, and native cache fields.
@@ -21,14 +20,15 @@ The parent checked and accepted its three findings: evidence-driver claims, expl
 The original implementation approval covered non-release Slice 1.
 After its merge, the user approved starting Slice 2.
 The Slice 1 checks and limits are recorded under [Slice 1 verification](#slice-1-verification).
-Slice 2 review passed as reported by the user.
-Its merge, later slices, and release remain separate gates.
+Slice 2 review passed as reported by the user, and its merge is complete.
+The approved v0.5.0 release is separate from the optional Slice 3 enhancements.
 
 ## Summary
 
 The original pi-warm-cache 0.4.0 audit passed type checking against Pi 1.0.0 but did not support an unconditional compatibility claim.
 Its main problems were request safety, coordination with native warming, and a test that assumed an old model catalog.
-Slice 1 corrected the contract checks; the reviewed Slice 2 corrects the safety policy and matching documentation, pending pull-request CI and merge approval.
+The merged Slice 1 corrected the contract checks; the merged Slice 2 corrected the safety policy and matching documentation.
+These satisfy the compatibility implementation scope for v0.5.0.
 A rewrite is not needed.
 
 Keep our exact provider-payload replay and route verification.
@@ -496,7 +496,8 @@ Explicit and inferred legacy Codex cap stripping and suffix/output-spike checks 
 See the [review correction evidence](evidence/pi-v1-safety-checks.md#review-correction-instructions-must-not-remove-the-subscription-cap).
 PR #72's initial CI passed Pi 0.84.2 but failed Pi 1.0.0 at the stored-OAuth fixture's public auth assertion.
 The fixture now uses a fresh runtime/session seeded with dummy OAuth credentials before creation, avoiding stale API-key snapshots from background refreshes.
-Both local target suites and ten repeated v1 host checks pass; the replacement GitHub CI run remains the acceptance check.
+Both local target suites and ten repeated v1 host checks passed.
+The [replacement GitHub CI run](https://github.com/ribbons-digital/pi-warm-cache/actions/runs/37157289029) passed both matrix targets before PR #72 merged.
 Production source and existing safety assertions are unchanged.
 See the [CI correction evidence](evidence/pi-v1-safety-checks.md#pr-72-ci-correction-isolate-the-oauth-runtime).
 Compaction/tree/replacement checks emit lifecycle boundaries through the host runner; they do not perform live compaction or the complete `/new` journey.
@@ -519,7 +520,32 @@ There is no new economics policy, evidence-driver reuse, automatic subscription 
 No delegated review was launched.
 The user reported that re-review passed on 2026-10-03 and approved committing, pushing this feature branch, and opening the Slice 2 pull request.
 The parent did not launch another review or infer the reviewer's identity.
-Wait for CI and explicit merge approval; do not merge, publish, or start Slice 3.
+PR #72 subsequently merged after both CI targets passed.
+The user has separately approved the v0.5.0 release; it requires a merged release-preparation PR before tagging and publication.
+Slice 3 remains optional and unapproved.
+
+### v0.5.0 release preparation
+
+The user approved v0.5.0 after the two compatibility slices merged.
+The release branch changes package version, upgrade/release documentation, status records, and the publication workflow's Node version and lint check.
+It does not change production source, route policy, default economics, or live evidence.
+
+Release-candidate checks use Docker Sandbox `pi-warm-cache-release-050`, Node 24.21.0, and pnpm 10.0.0.
+The host workspace is the repository path; isolated verification copies are `/tmp/pi-warm-cache-release-050/previous` and `/tmp/pi-warm-cache-release-050/v1` inside the sandbox.
+Both targets passed tests, type checking, and lint with sandbox-scoped deny-all active.
+The v0.5.0 tarball contains only the manifest, README, license, and nine production source files.
+The extracted package passed the real-loader host check against both dependency targets using a test harness added only outside the tarball.
+No provider credentials or new live campaign were used.
+
+Access uses `sbx exec --workdir /tmp/pi-warm-cache-release-050/v1 pi-warm-cache-release-050 bash`.
+Project commands need `/tmp/pi-warm-node/node_modules/node/bin` first on `PATH`.
+Stop with `sbx stop pi-warm-cache-release-050`.
+No server or port publication is needed.
+Candidate logs and tarball are preserved under `~/.local/share/pi-warm-cache/releases/v0.5.0/`.
+
+The npm registry currently has v0.4.0 with provenance, and the existing trusted-publishing workflow has successful prior runs.
+The release-preparation PR must merge before creating `v0.5.0` at the merged commit and dispatching `release.yml` from `main`.
+A successful publish, registry/provenance verification, and GitHub release remain pending.
 
 ### Slice 3: Borrow economics and extend live verification separately
 
@@ -548,19 +574,18 @@ Wait for CI and explicit merge approval; do not merge, publish, or start Slice 3
 Live evidence distinguishes probe hits from successful cache reuse on the following real turn.
 Documentation does not imply that native warming costs are included in extension counters or that both warmers preserve the same route simultaneously.
 
-## Research sandbox
+## Research sandbox archive
 
-- Name: `pi-warm-cache-v1-research`.
-- State after Slice 2 verification: Stopped, with research and check files preserved.
-- Network: Sandbox-scoped deny-all policy remains enabled after the failed CLI harness correction.
-- Workspace: `/tmp/pi-warm-cache-v1-research.J82S7J`.
-- Start/access: `sbx exec --workdir /tmp/pi-warm-cache-v1-research.J82S7J pi-warm-cache-v1-research bash`.
-- Stop: `sbx stop pi-warm-cache-v1-research`.
-- No server, port mapping, or local URL was needed.
-- Synthetic reproduction: `/tmp/warm-node-runtime/node_modules/node-linux-arm64/bin/node research-check.mjs`, run inside this sandbox.
-- The root sandbox copy contains research-only dependency changes and the reproduction script.
-  The two `slice1-*` subdirectories hold the approved implementation-check copies described above.
-  Research drivers remain outside the implementation diff.
+The original `pi-warm-cache-v1-research` sandbox was removed during the user-approved cleanup after PR #72 merged.
+Its research workspace and guest files were preserved in `~/.local/share/docker-sandbox-archives/cleanup-2026-10-03/`.
+The host research workspace remains at `/tmp/pi-warm-cache-v1-research.J82S7J`.
+The old sandbox's start command and scoped network rule are no longer active.
+
+The earlier checks used Node 24.21.0 and sandbox-scoped deny-all during synthetic verification.
+No server or port mapping was needed.
+The two `slice1-*` copies, logs, and scratch research drivers are historical evidence, not a current development environment.
+Use [CONTRIBUTING.md](../CONTRIBUTING.md#development-setup) for fresh sandbox setup.
+Research drivers remain outside the package and require new approval and corrected controls before any live reuse.
 
 ## Primary sources
 
