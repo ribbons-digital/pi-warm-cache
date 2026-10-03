@@ -4,7 +4,8 @@ Date: 2026-10-03.
 Branch: `compat/pi-v1-safety`, based on merged Slice 1 commit `4b17f916c21697c348b145cdf30485ad7ef7481c`.
 The user reported that independent re-review passed after the blocking cap finding was corrected.
 The user approved committing, pushing the feature branch, and opening the Slice 2 pull request on 2026-10-03.
-Merge, release, and a new live campaign remain unapproved.
+PR #72 subsequently merged after both CI targets passed.
+The user later approved v0.5.0 release preparation and publication; the evidence below remains the earlier synthetic safety record, not new live validation.
 
 ## Technical checks
 
@@ -187,4 +188,5 @@ No safe native-streaming/extension-idle handoff or native usage attribution is c
 No new economic policy, economic default change, evidence-driver reuse, or release was added.
 The user reported that the external re-review passed and approved opening the pull request.
 No additional review was launched by the parent, and no reviewer identity is inferred.
-Pull-request CI and merge approval are the next gates.
+Both pull-request CI targets passed and PR #72 merged.
+The next approved work is v0.5.0 release preparation through a separate release PR.

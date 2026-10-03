@@ -7,7 +7,20 @@ That cache expires if you leave the session idle.
 The next turn then pays a cold read or a costly rewrite.
 This extension sends a small keepalive probe before that is likely to happen.
 
-It requires [Pi](https://github.com/badlogic/pi-mono) 0.84 or newer.
+It requires [Pi](https://github.com/earendil-works/pi) 0.84 or newer.
+Version 0.5.0 is checked against Pi 0.84.2 with pi-tui 0.84.4 and Pi 1.0.0.
+These checks establish host compatibility and request safety, not cache preservation on every provider route.
+
+## What's new in 0.5.0
+
+- Pi v1 support with one automatic warmer per owned route and a visible route owner.
+- Real turns cancel extension probes; late replies cannot replace the new request or its observations.
+- Cache opt-out, unsafe budget thinking, and expired payloads cannot start automatic probes.
+- New ChatGPT sign-in is separate from legacy Codex and allows only the bounded manual probes described below.
+
+Existing verified-route settings and defaults remain, except for the documented safety restrictions.
+No new cost-aware policy or automatic ChatGPT subscription warming is included.
+See the [upgrade guide](docs/upgrade-notes.md#upgrading-from-040-to-050) and [release notes](docs/release-notes-v0.5.0.md).
 
 ## How it works
 
@@ -56,7 +69,21 @@ Native usage is not included in this extension's probe counters.
 pi install npm:pi-warm-cache
 ```
 
-Restart or reload Pi after install.
+Restart or reload Pi after install, then send a real turn before expecting a probe.
+
+To update an unpinned installation on Pi v1:
+
+```bash
+pi update npm:pi-warm-cache
+```
+
+If your installation is pinned to an older version, select the new version explicitly:
+
+```bash
+pi install npm:pi-warm-cache@0.5.0
+```
+
+After updating, restart or reload Pi, send a real turn, and run `/warm` to check the route owner and whether probing is allowed.
 
 ## Commands
 

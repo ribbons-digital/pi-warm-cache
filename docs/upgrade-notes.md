@@ -1,6 +1,38 @@
 # Diagnostics reference
 
-This page documents the lifecycle, `/warm` status, savings summary, and JSONL diagnostics used by pi-warm-cache.
+This page documents upgrading to v0.5.0, lifecycle, `/warm` status, savings summary, and JSONL diagnostics used by pi-warm-cache.
+
+## Upgrading from 0.4.0 to 0.5.0
+
+Version 0.5.0 adds Pi 1.0 compatibility and request-safety protection while retaining the earlier Pi 0.84 host path.
+CI covers Pi 0.84.2 with pi-tui 0.84.4 and all three Pi packages at 1.0.0.
+Host-provided peer dependencies remain `*`; the extension does not bundle another copy of Pi.
+
+1. On Pi v1, run `pi update npm:pi-warm-cache` for an unpinned installation.
+   If pinned to an older version, use `pi install npm:pi-warm-cache@0.5.0` instead.
+2. Restart or reload Pi.
+   The old captured request is not retained across reload.
+3. Send a real turn, then run `/warm` to check the route owner, capability, and next probe time.
+
+Your existing commands and verified-route settings remain available.
+The deliberate safety changes are:
+
+- The extension vetoes native warming on owned routes, including native streaming warming during tool work.
+  It still warms only while idle; unowned routes keep Pi's native behavior.
+- `/warm off` stops only this extension, not Pi's native warmer or provider caching.
+  Off/on needs a new real turn.
+- Cache-disabled requests and budget-based Anthropic thinking receive no automatic probes.
+- Expired payloads are dropped rather than sent late.
+- Real turns cancel extension probes; late replies cannot change a new anchor's results.
+- New ChatGPT sign-in is manual-only on the exact profiles below.
+  It is not enabled by `/warm codex-on` or interval overrides.
+
+Legacy Codex timers retain their existing default and output-spike protection.
+Existing verified-route manual idle/spend bypass remains available while its anchor is usable.
+Subscription manual probes instead obey a configured spend ceiling and have fixed output, time, and retry bounds.
+Savings remain a probe-price comparison, not measured next-turn savings.
+No opt-in economics feature, automatic subscription promotion, or new live cache-preservation claim ships in v0.5.0.
+See the [release notes](release-notes-v0.5.0.md) for the complete release summary.
 
 ## Safety rules and scope
 
@@ -70,7 +102,7 @@ A configured spend ceiling is checked before dispatch, unlike the existing verif
 It uses accumulated reported model cost and can overshoot on the accepted request; it is not a billing or per-request cost guarantee.
 Defaults are unchanged: `spend=0` disables the ceiling and the implicit one-dollar default applies only to OpenCode Go.
 The UI labels manual hits as unverified preservation with savings `n/a`.
-See the [live trial](evidence/openai-chatgpt-v1-live-trial.md) and [follow-up investigation](evidence/openai-chatgpt-v1-cache-investigation.md); this slice adds no live preservation evidence.
+See the [live trial](evidence/openai-chatgpt-v1-live-trial.md) and [follow-up investigation](evidence/openai-chatgpt-v1-cache-investigation.md); v0.5.0 adds no live preservation evidence.
 
 This extension supports Pi only.
 Tau is out of scope.
