@@ -61,7 +61,7 @@
     "@earendil-works/pi-tui": "1.0.0",
     "@oxlint/plugins": "1.78.0",
     "@types/node": "^26.1.2",
-    "npm": "12.1.0",
+    "npm": "12.2.1",
     "oxlint": "1.85.0",
     "typescript": "^7.0.2"
   },
